@@ -1,0 +1,255 @@
+"""anon-router: payer-anonymous OpenAI-compatible inference proxy.
+
+Payment: prepaid blind-signature tokens (see mint.py). The server cannot link
+a request to the deposit that funded it. Overpayment comes back as blind
+change via a one-time receipt.
+
+Run: uvicorn server:app --host 127.0.0.1 --port 8402
+"""
+import base64
+import json
+import math
+import os
+import secrets
+import sqlite3
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from mint import Mint
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_env() -> None:
+    path = os.path.join(ROOT, ".env")
+    if os.path.exists(path):
+        for line in open(path):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+
+
+_load_env()
+
+OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
+UPSTREAM = os.environ.get("UPSTREAM", "https://openrouter.ai/api/v1")
+CREDIT_USD = float(os.environ.get("CREDIT_USD", "0.0001"))  # 1 credit = $0.0001
+MARKUP = float(os.environ.get("MARKUP", "1.0"))
+MIN_PREPAY = int(os.environ.get("MIN_PREPAY", "500"))  # credits required up front
+DEV_FAUCET = os.environ.get("DEV_FAUCET", "1") == "1"
+FAUCET_MAX = int(os.environ.get("FAUCET_MAX", "500000"))  # per topup call, dev only
+
+
+def _master() -> bytes:
+    path = os.path.join(ROOT, "mint_master.hex")
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(secrets.token_bytes(32).hex())
+        os.chmod(path, 0o600)
+    return bytes.fromhex(open(path).read().strip())
+
+
+mint = Mint(_master())
+db = sqlite3.connect(os.path.join(ROOT, "state.db"), check_same_thread=False)
+db.execute("CREATE TABLE IF NOT EXISTS spent(secret TEXT PRIMARY KEY)")
+db.execute(
+    "CREATE TABLE IF NOT EXISTS receipts("
+    "id TEXT PRIMARY KEY, prepaid INT, cost INT, state TEXT)"
+)
+db.commit()
+
+app = FastAPI(title="anon-router")
+
+
+def _parse_outputs(payload: dict) -> list[dict]:
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise HTTPException(400, "outputs required: [{amount, B_}]")
+    for o in outputs:
+        if int(o.get("amount", 0)) <= 0 or not o.get("B_"):
+            raise HTTPException(400, "each output needs amount and B_")
+    return outputs
+
+
+def _sign_outputs(outputs: list[dict]) -> list[dict]:
+    try:
+        return [
+            {"amount": int(o["amount"]), "C_": mint.sign_blinded(int(o["amount"]), o["B_"])}
+            for o in outputs
+        ]
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+def _spend(tokens: list[dict]) -> int:
+    total = sum(int(t.get("amount", 0)) for t in tokens)
+    if total < MIN_PREPAY:
+        raise HTTPException(402, f"prepay {total} < minimum {MIN_PREPAY} credits")
+    for t in tokens:
+        if not mint.verify(int(t["amount"]), t["secret"], t["C"]):
+            raise HTTPException(400, "invalid token signature")
+    cur = db.cursor()
+    try:
+        for t in tokens:
+            cur.execute("INSERT INTO spent(secret) VALUES (?)", (t["secret"],))
+    except sqlite3.IntegrityError:
+        db.rollback()
+        raise HTTPException(400, "token already spent")
+    db.commit()
+    return total
+
+
+def _finalize(receipt_id: str, cost: int) -> None:
+    db.execute(
+        "UPDATE receipts SET cost=?, state='final' WHERE id=? AND state='pending'",
+        (cost, receipt_id),
+    )
+    db.commit()
+
+
+def _usd_to_credits(cost_usd: float | None) -> int:
+    if cost_usd is None:
+        return 1  # upstream gave no usage; charge the floor, log for investigation
+    return max(1, math.ceil(cost_usd * MARKUP / CREDIT_USD))
+
+
+@app.get("/mint/keys")
+def keys():
+    return {
+        "pubkeys": mint.pubkeys(),
+        "credit_usd": CREDIT_USD,
+        "min_prepay": MIN_PREPAY,
+        "markup": MARKUP,
+    }
+
+
+@app.post("/mint/topup")
+async def topup(request: Request):
+    """Dev faucet: issues credits for free. Replaced by the USDC deposit watcher."""
+    if not DEV_FAUCET:
+        raise HTTPException(403, "faucet disabled; fund via USDC deposit")
+    outputs = _parse_outputs(await request.json())
+    total = sum(int(o["amount"]) for o in outputs)
+    if total > FAUCET_MAX:
+        raise HTTPException(400, f"faucet cap {FAUCET_MAX} credits per call")
+    return {"signatures": _sign_outputs(outputs)}
+
+
+@app.get("/mint/change/{receipt_id}")
+def change_info(receipt_id: str):
+    row = db.execute(
+        "SELECT prepaid, cost, state FROM receipts WHERE id=?", (receipt_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "unknown receipt")
+    prepaid, cost, state = row
+    change = max(0, prepaid - (cost or 0)) if state != "pending" else None
+    return {"state": state, "prepaid": prepaid, "cost": cost, "change": change}
+
+
+@app.post("/mint/change/{receipt_id}")
+async def redeem_change(receipt_id: str, request: Request):
+    row = db.execute(
+        "SELECT prepaid, cost, state FROM receipts WHERE id=?", (receipt_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "unknown receipt")
+    prepaid, cost, state = row
+    if state == "pending":
+        raise HTTPException(409, "request still in flight, retry shortly")
+    if state == "redeemed":
+        raise HTTPException(400, "receipt already redeemed")
+    change = max(0, prepaid - cost)
+    if change == 0:
+        db.execute("UPDATE receipts SET state='redeemed' WHERE id=?", (receipt_id,))
+        db.commit()
+        return {"change": 0, "cost": cost, "signatures": []}
+    outputs = _parse_outputs(await request.json())
+    if sum(int(o["amount"]) for o in outputs) != change:
+        raise HTTPException(400, f"outputs must sum to change of {change} credits")
+    signatures = _sign_outputs(outputs)
+    db.execute("UPDATE receipts SET state='redeemed' WHERE id=?", (receipt_id,))
+    db.commit()
+    return {"change": change, "cost": cost, "signatures": signatures}
+
+
+@app.get("/v1/models")
+async def models():
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{UPSTREAM}/models")
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@app.post("/v1/chat/completions")
+async def chat(request: Request):
+    cash_header = request.headers.get("X-Cash")
+    if not cash_header:
+        raise HTTPException(402, "payment required: attach tokens in X-Cash header")
+    try:
+        tokens = json.loads(base64.b64decode(cash_header))
+    except Exception:
+        raise HTTPException(400, "X-Cash must be base64 JSON token list")
+
+    prepaid = _spend(tokens)
+    receipt_id = secrets.token_hex(16)
+    db.execute(
+        "INSERT INTO receipts(id, prepaid, cost, state) VALUES (?, ?, 0, 'pending')",
+        (receipt_id, prepaid),
+    )
+    db.commit()
+
+    body = await request.json()
+    body["usage"] = {"include": True}  # OpenRouter returns exact USD cost
+    upstream_headers = {
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "Content-Type": "application/json",
+    }
+    url = f"{UPSTREAM}/chat/completions"
+
+    if body.get("stream"):
+
+        async def gen():
+            cost_usd = None
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream(
+                        "POST", url, json=body, headers=upstream_headers
+                    ) as r:
+                        async for line in r.aiter_lines():
+                            if line.startswith("data: ") and line[6:] != "[DONE]":
+                                try:
+                                    usage = json.loads(line[6:]).get("usage")
+                                    if usage and usage.get("cost") is not None:
+                                        cost_usd = usage["cost"]
+                                except (json.JSONDecodeError, AttributeError):
+                                    pass
+                            yield line + "\n"
+            finally:
+                _finalize(receipt_id, min(prepaid, _usd_to_credits(cost_usd)))
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"X-Change-Receipt": receipt_id},
+        )
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(url, json=body, headers=upstream_headers)
+    if r.status_code != 200:
+        _finalize(receipt_id, 0)  # upstream failed: full refund via change
+        return JSONResponse(
+            r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": r.text},
+            status_code=r.status_code,
+            headers={"X-Change-Receipt": receipt_id},
+        )
+    data = r.json()
+    cost_usd = (data.get("usage") or {}).get("cost")
+    cost = min(prepaid, _usd_to_credits(cost_usd))
+    _finalize(receipt_id, cost)
+    return JSONResponse(
+        data,
+        headers={"X-Change-Receipt": receipt_id, "X-Cost-Credits": str(cost)},
+    )
