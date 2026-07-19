@@ -44,6 +44,22 @@ python cli.py chat "hello" --model openai/gpt-4o-mini
 
 Set `DEV_FAUCET=0` in `.env` for any deployment where credits are sold.
 
+## Trust-minimized channel lane (confetti, M4a)
+
+An opt-in payment lane where the buyer's deposit is governed by the confetti
+zk payment channel instead of trusting the mint. See [confetti/README.md](confetti/README.md).
+
+```bash
+python cli.py channel open 5000                       # deposit 5000 credits
+python cli.py chat "hello" --model openai/gpt-4o-mini --channel
+python cli.py channel status
+```
+
+Each request builds a payment proof, the router verifies and countersigns it,
+and a stale/rolled-back close is provably challengeable. M4a runs off-chain
+against an in-memory referee with the reference (non-ZK) prover; M4b adds the
+on-chain contract and the real STARK prover.
+
 ## Free local lane
 
 Models prefixed `local/` route to a free upstream (RTX 3080 PC running Ollama, reached via ssh tunnel) and require no payment. For user testing without spending credits:

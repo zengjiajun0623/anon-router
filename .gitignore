@@ -1,7 +1,8 @@
-.env
-mint_master.hex
-state.db
 .venv/
 __pycache__/
-research/phase0-bench/
+*.pyc
+state.db
+mint_master.hex
 server.log
+.env
+research/phase0-bench/

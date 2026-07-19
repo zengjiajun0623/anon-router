@@ -2,15 +2,19 @@
 import base64
 import json
 import os
+import pickle
 import secrets
 import time
 
 import httpx
 
+from confetti.channel import Payer
+from confetti.wire import payment_to_j, sig_from_j
 from mint import blind, decompose, unblind
 
 DEFAULT_MINT = os.environ.get("ANON_ROUTER_URL", "http://127.0.0.1:8402")
 WALLET_PATH = os.path.expanduser("~/.anon-router/wallet.json")
+CHANNEL_PATH = os.path.expanduser("~/.anon-router/channel.pkl")
 
 
 class Wallet:
@@ -103,6 +107,66 @@ class Wallet:
         if change and info["state"] == "final":
             self._request_signatures(f"/mint/change/{receipt_id}", change)
         return {"cost": info["cost"], "change": change}
+
+    # ---- confetti channel lane ----
+
+    def channel_open(self, deposit: int) -> dict:
+        """Open a confetti channel with the router funded by `deposit` credits.
+        Persists the Payer locally (demo persistence; see channel.py notes)."""
+        params = self.http.get(f"{self.url}/channel/params").json()
+        payer = Payer(deposit, bytes.fromhex(params["pk_B"]))
+        resp = self.http.post(
+            f"{self.url}/channel/open",
+            json={"cid": payer.cid.hex(), "D": deposit,
+                  "C_open": payer.C_open.hex()},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        payer.register(data["rec_index"],
+                       [bytes.fromhex(p) for p in data["rec_path"]],
+                       bytes.fromhex(data["root"]))
+        os.makedirs(os.path.dirname(CHANNEL_PATH), exist_ok=True)
+        with open(CHANNEL_PATH, "wb") as f:
+            pickle.dump(payer, f)
+        os.chmod(CHANNEL_PATH, 0o600)
+        return {"deposit": deposit, "price": params["price_per_request"]}
+
+    def _load_channel(self) -> Payer:
+        if not os.path.exists(CHANNEL_PATH):
+            raise RuntimeError("no channel open; run: cli.py channel open <credits>")
+        with open(CHANNEL_PATH, "rb") as f:
+            return pickle.load(f)
+
+    def _save_channel(self, payer: Payer) -> None:
+        with open(CHANNEL_PATH, "wb") as f:
+            pickle.dump(payer, f)
+
+    def channel_status(self) -> dict:
+        payer = self._load_channel()
+        return {"deposit": payer.D, "spent": payer.tip.bal,
+                "remaining": payer.D - payer.tip.bal, "payments": payer.tip.index}
+
+    def channel_chat(self, messages: list[dict], model: str, **kwargs):
+        params = self.http.get(f"{self.url}/channel/params").json()
+        price = params["price_per_request"]
+        payer = self._load_channel()
+        if payer.D - payer.tip.bal < price:
+            raise RuntimeError("channel balance below price; open a new channel")
+        m, pending = payer.build_payment(price)
+        header = base64.b64encode(json.dumps(payment_to_j(m)).encode()).decode()
+        body = {"model": model, "messages": messages, "stream": False, **kwargs}
+        resp = self.http.post(
+            f"{self.url}/v1/chat/completions", json=body,
+            headers={"X-Channel-Payment": header},
+        )
+        resp.raise_for_status()
+        countersign = resp.headers.get("X-Channel-Countersign")
+        if not countersign:
+            raise RuntimeError("router did not countersign the payment")
+        sigma = sig_from_j(json.loads(base64.b64decode(countersign)))
+        payer.on_countersign(pending, sigma)   # advances the tip only if valid
+        self._save_channel(payer)
+        return resp.json(), {"cost": price, "remaining": payer.D - payer.tip.bal}
 
     def chat(self, messages: list[dict], model: str, prepay: int = 2000,
              stream: bool = False, **kwargs):

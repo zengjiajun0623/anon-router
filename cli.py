@@ -30,6 +30,14 @@ def main() -> int:
     c.add_argument("message")
     c.add_argument("--model", default="openai/gpt-4o-mini")
     c.add_argument("--prepay", type=int, default=2000)
+    c.add_argument("--channel", action="store_true",
+                   help="pay via confetti channel instead of ecash tokens")
+
+    ch = sub.add_parser("channel", help="confetti trust-minimized payment channel")
+    chs = ch.add_subparsers(dest="channel_cmd", required=True)
+    cho = chs.add_parser("open")
+    cho.add_argument("credits", type=int)
+    chs.add_parser("status")
 
     m = sub.add_parser("models")
     m.add_argument("--search", default=None)
@@ -49,19 +57,35 @@ def main() -> int:
         bal = w.balance()
         print(f"balance: {bal} credits (${bal * w.keys()['credit_usd']:.4f})")
     elif args.cmd == "chat":
-        reply, settle = w.chat(
-            [{"role": "user", "content": args.message}],
-            model=args.model,
-            prepay=args.prepay,
-        )
-        print(reply["choices"][0]["message"]["content"])
+        msgs = [{"role": "user", "content": args.message}]
         credit_usd = w.keys()["credit_usd"]
-        cost = settle["cost"]
-        print(
-            f"\n[cost: {cost} credits (${(cost or 0) * credit_usd:.6f}) · "
-            f"change returned: {settle['change']} · balance: {w.balance()}]",
-            file=sys.stderr,
-        )
+        if args.channel:
+            reply, settle = w.channel_chat(msgs, model=args.model)
+            print(reply["choices"][0]["message"]["content"])
+            print(
+                f"\n[channel · cost: {settle['cost']} credits "
+                f"(${settle['cost'] * credit_usd:.6f}) · "
+                f"remaining: {settle['remaining']}]",
+                file=sys.stderr,
+            )
+        else:
+            reply, settle = w.chat(msgs, model=args.model, prepay=args.prepay)
+            print(reply["choices"][0]["message"]["content"])
+            cost = settle["cost"]
+            print(
+                f"\n[cost: {cost} credits (${(cost or 0) * credit_usd:.6f}) · "
+                f"change returned: {settle['change']} · balance: {w.balance()}]",
+                file=sys.stderr,
+            )
+    elif args.cmd == "channel":
+        if args.channel_cmd == "open":
+            info = w.channel_open(args.credits)
+            print(f"channel open: deposit {info['deposit']} credits, "
+                  f"price {info['price']} credits/request")
+        elif args.channel_cmd == "status":
+            s = w.channel_status()
+            print(f"deposit {s['deposit']} · spent {s['spent']} · "
+                  f"remaining {s['remaining']} · payments {s['payments']}")
     elif args.cmd == "models":
         data = w.http.get(f"{w.url}/v1/models").json()["data"]
         for entry in data:

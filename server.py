@@ -18,6 +18,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from mint import DENOMS, Mint
+from confetti.chain import ChannelRecord
+from confetti.channel import Contract, Recipient
+from confetti.wire import payment_from_j, sig_to_j
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -72,6 +75,16 @@ def _master() -> bytes:
 
 
 mint = Mint(_master())
+
+# --- confetti channel lane (M4a: off-chain, in-memory referee) ---
+# Flat price per request in credits; the channel pays this fixed delta per
+# message (metered/variable channel pricing is M4b). Contract + Recipient are
+# in-memory for M4a — a restart resets the registry and XMSS signer; persistence
+# and an on-chain contract land in M4b.
+CHANNEL_PRICE = int(os.environ.get("CHANNEL_PRICE", "50"))
+channel_contract = Contract(tau=int(os.environ.get("CHANNEL_TAU", "7")))
+bob = Recipient(height=int(os.environ.get("CHANNEL_HEIGHT", "12")))
+
 db = sqlite3.connect(os.path.join(ROOT, "state.db"), check_same_thread=False)
 db.execute("CREATE TABLE IF NOT EXISTS spent(secret TEXT PRIMARY KEY)")
 db.execute(
@@ -158,6 +171,39 @@ async def topup(request: Request):
     if total > FAUCET_MAX:
         raise HTTPException(400, f"faucet cap {FAUCET_MAX} credits per call")
     return {"signatures": _sign_outputs(outputs)}
+
+
+@app.get("/channel/params")
+def channel_params():
+    """Everything a client needs to open a confetti channel."""
+    return {
+        "pk_B": bob.pk_B.hex(),
+        "root": channel_contract.root().hex(),
+        "price_per_request": CHANNEL_PRICE,
+        "credit_usd": CREDIT_USD,
+        "tau_days": channel_contract.tau,
+    }
+
+
+@app.post("/channel/open")
+async def channel_open(request: Request):
+    body = await request.json()
+    try:
+        cid = bytes.fromhex(body["cid"])
+        D = int(body["D"])
+        C_open = bytes.fromhex(body["C_open"])
+    except (KeyError, ValueError):
+        raise HTTPException(400, "need cid (hex), D (int), C_open (hex)")
+    if cid in channel_contract.channels:
+        raise HTTPException(400, "cid already opened")
+    rec = ChannelRecord(cid, D, bob.pk_B, C_open)
+    idx = channel_contract.open(rec)
+    path = channel_contract.registry.proof(idx)
+    return {
+        "rec_index": idx,
+        "rec_path": [p.hex() for p in path],
+        "root": channel_contract.root().hex(),
+    }
 
 
 @app.get("/mint/voucher/{code}")
@@ -278,9 +324,29 @@ async def chat(request: Request):
             r.json(), status_code=r.status_code, headers={"X-Cost-Credits": "0"}
         )
 
+    channel_header = request.headers.get("X-Channel-Payment")
+    if channel_header:
+        try:
+            m = payment_from_j(json.loads(base64.b64decode(channel_header)))
+        except Exception:
+            raise HTTPException(400, "X-Channel-Payment must be base64 JSON")
+        try:
+            sigma = bob.accept(channel_contract, m, price=CHANNEL_PRICE)
+        except ValueError as e:
+            raise HTTPException(402, f"channel payment rejected: {e}")
+        countersign = base64.b64encode(json.dumps(sig_to_j(sigma)).encode()).decode()
+        async with httpx.AsyncClient(timeout=300) as client:
+            r = await client.post(url, json=body, headers=upstream_headers)
+        return JSONResponse(
+            r.json(),
+            status_code=r.status_code,
+            headers={"X-Channel-Countersign": countersign,
+                     "X-Cost-Credits": str(CHANNEL_PRICE)},
+        )
+
     cash_header = request.headers.get("X-Cash")
     if not cash_header:
-        raise HTTPException(402, "payment required: attach tokens in X-Cash header")
+        raise HTTPException(402, "payment required: attach tokens in X-Cash or X-Channel-Payment header")
     try:
         tokens = json.loads(base64.b64decode(cash_header))
     except Exception:
