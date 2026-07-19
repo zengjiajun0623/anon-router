@@ -42,6 +42,25 @@ MIN_PREPAY = int(os.environ.get("MIN_PREPAY", "500"))  # credits required up fro
 DEV_FAUCET = os.environ.get("DEV_FAUCET", "1") == "1"
 FAUCET_MAX = int(os.environ.get("FAUCET_MAX", "500000"))  # per topup call, dev only
 
+# Model-prefix routing. "local/<model>" strips the prefix and goes to the free
+# lane (3080 Ollama via ssh tunnel); anything else goes to the paid default.
+UPSTREAMS = {
+    "local": {
+        "base": os.environ.get("LOCAL_UPSTREAM", "http://127.0.0.1:11435/v1"),
+        "key": None,
+        "free": True,
+    },
+}
+
+
+def resolve_route(model: str) -> tuple[str, str | None, bool, str]:
+    """-> (base_url, api_key, free, upstream_model_name)"""
+    prefix, _, rest = model.partition("/")
+    if rest and prefix in UPSTREAMS:
+        u = UPSTREAMS[prefix]
+        return u["base"], u["key"], u["free"], rest
+    return UPSTREAM, OPENROUTER_KEY, False, model
+
 
 def _master() -> bytes:
     path = os.path.join(ROOT, "mint_master.hex")
@@ -180,11 +199,49 @@ async def redeem_change(receipt_id: str, request: Request):
 async def models():
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(f"{UPSTREAM}/models")
-    return JSONResponse(r.json(), status_code=r.status_code)
+        data = r.json().get("data", [])
+        for prefix, u in UPSTREAMS.items():
+            try:
+                lr = await client.get(f"{u['base']}/models", timeout=5)
+                for m in lr.json().get("data", []):
+                    data.insert(0, {"id": f"{prefix}/{m['id']}", "object": "model", "free": u["free"]})
+            except httpx.HTTPError:
+                pass  # free upstream down: paid lane still works
+    return {"object": "list", "data": data}
 
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
+    body = await request.json()
+    base, key, free, upstream_model = resolve_route(str(body.get("model", "")))
+    body["model"] = upstream_model
+    upstream_headers = {"Content-Type": "application/json"}
+    if key:
+        upstream_headers["Authorization"] = f"Bearer {key}"
+    url = f"{base}/chat/completions"
+
+    if free:
+        if body.get("stream"):
+
+            async def gen_free():
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream(
+                        "POST", url, json=body, headers=upstream_headers
+                    ) as r:
+                        async for line in r.aiter_lines():
+                            yield line + "\n"
+
+            return StreamingResponse(
+                gen_free(),
+                media_type="text/event-stream",
+                headers={"X-Cost-Credits": "0"},
+            )
+        async with httpx.AsyncClient(timeout=300) as client:
+            r = await client.post(url, json=body, headers=upstream_headers)
+        return JSONResponse(
+            r.json(), status_code=r.status_code, headers={"X-Cost-Credits": "0"}
+        )
+
     cash_header = request.headers.get("X-Cash")
     if not cash_header:
         raise HTTPException(402, "payment required: attach tokens in X-Cash header")
@@ -201,13 +258,7 @@ async def chat(request: Request):
     )
     db.commit()
 
-    body = await request.json()
     body["usage"] = {"include": True}  # OpenRouter returns exact USD cost
-    upstream_headers = {
-        "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type": "application/json",
-    }
-    url = f"{UPSTREAM}/chat/completions"
 
     if body.get("stream"):
 

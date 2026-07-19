@@ -97,11 +97,13 @@ class Wallet:
 
     def chat(self, messages: list[dict], model: str, prepay: int = 2000,
              stream: bool = False, **kwargs):
-        spend = [
-            {"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
-            for t in self._select(max(prepay, self.keys()["min_prepay"]))
-        ]
-        headers = {"X-Cash": base64.b64encode(json.dumps(spend).encode()).decode()}
+        headers = {}
+        if not model.startswith("local/"):  # local/* lane is free, no payment
+            spend = [
+                {"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
+                for t in self._select(max(prepay, self.keys()["min_prepay"]))
+            ]
+            headers["X-Cash"] = base64.b64encode(json.dumps(spend).encode()).decode()
         body = {"model": model, "messages": messages, "stream": stream, **kwargs}
         if stream:
             return self.http.stream(
@@ -111,6 +113,6 @@ class Wallet:
             f"{self.url}/v1/chat/completions", json=body, headers=headers
         )
         receipt = resp.headers.get("X-Change-Receipt")
-        settle = self.redeem_change(receipt) if receipt else {"cost": None, "change": 0}
+        settle = self.redeem_change(receipt) if receipt else {"cost": 0, "change": 0}
         resp.raise_for_status()
         return resp.json(), settle

@@ -28,6 +28,17 @@ cp .env.example .env   # set OPENROUTER_API_KEY
 
 Any OpenAI-compatible client works against `http://127.0.0.1:8402/v1` if it can attach the `X-Cash` header per request (the CLI/wallet does this automatically).
 
+## Free local lane
+
+Models prefixed `local/` route to a free upstream (RTX 3080 PC running Ollama, reached via ssh tunnel) and require no payment. For user testing without spending credits:
+
+```bash
+ssh -f -N -L 11435:127.0.0.1:11434 pc3080   # once per boot
+.venv/bin/python cli.py chat "hello" --model local/qwen3:8b
+```
+
+Override the upstream with `LOCAL_UPSTREAM` in `.env`.
+
 ## Honest limitations (v1)
 
 - The mint is trusted with float: it could refuse redemption. v2 (confetti channels) removes this.
