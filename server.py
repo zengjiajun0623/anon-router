@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from mint import Mint
+from mint import DENOMS, Mint
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -77,6 +77,9 @@ db.execute("CREATE TABLE IF NOT EXISTS spent(secret TEXT PRIMARY KEY)")
 db.execute(
     "CREATE TABLE IF NOT EXISTS receipts("
     "id TEXT PRIMARY KEY, prepaid INT, cost INT, state TEXT)"
+)
+db.execute(
+    "CREATE TABLE IF NOT EXISTS vouchers(code TEXT PRIMARY KEY, credits INT, state TEXT)"
 )
 db.commit()
 
@@ -155,6 +158,39 @@ async def topup(request: Request):
     if total > FAUCET_MAX:
         raise HTTPException(400, f"faucet cap {FAUCET_MAX} credits per call")
     return {"signatures": _sign_outputs(outputs)}
+
+
+@app.get("/mint/voucher/{code}")
+def voucher_info(code: str):
+    row = db.execute(
+        "SELECT credits, state FROM vouchers WHERE code=?", (code,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "unknown voucher")
+    return {"credits": row[0], "state": row[1]}
+
+
+@app.post("/mint/voucher/{code}")
+async def redeem_voucher(code: str, request: Request):
+    row = db.execute(
+        "SELECT credits, state FROM vouchers WHERE code=?", (code,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "unknown voucher")
+    credits = row[0]
+    outputs = _parse_outputs(await request.json())
+    if any(int(o["amount"]) not in DENOMS for o in outputs):
+        raise HTTPException(400, "output amounts must be valid denominations")
+    if sum(int(o["amount"]) for o in outputs) != credits:
+        raise HTTPException(400, f"outputs must sum to {credits} credits")
+    # mark redeemed atomically before signing so a concurrent redeem can't double-issue
+    cur = db.execute(
+        "UPDATE vouchers SET state='redeemed' WHERE code=? AND state='issued'", (code,)
+    )
+    db.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(400, "voucher already redeemed")
+    return {"credits": credits, "signatures": _sign_outputs(outputs)}
 
 
 @app.get("/mint/change/{receipt_id}")

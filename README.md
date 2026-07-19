@@ -28,6 +28,22 @@ cp .env.example .env   # set OPENROUTER_API_KEY
 
 Any OpenAI-compatible client works against `http://127.0.0.1:8402/v1` if it can attach the `X-Cash` header per request (the CLI/wallet does this automatically).
 
+## Selling credits (vouchers)
+
+The MVP resale loop: the operator funds an OpenRouter account wholesale, sells voucher codes through any channel (USDC, WeChat, resellers), and buyers redeem codes for anonymous credits. The mint sees which voucher a redemption came from but cannot link the resulting tokens to any later request (blind signatures).
+
+```bash
+# operator, on the router box:
+.venv/bin/python admin.py issue 50000          # prints a code worth $5
+.venv/bin/python admin.py list                 # ledger of issued/redeemed
+
+# buyer, anywhere:
+python cli.py redeem ar-XXXXXXXXXXXXXXXXXXXX   # code → anonymous credits
+python cli.py chat "hello" --model openai/gpt-4o-mini
+```
+
+Set `DEV_FAUCET=0` in `.env` for any deployment where credits are sold.
+
 ## Free local lane
 
 Models prefixed `local/` route to a free upstream (RTX 3080 PC running Ollama, reached via ssh tunnel) and require no payment. For user testing without spending credits:

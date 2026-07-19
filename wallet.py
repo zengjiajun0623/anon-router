@@ -66,6 +66,15 @@ class Wallet:
         self._request_signatures("/mint/topup", credits)
         return self.balance()
 
+    def redeem_voucher(self, code: str) -> int:
+        info = self.http.get(f"{self.url}/mint/voucher/{code}")
+        info.raise_for_status()
+        data = info.json()
+        if data["state"] != "issued":
+            raise RuntimeError("voucher already redeemed")
+        self._request_signatures(f"/mint/voucher/{code}", data["credits"])
+        return self.balance()
+
     def _select(self, amount: int) -> list[dict]:
         """Pop tokens covering >= amount, largest first (change comes back)."""
         chosen, total = [], 0

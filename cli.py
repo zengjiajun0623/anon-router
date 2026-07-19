@@ -21,6 +21,9 @@ def main() -> int:
     t = sub.add_parser("topup", help="dev faucet topup")
     t.add_argument("credits", type=int)
 
+    r = sub.add_parser("redeem", help="redeem a purchased voucher code")
+    r.add_argument("code")
+
     sub.add_parser("balance")
 
     c = sub.add_parser("chat")
@@ -38,6 +41,10 @@ def main() -> int:
         bal = w.topup(args.credits)
         usd = bal * w.keys()["credit_usd"]
         print(f"balance: {bal} credits (${usd:.4f})")
+    elif args.cmd == "redeem":
+        bal = w.redeem_voucher(args.code)
+        usd = bal * w.keys()["credit_usd"]
+        print(f"voucher redeemed. balance: {bal} credits (${usd:.4f})")
     elif args.cmd == "balance":
         bal = w.balance()
         print(f"balance: {bal} credits (${bal * w.keys()['credit_usd']:.4f})")
