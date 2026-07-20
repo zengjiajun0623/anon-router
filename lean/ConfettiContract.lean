@@ -59,6 +59,13 @@ per-channel transition system, with the §7 on-chain settlement theorems proved.
 4. `unchallenged_close_settles` — liveness flavour: from any reachable state
    with a pending unchallenged close, the clock plus one `finalize` call
    settles the full deposit as (`bal`, `D−bal`).
+5. `open_absorbing` — `open` is one-shot (`usedCid`) and `deposit` is
+   immutable afterwards: the `D` in every payout theorem is the original
+   escrow.
+6. `no_locked_funds` — from *every* reachable state (no close yet, challenged,
+   finalized, mid-withdrawal) a finite sequence of permitted calls empties the
+   escrow into the parties' ledger slots and pays them out: no reachable state
+   permanently strands funds.
 
 One disclosed quirk, proved harmless: after `timeoutForfeit` the contract
 leaves `closes[cid].openedAt = 0` and `challenged = false`, so on a chain
@@ -569,5 +576,175 @@ theorem unchallenged_close_settles {P : Params} {s : St} {cl : CloseRec}
     simp [payAlice, payBob, hnc]; omega
   · show s.wBob + payBob s.deposit cl + (s.wAlice + payAlice s.deposit cl) = s.deposit
     simp [payAlice, payBob, hnc]; omega
+
+/-! ## Theorem 5 — `open` is one-shot; the deposit is immutable -/
+
+/-- **cid non-reuse / deposit immutability.** Once the channel is opened, no
+transition can re-open it or change `deposit`: the `D` appearing in every
+payout theorem above is the original escrowed amount, not a value an attacker
+could have rewritten. Mirrors `usedCid[cid]` being set forever (contract
+`open`, "cid used") and `channels[cid].deposit` never being written again. -/
+theorem open_absorbing {P : Params} {s s' : St} (st : Step P s s')
+    (ho : s.opened = true) : s'.opened = true ∧ s'.deposit = s.deposit := by
+  cases st with
+  | openChannel D hD hcid => rw [hcid] at ho; cases ho
+  | tick t ht => exact ⟨ho, rfl⟩
+  | requestClose hex hreq => exact ⟨ho, rfl⟩
+  | closeGenesis n1 hex hnone hpf => exact ⟨ho, rfl⟩
+  | closeSigned nNext bal hex hnone hbal hpf => exact ⟨ho, rfl⟩
+  | closeUnsigned cX nX nNext bal delta hex hnone hbal hpf => exact ⟨ho, rfl⟩
+  | challenge nM cM hc hnch hwin hpf hss hcol => exact ⟨ho, rfl⟩
+  | finalize hc hnf hwin => exact ⟨ho, rfl⟩
+  | timeoutForfeit hex hnone hdl => exact ⟨ho, rfl⟩
+  | withdrawBob hw => exact ⟨ho, rfl⟩
+  | withdrawAlice hw => exact ⟨ho, rfl⟩
+
+/-! ## Theorem 6 — no permanently locked funds
+
+`unchallenged_close_settles` (Theorem 4) only covers the pending-unchallenged
+close. The states it does *not* cover — no close yet, challenged close,
+already-finalized close with pending credits — are exactly where an escrow
+could silently brick funds. Theorem 6 closes that gap: from **every**
+reachable state a finite sequence of permitted calls empties the escrow into
+the parties' hands. -/
+
+/-- Finitely many further calls: the reflexive–transitive closure of `Step`. -/
+inductive Steps (P : Params) : St → St → Prop where
+  | refl {s : St} : Steps P s s
+  | tail {s₁ s₂ s₃ : St} : Steps P s₁ s₂ → Step P s₂ s₃ → Steps P s₁ s₃
+
+/-- A single call is a call sequence. -/
+theorem Steps.single {P : Params} {s s' : St} (h : Step P s s') : Steps P s s' :=
+  Steps.refl.tail h
+
+/-- Call sequences compose. -/
+theorem Steps.trans {P : Params} {s₁ s₂ s₃ : St} (h₁ : Steps P s₁ s₂)
+    (h₂ : Steps P s₂ s₃) : Steps P s₁ s₃ := by
+  induction h₂ with
+  | refl => exact h₁
+  | tail _ st ih => exact ih.tail st
+
+/-- Reachability is closed under call sequences. -/
+theorem Reachable.steps {P : Params} {s s' : St} (hr : Reachable P s)
+    (hs : Steps P s s') : Reachable P s' := by
+  induction hs with
+  | refl => exact hr
+  | tail _ st ih => exact ih.step st
+
+/-- An opened channel with no close on record still exists (only `finalize`
+and `timeoutForfeit` clear `exists`, and both leave a close behind). Needed so
+the timeout path below is actually enabled. -/
+theorem chExists_of_open_no_close {P : Params} {s : St} (hr : Reachable P s) :
+    s.opened = true → s.close = none → s.chExists = true := by
+  induction hr with
+  | init => intro ho _; cases ho
+  | step hr' st ih =>
+      intro ho hn
+      cases st with
+      | tick t ht => exact ih ho hn
+      | openChannel D hD hcid => rfl
+      | requestClose hex hreq => exact hex
+      | closeGenesis n1 hex hnone hpf => cases hn
+      | closeSigned nNext bal hex hnone hbal hpf => cases hn
+      | closeUnsigned cX nX nNext bal delta hex hnone hbal hpf => cases hn
+      | challenge nM cM hc hnch hwin hpf hss hcol => cases hn
+      | finalize hc hnf hwin => simp only [St.finalizeSt] at hn; cases hn
+      | timeoutForfeit hex hnone hdl => cases hn
+      | withdrawBob hw => exact ih ho hn
+      | withdrawAlice hw => exact ih ho hn
+
+/-- In any reachable finalized state the escrow exactly covers the two pending
+ledger slots (conservation + credits-happen-once, cancelled). -/
+theorem settled_balance {P : Params} {s : St} (hr : Reachable P s)
+    (hf : finalizedP s) : s.ethBal = s.wBob + s.wAlice := by
+  obtain ⟨cl, hc, hfin⟩ := hf
+  have h := reachable_inv hr
+  have ⟨ho, _⟩ := h.closeInv _ hc
+  have hcons := h.conserve
+  have hcred := h.credited
+  simp only [ho, if_pos] at hcons
+  simp only [settledAmt, hc, hfin, if_pos] at hcred
+  omega
+
+/-- Draining helper: from any reachable state, at most two `withdraw` calls
+clear both pending ledger slots and pay them out of escrow. -/
+private theorem drain {P : Params} {s : St} (hr : Reachable P s) :
+    ∃ s', Steps P s s' ∧ Reachable P s' ∧ s'.wBob = 0 ∧ s'.wAlice = 0 ∧
+      s'.ethBal = s.ethBal - s.wBob - s.wAlice := by
+  rcases Nat.eq_zero_or_pos s.wBob with hb0 | hbpos
+  · rcases Nat.eq_zero_or_pos s.wAlice with ha0 | hapos
+    · exact ⟨s, .refl, hr, hb0, ha0, by omega⟩
+    · have st := Step.withdrawAlice (P := P) hapos
+      exact ⟨_, .single st, hr.step st, hb0, rfl, by simp; omega⟩
+  · have st1 := Step.withdrawBob (P := P) hbpos
+    rcases Nat.eq_zero_or_pos s.wAlice with ha0 | hapos
+    · exact ⟨_, .single st1, hr.step st1, rfl, ha0, by simp; omega⟩
+    · have st2 := Step.withdrawAlice (P := P)
+        (s := { s with wBob := 0, pBob := s.pBob + s.wBob,
+                       ethBal := s.ethBal - s.wBob }) hapos
+      exact ⟨_, (Steps.single st1).tail st2, (hr.step st1).step st2, rfl, rfl, rfl⟩
+
+/-- **No permanently locked funds.** From every reachable state there is a
+finite sequence of permitted calls — clock ticks plus `finalize` /
+`timeoutForfeit` / `withdraw` — after which this channel's escrow is empty
+and both pending ledger slots are cleared: no reachable state strands a
+single wei for everyone. Covers the cases Theorem 4 does not: no close yet
+(timeout path), challenged close, and finalized-but-unwithdrawn credits.
+
+Reading of the model liveness in contract terms: `tick` is chain time
+passing; the timeout path is a call only Bob can make and `withdraw` pays
+each party only its own slot — so this says the *parties jointly* can always
+extract everything (an AWOL Bob is instead covered by Alice's close path,
+whose enabledness depends on verifier completeness, deliberately outside this
+model). It does not — and must not — say a single party can force any split;
+the split is pinned by `finalize_payout`. -/
+theorem no_locked_funds {P : Params} {s : St} (hr : Reachable P s) :
+    ∃ s', Steps P s s' ∧ Reachable P s' ∧
+      s'.ethBal = 0 ∧ s'.wBob = 0 ∧ s'.wAlice = 0 := by
+  -- Stage 1: reach a state whose escrow exactly covers the pending slots;
+  -- Stage 2: drain the slots.
+  suffices h : ∃ s₂, Steps P s s₂ ∧ Reachable P s₂ ∧
+      s₂.ethBal = s₂.wBob + s₂.wAlice by
+    obtain ⟨s₂, hs₂, hr₂, heq⟩ := h
+    obtain ⟨s', hs', hr', hwB, hwA, hE⟩ := drain hr₂
+    exact ⟨s', hs₂.trans hs', hr', by omega, hwB, hwA⟩
+  cases hop : s.opened with
+  | false =>
+      -- Virgin channel: nothing escrowed, nothing pending.
+      have h := reachable_inv hr
+      have hv := h.virgin hop
+      have hcons := h.conserve
+      have hcred := h.credited
+      simp only [hop, if_neg Bool.false_ne_true] at hcons
+      simp only [settledAmt, hv.1] at hcred
+      exact ⟨s, .refl, hr, by omega⟩
+  | true =>
+      cases hc : s.close with
+      | some cl =>
+          cases hfin : cl.finalized with
+          | true => exact ⟨s, .refl, hr, settled_balance hr ⟨cl, hc, hfin⟩⟩
+          | false =>
+              -- Pending close (challenged or not): tick past the window, finalize.
+              have hst1 : Step P s { s with now := max s.now (cl.t0 + P.tau + 1) } :=
+                .tick _ (Nat.le_max_left _ _)
+              have hwin : cl.t0 + P.tau < max s.now (cl.t0 + P.tau + 1) := by
+                have := Nat.le_max_right s.now (cl.t0 + P.tau + 1); omega
+              have hst2 : Step P { s with now := max s.now (cl.t0 + P.tau + 1) } _ :=
+                .finalize (cl := cl) hc hfin hwin
+              have hr2 := (hr.step hst1).step hst2
+              exact ⟨_, (Steps.single hst1).tail hst2, hr2,
+                     settled_balance hr2 ⟨_, rfl, rfl⟩⟩
+      | none =>
+          -- No close: tick past the absolute deadline, Bob timeout-forfeits.
+          have hex : s.chExists = true := chExists_of_open_no_close hr hop hc
+          have hst1 : Step P s { s with now := max s.now (s.chOpenedAt + P.tAbs + 1) } :=
+            .tick _ (Nat.le_max_left _ _)
+          have hdl : s.chOpenedAt + P.tAbs < max s.now (s.chOpenedAt + P.tAbs + 1) := by
+            have := Nat.le_max_right s.now (s.chOpenedAt + P.tAbs + 1); omega
+          have hst2 : Step P { s with now := max s.now (s.chOpenedAt + P.tAbs + 1) } _ :=
+            .timeoutForfeit hex hc (Or.inl hdl)
+          have hr2 := (hr.step hst1).step hst2
+          exact ⟨_, (Steps.single hst1).tail hst2, hr2,
+                 settled_balance hr2 ⟨timeoutRec, rfl, rfl⟩⟩
 
 end Zkpc.Confetti
