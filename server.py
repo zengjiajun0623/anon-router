@@ -716,6 +716,7 @@ def config():
             "closeGenesis": sel("closeGenesis(bytes16,bytes32,bytes)"),
             "finalize": sel("finalize(bytes16)"),
             "withdraw": sel("withdraw()"),
+            "withdrawTo": sel("withdrawTo(address)"),
             "channels": sel("channels(bytes16)"),
             "withdrawable": sel("withdrawable(address)"),
         },

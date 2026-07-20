@@ -194,11 +194,57 @@ contract ConfettiChannelsTest is Test {
         assertTrue(ch.rootAccepted(r0));
     }
 
+    // Audit fix: an absurd duration would overflow `timestamp + duration` (uint64)
+    // in finalize/timeout and brick the channel. The constructor rejects it.
+    function test_constructor_rejects_absurd_duration() public {
+        IVerifier v = IVerifier(new MockVerifier());
+        vm.expectRevert("duration out of range");
+        new ConfettiChannels(v, type(uint64).max, 90 days, 7 days, 1 days);
+        vm.expectRevert("duration out of range");
+        new ConfettiChannels(v, TAU, type(uint64).max, 7 days, 1 days);
+    }
+
+    // Audit fix: a role whose own address cannot receive ETH can still recover
+    // its funds via withdrawTo(EOA); they are never permanently stranded.
+    function test_withdrawTo_escapes_unreceivable_role() public {
+        RevertOnReceive rc = new RevertOnReceive();
+        address payable rcAddr = payable(address(rc));
+        vm.prank(alice);
+        ch.open{value: 1 ether}(CID, rcAddr, PKB, COPEN);
+        vm.prank(alice);
+        ch.closeSigned(CID, bytes32(uint256(0x9911)), 0.3 ether, hex"");
+        vm.warp(block.timestamp + TAU + 1);
+        ch.finalize(CID);
+        assertEq(ch.withdrawable(rcAddr), 0.3 ether);
+
+        // withdraw() to its own (reverting) address fails...
+        vm.prank(rcAddr);
+        vm.expectRevert("transfer failed");
+        ch.withdraw();
+        assertEq(ch.withdrawable(rcAddr), 0.3 ether, "balance preserved on failed withdraw");
+
+        // ...but it can direct the payout to an EOA it controls.
+        address payable eoa = payable(address(0xE0A));
+        uint256 e0 = eoa.balance;
+        vm.prank(rcAddr);
+        ch.withdrawTo(eoa);
+        assertEq(eoa.balance - e0, 0.3 ether);
+        assertEq(ch.withdrawable(rcAddr), 0);
+    }
+
     function _channel()
         internal
         view
         returns (uint256, bytes32, bytes32, address, address, uint64, uint64, bool)
     {
         return ch.channels(CID);
+    }
+}
+
+/// A contract whose address cannot receive ETH — used to test that withdrawTo
+/// lets such a role recover its funds anyway.
+contract RevertOnReceive {
+    receive() external payable {
+        revert("cannot receive");
     }
 }

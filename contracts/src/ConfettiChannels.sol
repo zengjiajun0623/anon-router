@@ -87,8 +87,21 @@ contract ConfettiChannels {
         _locked = 1;
     }
 
+    // A deadline is computed as `timestamp + duration` in uint64; an absurd
+    // duration (near 2^64) would overflow that checked addition and revert
+    // finalize/timeoutForfeit forever, permanently locking channel funds. Bound
+    // every duration well below 2^64 so `timestamp + duration` can never overflow
+    // for any realistic block.timestamp. ~2^40 s is ~34,000 years — a sanity
+    // ceiling, not a real constraint.
+    uint64 private constant MAX_DURATION = uint64(1) << 40;
+
     constructor(IVerifier _verifier, uint64 _tau, uint64 _tAbs, uint64 _tReq, uint64 _tRoot) {
         require(_tRoot > 0, "tRoot=0");
+        require(
+            _tau < MAX_DURATION && _tAbs < MAX_DURATION
+                && _tReq < MAX_DURATION && _tRoot < MAX_DURATION,
+            "duration out of range"
+        );
         verifier = _verifier;
         tau = _tau;
         tAbs = _tAbs;
@@ -291,10 +304,26 @@ contract ConfettiChannels {
     }
 
     function withdraw() external nonReentrant {
+        _withdrawTo(payable(msg.sender));
+    }
+
+    /// Withdraw the caller's earned balance to a chosen address. Escape hatch for
+    /// a role whose OWN address cannot receive ETH (e.g. a contract that reverts
+    /// on receive): its funds can then never be permanently stranded, since it
+    /// can direct the payout to an EOA it controls.
+    function withdrawTo(address payable to) external nonReentrant {
+        require(to != address(0), "zero addr");
+        _withdrawTo(to);
+    }
+
+    /// Pull the CALLER's earned balance (keyed by msg.sender) and send it to
+    /// `to`. Checks-effects-interactions: the ledger slot is zeroed before the
+    /// external call, and both entrypoints are nonReentrant.
+    function _withdrawTo(address payable to) private {
         uint256 amount = withdrawable[msg.sender];
         require(amount > 0, "nothing to withdraw");
         withdrawable[msg.sender] = 0;
-        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        (bool ok,) = to.call{value: amount}("");
         require(ok, "transfer failed");
         emit Withdrawn(msg.sender, amount);
     }
