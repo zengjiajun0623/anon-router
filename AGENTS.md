@@ -6,7 +6,7 @@ non-interactive and safe to script.
 
 ## 1. Install
 ```bash
-pip install anon-router-cli          # or: pip install git+https://github.com/zengjiajun0623/anon-router
+pip install git+https://github.com/zengjiajun0623/anon-router.git   # PyPI package coming
 ```
 This adds an `anon-router` command. It targets the hosted router by default — no
 config needed. (Override with `ANON_ROUTER_URL` only for a self-hosted router.)

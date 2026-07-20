@@ -62,7 +62,6 @@ function unlockAfterKey() {
   $('key-start').classList.add('hidden');
   $('key-info').classList.remove('hidden');
   $('apikey').textContent = account.api_key;
-  $('baseurl').textContent = account.base_url || '';
   $('deposit-locked').classList.add('hidden');
   $('deposit-body').classList.remove('hidden');
   renderDepositPreview();
@@ -499,7 +498,6 @@ importInput.addEventListener('change', () => {
   importInput.value = '';   // allow re-importing the same file
 });
 wireCopy('copy-key', 'apikey');
-wireCopy('copy-base', 'baseurl');
 updateSendState();
 mintKeys().then(redeemPendingChange).then(renderBalance).catch(() => renderBalance());
 

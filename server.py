@@ -334,6 +334,13 @@ def index():
     return FileResponse(os.path.join(ROOT, "web", "index.html"))
 
 
+@app.get("/quickstart")
+def quickstart():
+    """Developer quickstart: fund -> claim -> run the local proxy -> call any tool."""
+    from fastapi.responses import FileResponse
+    return FileResponse(os.path.join(ROOT, "web", "quickstart.html"))
+
+
 @app.get("/ecash.js")
 def ecash_js():
     """In-browser BDHKE wallet module (same-origin; no CDN loads)."""
@@ -375,7 +382,8 @@ def privacy():
         "no_account": True,
         "no_card_no_kyc": True,
         "no_cookies_or_sessions": True,
-        "auth": "stateless bearer key",
+        "auth": ("ecash (blind-signed) pays for inference — no bearer key on the "
+                 "inference path; the account key funds/claims only, never buys a call"),
         "live_lane": "ecash (blind-signature, custodial)",
         "roadmap_lane": "confetti channel (non-custodial, per-request ZK)",
         "payment_unlinkable": ("cryptographically unlinkable at the signature layer "
@@ -384,9 +392,11 @@ def privacy():
                                "common round amount and spend over time to avoid "
                                "statistical correlation"),
         "what_provider_sees": "only the router — not your identity, IP, or card",
-        "what_router_sees": ("prompt content + connection metadata (IP/timing); IPs are "
-                             "not logged, but requests under the same bearer key are "
-                             "linkable by that key — rotate keys to unlink"),
+        "what_router_sees": ("prompt content + connection metadata (IP/timing). Ecash "
+                             "spends carry no account identifier, so they are not linkable "
+                             "by any key; but without Tor the source IP + timing still "
+                             "correlate your requests — connect over the .onion to remove "
+                             "that channel"),
         "what_the_model_sees": ("your prompt content — it must, to answer you; use a "
                                 "local/self-hosted model to keep content off third parties"),
         "transport": {"onion_live": bool(onion), "onion": onion or None},
@@ -696,7 +706,10 @@ async def _reserve_daily_cap(estimate: float) -> tuple[str, float]:
         ).fetchone()
         today_usd = float(row[0]) if row else 0.0
         if today_usd + estimate > DAILY_USD_CAP:
-            raise HTTPException(402, "daily budget reached, try later")
+            # Honest signal: this is a shared testnet spending cap, not an outage or
+            # a problem with the caller's wallet. It resets at 00:00 UTC.
+            raise HTTPException(402, "shared daily testnet budget reached (not your "
+                                     "wallet); it resets at 00:00 UTC — try again later")
         db.execute(
             "INSERT INTO spend_ledger(day, usd) VALUES (?, ?) "
             "ON CONFLICT(day) DO UPDATE SET usd=usd+excluded.usd",

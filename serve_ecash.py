@@ -4,8 +4,10 @@ Runs an OpenAI-compatible server on your own machine that pays for each request
 with blind-signed ecash from your wallet, then forwards to the hosted router.
 Point any agent/tool (Cursor, aider, the OpenAI SDK, ...) at
 `http://localhost:<port>/v1` with no code changes, and every request becomes
-private, unlinkable pay-per-use inference — the router can't tie your tool's
-requests to each other or to your deposit.
+private pay-per-use inference: the payment tokens carry no account identifier and
+are cryptographically unlinkable to your deposit. (Without Tor the router still
+sees your IP and timing, which can correlate requests, so run with --tor to remove
+that channel.)
 
 Stdlib only (no FastAPI/uvicorn), so it ships in the slim CLI install. Single
 user, localhost: a lock serializes ecash spends so concurrent requests from a
@@ -14,6 +16,7 @@ tool can't race the wallet.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -54,12 +57,17 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
     # ENTIRE account balance into ecash ONCE, here at startup, decoupled from any
     # individual request. When ecash runs out the user funds + claims again (a
     # deliberate event, not one triggered by a spend).
+    claim_err = {"e": None}
+
     def _claim_all_at_startup():
         try:
             if wallet.account and wallet.account_status().get("balance", 0) > 0:
                 wallet.claim_all()
-        except Exception:
-            pass  # best-effort; a truly empty wallet still returns a clear 402
+        except Exception as e:
+            # best-effort, but don't hide it: a swallowed failure here leaves the
+            # user staring at 402s with an account that looks funded. Surface it in
+            # the startup banner so they can retry `claim` instead of guessing.
+            claim_err["e"] = e
 
     import time as _time
     _models = {"set": None, "ts": 0.0}
@@ -136,15 +144,27 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                 return self._json(400, {"error": "messages required"})
             model = _map_model(body.get("model") or default_model)
             want_stream = bool(body.get("stream"))
+            # Forward EVERY field the client sent except the ones we manage here
+            # (model/messages/stream). The hosted router applies its own security
+            # allowlist, so tool-calling (tools/tool_choice), structured output
+            # (response_format), seeds, penalties, etc. reach the upstream intact —
+            # agents like Cursor/aider depend on these. The old 5-field whitelist
+            # silently dropped tools, so function calls vanished.
             kwargs = {k: v for k, v in body.items()
-                      if k in ("temperature", "top_p", "max_tokens", "stop", "n")}
+                      if k not in ("model", "messages", "stream", "stream_options")}
+            # Paid models stream REAL upstream chunks (preserves tool-call deltas +
+            # usage); the free local lane has no ecash to attach, so it uses a
+            # simple non-streaming pass re-emitted as one SSE chunk.
+            if want_stream and not model.startswith("local/"):
+                return self._openai_stream(messages, model, kwargs)
             try:
                 with lock:  # serialize ecash spends (wallet mutates on spend)
                     reply, _settle = wallet.chat(messages, model=model, stream=False, **kwargs)
             except RuntimeError as e:
                 # insufficient ecash — tell the user how to top up
                 return self._json(402, {"error": {
-                    "message": f"{e}. Run `anon-router claim <credits>` to add ecash.",
+                    "message": f"{e}. Run `anon-router claim` (drains your whole "
+                               "balance to ecash), then restart the proxy.",
                     "type": "insufficient_balance"}})
             except Exception as e:
                 return self._json(502, {"error": str(e)})
@@ -152,6 +172,61 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                 self._stream(reply)
             else:
                 self._json(200, reply)
+
+        def _openai_stream(self, messages, model, kwargs):
+            """Paid OpenAI streaming: open a real upstream SSE stream, consume it
+            UNDER the wallet lock (peeling the in-band ecash change + settling),
+            then replay the genuine upstream chunks to the client. Real chunks carry
+            tool-call deltas and usage that a synthesized single chunk would lose.
+            Buffering under the lock keeps client I/O off the lock, so concurrent
+            clients can't deadlock (same discipline as the Anthropic lane)."""
+            oreq = {"model": model, "messages": messages, "stream": True,
+                    "stream_options": {"include_usage": True}, **kwargs}
+            buffered = []
+            change_holder = {}
+            try:
+                with lock:
+                    resp = wallet.open_stream(oreq)
+                    try:
+                        for line in resp.iter_lines():
+                            s = line.strip() if isinstance(line, str) else line.decode(errors="ignore").strip()
+                            if s == "event: x-cash-change":
+                                change_holder["seen"] = True
+                                continue
+                            if change_holder.get("seen") and s.startswith("data: "):
+                                try:
+                                    change_holder["payload"] = json.loads(s[6:])
+                                except Exception:
+                                    pass
+                                change_holder["seen"] = False
+                                continue
+                            buffered.append(line)
+                    finally:
+                        resp.close()
+                        try:
+                            wallet.finish_stream(change_holder.get("payload"))
+                        except Exception as _e:
+                            # money-safe: pending is preserved and recovered on the next request,
+                            # but leave a trail so a silent change-settlement failure is diagnosable.
+                            print(f"anon-router: change settlement deferred to recovery: {_e}", file=sys.stderr)
+            except RuntimeError as e:
+                return self._json(402, {"error": {
+                    "message": f"{e}. Run `anon-router claim`, then restart the proxy.",
+                    "type": "insufficient_balance"}})
+            except Exception as e:
+                return self._json(502, {"error": str(e)})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for line in buffered:
+                    b = line if isinstance(line, (bytes, bytearray)) else line.encode()
+                    self.wfile.write(b + b"\n")
+                self.wfile.flush()
+            except Exception:
+                pass
 
         def _messages(self, body: dict):
             """Anthropic Messages API (POST /v1/messages) for Claude Code etc.:
@@ -170,7 +245,7 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                 except RuntimeError as e:
                     return self._json(402, {"type": "error", "error": {
                         "type": "insufficient_balance",
-                        "message": f"{e}. Run `anon-router claim <credits>`."}})
+                        "message": f"{e}. Run `anon-router claim`, then restart the proxy."}})
                 except Exception as e:
                     return self._json(502, {"type": "error", "error": {"message": str(e)}})
                 if isinstance(reply, dict) and reply.get("error"):  # upstream error body
@@ -215,12 +290,14 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                         resp.close()
                         try:
                             wallet.finish_stream(change_holder.get("payload"))
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            # money-safe: pending is preserved and recovered on the next request,
+                            # but leave a trail so a silent change-settlement failure is diagnosable.
+                            print(f"anon-router: change settlement deferred to recovery: {_e}", file=sys.stderr)
             except RuntimeError as e:
                 return self._json(402, {"type": "error", "error": {
                     "type": "insufficient_balance",
-                    "message": f"{e}. Run `anon-router claim <credits>`."}})
+                    "message": f"{e}. Run `anon-router claim`, then restart the proxy."}})
             except Exception as e:
                 return self._json(502, {"type": "error", "error": {"message": str(e)}})
             self.send_response(200)
@@ -272,11 +349,20 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
     print(f"      export ANTHROPIC_BASE_URL={base}", flush=True)
     print("      export ANTHROPIC_API_KEY=anon-router      # any non-empty value", flush=True)
     print("      claude              # every request now pays private ecash", flush=True)
-    print(f"  spendable ecash: {bal}   (drained from the account at startup)", flush=True)
-    if bal == 0:
+    print(f"  spendable ecash: {bal}   (drained from the account once, at startup)", flush=True)
+    if claim_err["e"] and bal == 0 and acct_bal > 0:
+        print(f"  ! startup claim failed ({claim_err['e']}); your account still holds "
+              f"{acct_bal} credits.", flush=True)
+        print("    run `anon-router claim`, then restart the proxy.", flush=True)
+    if bal == 0 and acct_bal == 0:
         print("  empty wallet — fund once, then it's all claimed to ecash up front:", flush=True)
         print("      anon-router redeem <voucher>      # or: deposit 0.001 --key <key.json>",
               flush=True)
+    # The proxy claims ONLY at startup (a per-request claim would be a claim->spend
+    # marker the router could use to re-link you). So a mid-session top-up is a
+    # deliberate two-step: fund, then RESTART this proxy to claim the new balance.
+    print("  out of ecash later? fund again, then restart the proxy to claim it.", flush=True)
+    print("  private spends need your real IP hidden too — run with --tor for that.", flush=True)
     print("  the provider sees only the router — never who paid. Ctrl-C to stop.\n", flush=True)
     try:
         srv.serve_forever()

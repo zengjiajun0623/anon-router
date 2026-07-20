@@ -167,7 +167,10 @@ def main() -> int:
     elif args.cmd == "redeem":
         bal = w.redeem_voucher(args.code)
         usd = bal * w.keys()["credit_usd"]
-        print(f"voucher redeemed. balance: {bal} credits (${usd:.4f})")
+        # A voucher mints ecash DIRECTLY into the wallet (no account, no claim step).
+        # Next stop is the proxy — don't send voucher users to `claim`.
+        print(f"voucher redeemed. spendable ecash: {bal} credits (${usd:.4f}). "
+              f"Next: `anon-router serve`")
     elif args.cmd == "account":
         acct = w.account or w.new_account()
         print(f"account key: {acct['api_key']}")
@@ -200,11 +203,21 @@ def main() -> int:
             time.sleep(5)
         ok = "✓" if bal >= target else "…(still crediting)"
         print(f"{ok} account balance: {bal} credits (+{bal - before} this deposit, "
-              f"${bal * w.keys()['credit_usd']:.4f}). Now: cli.py claim {res['expected_credits']}",
+              f"${bal * w.keys()['credit_usd']:.4f}). Now: anon-router claim  "
+              f"(drains the WHOLE balance to ecash in one go — a partial claim that "
+              f"matches your deposit amount would help re-link you)",
               file=sys.stderr)
     elif args.cmd == "claim":
         if not w.account:
-            p.error("no account; run: cli.py deposit <eth> first")
+            # A voucher user has ecash but no account — `claim` is a no-op for them,
+            # not an error. Only send someone to `deposit` if they have nothing at all.
+            bal = w.balance()
+            if bal > 0:
+                print(f"nothing to claim — you already hold {bal} ecash credits "
+                      f"(a voucher mints ecash directly). Run: anon-router serve")
+                return 0
+            p.error("no account and no ecash; run `anon-router redeem <voucher>` or "
+                    "`anon-router deposit <eth> --key <file>` first")
         # Balance-less funding: with no amount, drain the WHOLE account balance to
         # ecash in one claim so nothing links later spends to this account.
         if args.amount is None:
@@ -278,12 +291,13 @@ def main() -> int:
         funded = (ecash + acct_bal) > 0
         proxy_url = "http://127.0.0.1:8788/v1"
         if not funded:
-            nxt = ("fund it: `anon-router redeem <voucher>` (no crypto), or "
-                   "`anon-router deposit <eth> --key <file>`; then `anon-router claim`")
+            nxt = ("fund it: `anon-router redeem <voucher>` (no crypto — mints ecash "
+                   "directly, then `anon-router serve`), or `anon-router deposit <eth> "
+                   "--key <file>` then `anon-router claim` then `anon-router serve`")
         elif ecash < 500:
-            nxt = f"claim ecash: `anon-router claim {min(acct_bal, 50000)}`, then `anon-router serve`"
+            nxt = "claim ecash: `anon-router claim` (drains the whole balance), then `anon-router serve`"
         else:
-            nxt = "`anon-router serve &`, then set your tool's OPENAI_BASE_URL to proxy_url"
+            nxt = f"`anon-router serve &`, then point your tool's OPENAI_BASE_URL at {proxy_url}"
         info = {"router": w.url, "account_key": acct["api_key"], "ecash_balance": ecash,
                 "account_balance": acct_bal, "funded": funded, "ready_to_serve": ecash >= 500,
                 "proxy_url": proxy_url, "next_step": nxt}

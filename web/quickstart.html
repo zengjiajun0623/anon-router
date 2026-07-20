@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>anon-router · quickstart</title>
+<style>
+  :root {
+    --bg: #f6f7f8; --panel: #ffffff; --panel2: #f1f4f5; --text: #1a1e20;
+    --muted: #5c6770; --accent: #0f766e; --accent-dim: #b7dcd5;
+    --border: #dde3e6; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 48px 20px 96px; }
+  h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.02em; }
+  .lede { color: var(--muted); font-size: 16px; margin: 0 0 8px; }
+  .back { font-size: 13px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); margin: 34px 0 10px; font-weight: 600; }
+  p { margin: 0 0 12px; }
+  pre {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px 16px; overflow-x: auto;
+    font-size: 13px; line-height: 1.5; margin: 0 0 12px;
+  }
+  code.inl { background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 5px; font-size: 13px; }
+  .muted { color: var(--muted); }
+  .note { font-size: 13px; color: var(--muted); }
+  .tag { display:inline-block; font-size: 11px; color: var(--accent);
+    border: 1px solid var(--accent-dim); border-radius: 999px; padding: 1px 8px;
+    vertical-align: middle; margin-left: 6px; }
+  .c { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="back"><a href="/">&larr; anon-router</a></p>
+  <h1>Quickstart</h1>
+  <p class="lede">Pay crypto for AI inference, with spends that can't be linked to your deposit.
+    Point any OpenAI- or Anthropic-compatible tool at a local proxy. No account, no card, no code changes.</p>
+
+  <h2>How it works</h2>
+  <p>You fund once and get blind-signed ecash tokens. A tiny proxy on your machine
+    (<code class="inl">anon-router serve</code>) attaches a token to each request and forwards it to the
+    hosted router. The router can verify a token is valid and unspent, but the token carries no account
+    identifier, so it can't link your spend to your deposit. (Without Tor your IP and timing can still
+    correlate your requests, so add <code class="inl">--tor</code> for transport privacy.) The proxy is a
+    forwarder, not a model: no GPU, a few MB of RAM.</p>
+  <p class="note">Why local: the token has to be attached client-side. If a server held it for you, that
+    server would see the link, which is exactly what we remove. So there's a thin local relay.</p>
+
+  <h2>1 · Install</h2>
+  <pre>pip install git+https://github.com/zengjiajun0623/anon-router.git</pre>
+  <p class="note">Installs the <code class="inl">anon-router</code> CLI from source. (A published
+    <code class="inl">pip install anon-router</code> is coming.)</p>
+
+  <h2>2 · Get credits</h2>
+  <p><strong>Option A — voucher</strong> (no crypto). Redeeming mints ecash straight into your wallet,
+    so funding is done: skip step 3 and go to <a href="#run">step 4</a>.</p>
+  <pre>anon-router redeem ar-XXXXXXXX</pre>
+  <p><strong>Option B — deposit</strong> Sepolia test ETH from a funding key file (never paste a raw key
+    on the command line):</p>
+  <pre>anon-router deposit 0.05 --key wallet.json</pre>
+
+  <h2>3 · Claim to ecash <span class="muted">(deposit only)</span></h2>
+  <p>If you deposited, drain your whole balance into ecash tokens in one step. <span class="muted">Voucher
+    users already hold ecash and can skip this. Claiming the full balance (not a partial amount matching
+    your deposit) is what keeps funding and spending unlinkable.</span></p>
+  <pre>anon-router claim</pre>
+
+  <h2 id="run">4 · Run the proxy</h2>
+  <pre>anon-router serve
+<span class="c"># → base_url = http://127.0.0.1:8788/v1   (api_key = anything)</span>
+<span class="c"># add --tor to hide your IP from the router too</span></pre>
+  <p class="note">Out of ecash later? Fund again, then restart the proxy to claim the new balance
+    (the proxy claims only at startup, on purpose — a per-request claim would be a re-link marker).</p>
+
+  <h2>5 · Call it</h2>
+  <p><strong>OpenAI SDK / Python</strong> <span class="tag">chat + tools + streaming</span></p>
+  <pre>from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8788/v1", api_key="anon")
+
+resp = client.chat.completions.create(
+    model="openai/gpt-4o-mini",
+    messages=[{"role": "user", "content": "In one word, what is ecash?"}],
+)
+print(resp.choices[0].message.content)</pre>
+
+  <p><strong>curl</strong></p>
+  <pre>curl http://127.0.0.1:8788/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4o-mini",
+    "messages": [{"role": "user", "content": "In one word, what is ecash?"}]
+  }'</pre>
+
+  <p><strong>Claude Code</strong> <span class="tag">Anthropic API</span></p>
+  <pre>export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+export ANTHROPIC_API_KEY=anon      <span class="c"># any non-empty value</span>
+claude              <span class="c"># every request now pays private ecash</span></pre>
+  <p class="note">On the Anthropic lane the answer arrives once it's complete rather than token by token.
+    That's deliberate: the proxy settles each request's ecash before replying, which keeps concurrent
+    agent requests from racing your wallet.</p>
+
+  <p><strong>Cursor, aider, LangChain, LiteLLM…</strong> anything OpenAI-compatible: set the base URL to
+    <code class="inl">http://127.0.0.1:8788/v1</code> and the API key to any non-empty string.</p>
+
+  <h2>Models</h2>
+  <pre>anon-router models            <span class="c"># list what the router can route to</span></pre>
+  <p>Use provider-prefixed IDs like <code class="inl">openai/gpt-4o-mini</code> or
+    <code class="inl">anthropic/claude-3.5-sonnet</code>. Bare names (<code class="inl">gpt-4o-mini</code>)
+    are mapped for you. <code class="inl">local/*</code> models are free.</p>
+
+  <h2>What's private, honestly</h2>
+  <p class="note">Spends are cryptographically unlinkable to your deposit (blind signatures), and the model
+    provider only ever sees the router. Limits: the model reads your prompt content (use a
+    <code class="inl">local/*</code> model to keep it off third parties); the balance is custodial (keep it
+    small); on-chain funding is pseudonymous (fund from a fresh wallet, a common round amount); and without
+    <code class="inl">--tor</code> your IP and timing still correlate your requests. Full posture at
+    <a href="/privacy">/privacy</a>.</p>
+
+  <p class="note" style="margin-top:28px">Testnet demo — deposits use Sepolia test ETH; no real funds.</p>
+</div>
+</body>
+</html>
