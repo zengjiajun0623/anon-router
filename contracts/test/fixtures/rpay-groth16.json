@@ -1,0 +1,21 @@
+{
+  "_comment": "OUR OWN real SP1 Groth16 proof of the R_pay genesis-branch guest (research/m4b-groth16/program). Unlike sp1-canonical-groth16.json (SP1's Fibonacci sample, used only to prove the on-chain primitive), THIS proof is bound to OUR statement: its two gnark public inputs are programVKey below (public_input[0]) and sha256(publicValues)&((1<<253)-1) (public_input[1]). Generated end to end: Mac ran STARK core->compress->shrink->wrap (research/m4b-real-groth16.md); the resulting gnark witness was proved on the RTX 3080 (WSL 'sp1', /root/circuit = canonical SP1 v6.1.0 trusted-setup artifacts groth16_pk/vk/circuit.bin), producing /mnt/d/wsl/output-test.bin (bincode Groth16Bn254Proof, 1670 bytes, sha256 b20440d7eb43e43fd5995c0f72e47c54998ec49009e0f4effeedc24bd6b3941c). proof below = 4-byte v6.1.0 verifier selector (0x4388a21c == VERIFIER_HASH()[0:4]) ++ encoded_proof (abi.encode(exitCode=0, vkRoot, nonce=0, uint256[8])). Verifies on-chain against the vendored SP1VerifierGroth16 v6.1.0 (its Groth16Verifier.sol embeds the same VK as /root/circuit/groth16_vk.bin, byte-for-byte modulo the pragma caret). See test/SP1PayVerifier.t.sol :: SP1PayVerifierOurRealGroth16Test.",
+  "relation": "R_pay (genesis branch)",
+  "verifierVersion": "v6.1.0",
+  "verifierSelector": "0x4388a21c",
+  "programVKey": "0x000be6d3dd1da7bbf5f2884fe2ce6d76a4d579877e8a958dad915c4381ec2cc6",
+  "publicValuesSchema": "abi.encode(uint256 delta, bytes32 N_i, bytes32 C_i, bytes32 root)",
+  "publicValues": "0x00000000000000000000000000000000000000000000000000000000000003e819b4c0bd0770d9a37b35018c9ba54e4a8553ebdfba0357c1bce21849842d06a83f311d313e14afbc2efd21030dfe4627c30e7576df7452f0d44140a2b8c015466088f461c4f8c507608b6a40487efdaac8d2f4f124d3571690e287de647ead1f",
+  "publicValuesDecoded": {
+    "delta": 1000,
+    "N_i": "0x19b4c0bd0770d9a37b35018c9ba54e4a8553ebdfba0357c1bce21849842d06a8",
+    "C_i": "0x3f311d313e14afbc2efd21030dfe4627c30e7576df7452f0d44140a2b8c01546",
+    "root": "0x6088f461c4f8c507608b6a40487efdaac8d2f4f124d3571690e287de647ead1f"
+  },
+  "proof": "0x4388a21c0000000000000000000000000000000000000000000000000000000000000000002f850ee998974d6cc00e50cd0814b098c05bfade466d28573240d057f253520000000000000000000000000000000000000000000000000000000000000000186750fb6183d9db01a957afd00970d8bc293a14fd646537a93899a0d4d1139510f87ee52defa6c24fdd9fa207aaea62e1f585715bc3a80271bec22f9be2c4ab0e969dd8dcb2a01f8e438b2e271f37646aa7f6dde0fef7d68432d4ae04bc305a21fc78ce60500a7c5d089c316c28e66170f33d5becea42c452d94dce744d1aab04f655719a8063e1c0ffee07cbd6ca766bda07bce31e7f91adf61dd3f3b896fa08ba6c87290b752db9efaf43fa73f74011f2ede14b00f0f02b8a1c081a31e97b2f4be80b49f173394d5b5a4cf096b77aa982cd0b90224f234ddb83b57d3e7d2a0ea2c23eb7915098a8b0c19676dd7c0d8b1018da816a51787ad26e39587bb954",
+  "encodedProofDecoded": {
+    "exitCode": 0,
+    "vkRoot": "0x002f850ee998974d6cc00e50cd0814b098c05bfade466d28573240d057f25352",
+    "nonce": 0
+  }
+}

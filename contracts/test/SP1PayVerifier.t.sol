@@ -7,6 +7,7 @@ import {MockVerifier} from "../src/MockVerifier.sol";
 import {IVerifier} from "../src/IVerifier.sol";
 import {ISP1Verifier} from "sp1-contracts/contracts/src/ISP1Verifier.sol";
 import {SP1Verifier} from "sp1-contracts/contracts/src/v4.0.0-rc.3/SP1VerifierGroth16.sol";
+import {SP1Verifier as SP1VerifierV6} from "sp1-contracts/contracts/src/v6.1.0/SP1VerifierGroth16.sol";
 
 /// @dev SP1's REAL published Groth16 proof (canonical Fibonacci example),
 ///      vendored from sp1-contracts/contracts/test/SP1VerifierGroth16.t.sol.
@@ -97,6 +98,156 @@ contract SP1PayVerifierRealGroth16Test is Test {
             SP1Fixture.proof()
         );
         assertFalse(ok, "verifyPayment must return false (not revert) when the real proof rejects");
+    }
+}
+
+/// @dev OUR OWN real SP1 Groth16 proof of the R_pay genesis-branch guest
+///      (research/m4b-groth16/program). Unlike SP1Fixture (SP1's Fibonacci
+///      sample), this proof is bound to OUR statement: its two gnark public
+///      inputs are exactly programVKey() and sha256(publicValues())&mask.
+///      Generated on the RTX 3080 from the Mac-produced gnark witness against
+///      the canonical SP1 v6.1.0 trusted-setup circuit; see
+///      research/m4b-real-groth16.md and test/fixtures/rpay-groth16.json.
+///      `proof()` = 4-byte v6.1.0 selector (0x4388a21c) ++ abi.encode(exitCode,
+///      vkRoot, nonce, uint256[8]). Decoded statement: delta=1000, and the
+///      N_i / C_i / root below.
+library RPayFixture {
+    function programVKey() internal pure returns (bytes32) {
+        return 0x000be6d3dd1da7bbf5f2884fe2ce6d76a4d579877e8a958dad915c4381ec2cc6;
+    }
+
+    // Decoded R_pay statement (challenge arguments) the proof commits to.
+    function delta() internal pure returns (uint256) {
+        return 1000;
+    }
+
+    function nI() internal pure returns (bytes32) {
+        return 0x19b4c0bd0770d9a37b35018c9ba54e4a8553ebdfba0357c1bce21849842d06a8;
+    }
+
+    function cI() internal pure returns (bytes32) {
+        return 0x3f311d313e14afbc2efd21030dfe4627c30e7576df7452f0d44140a2b8c01546;
+    }
+
+    function root() internal pure returns (bytes32) {
+        return 0x6088f461c4f8c507608b6a40487efdaac8d2f4f124d3571690e287de647ead1f;
+    }
+
+    /// abi.encode(delta, N_i, C_i, root) — exactly what verifyPayment re-encodes.
+    function publicValues() internal pure returns (bytes memory) {
+        return
+            hex"00000000000000000000000000000000000000000000000000000000000003e819b4c0bd0770d9a37b35018c9ba54e4a8553ebdfba0357c1bce21849842d06a83f311d313e14afbc2efd21030dfe4627c30e7576df7452f0d44140a2b8c015466088f461c4f8c507608b6a40487efdaac8d2f4f124d3571690e287de647ead1f";
+    }
+
+    function proof() internal pure returns (bytes memory) {
+        return
+            hex"4388a21c0000000000000000000000000000000000000000000000000000000000000000002f850ee998974d6cc00e50cd0814b098c05bfade466d28573240d057f253520000000000000000000000000000000000000000000000000000000000000000186750fb6183d9db01a957afd00970d8bc293a14fd646537a93899a0d4d1139510f87ee52defa6c24fdd9fa207aaea62e1f585715bc3a80271bec22f9be2c4ab0e969dd8dcb2a01f8e438b2e271f37646aa7f6dde0fef7d68432d4ae04bc305a21fc78ce60500a7c5d089c316c28e66170f33d5becea42c452d94dce744d1aab04f655719a8063e1c0ffee07cbd6ca766bda07bce31e7f91adf61dd3f3b896fa08ba6c87290b752db9efaf43fa73f74011f2ede14b00f0f02b8a1c081a31e97b2f4be80b49f173394d5b5a4cf096b77aa982cd0b90224f234ddb83b57d3e7d2a0ea2c23eb7915098a8b0c19676dd7c0d8b1018da816a51787ad26e39587bb954";
+    }
+}
+
+/// @notice PART 1b — OUR OWN real R_pay Groth16 proof, verified on-chain.
+///
+/// This is the fixture-vs-fresh gap the earlier milestone could not close: it
+/// runs the REAL on-chain BN254 pairing check over a Groth16 proof WE generated
+/// (RTX 3080) of OUR R_pay genesis-branch guest, against the vendored
+/// SP1VerifierGroth16 v6.1.0 (selector 0x4388a21c) — the exact verifier version
+/// whose trusted-setup circuit produced the proof. Crucially it exercises the
+/// TRUE path of SP1PayVerifier.verifyPayment with our own proof: constructed
+/// with OUR program vkey, verifyPayment(delta, N_i, C_i, root, proof) re-encodes
+/// the 128-byte statement, forwards it, the pairing succeeds, and it returns
+/// true. Local proving was previously RAM-blocked (research/m4b-real-groth16.md
+/// §3); the proof was generated on a 32GB+ host, no contract change required.
+contract SP1PayVerifierOurRealGroth16Test is Test {
+    SP1VerifierV6 internal sp1;
+
+    function setUp() public {
+        sp1 = new SP1VerifierV6();
+    }
+
+    /// Sanity: the vendored v6.1.0 verifier is the version our proof targets.
+    function test_verifierIsV6() public view {
+        assertEq(sp1.VERSION(), "v6.1.0");
+        assertEq(bytes4(sp1.VERIFIER_HASH()), bytes4(hex"4388a21c"));
+    }
+
+    /// OUR real Groth16 proof of OUR R_pay statement verifies on-chain
+    /// (no revert == the pairing check accepted it). This is the exact
+    /// ISP1Verifier.verifyProof call that verifyPayment depends on.
+    function test_ourRealRPayProofVerifiesOnChain() public view {
+        sp1.verifyProof(RPayFixture.programVKey(), RPayFixture.publicValues(), RPayFixture.proof());
+    }
+
+    /// THE headline: our own proof routed THROUGH SP1PayVerifier.verifyPayment
+    /// on the TRUE path. Constructed with our program vkey; verifyPayment
+    /// re-encodes (delta, N_i, C_i, root) to the 128-byte public values, the
+    /// real pairing succeeds, and it returns true. address(0) fallback proves
+    /// the true result comes from the real verifier, not a fallback.
+    function test_verifyPayment_ourRealProof_truePath() public {
+        SP1PayVerifier pay =
+            new SP1PayVerifier(address(sp1), RPayFixture.programVKey(), address(0));
+        bool ok = pay.verifyPayment(
+            RPayFixture.delta(),
+            RPayFixture.nI(),
+            RPayFixture.cI(),
+            RPayFixture.root(),
+            RPayFixture.proof()
+        );
+        assertTrue(ok, "our own R_pay Groth16 proof must verify through verifyPayment");
+    }
+
+    /// The re-encoded public values must equal exactly the bytes the proof was
+    /// generated over (guards the ABI schema the guest commits to).
+    function test_verifyPaymentEncodingMatchesProofPublicValues() public pure {
+        bytes memory reencoded = abi.encode(
+            RPayFixture.delta(), RPayFixture.nI(), RPayFixture.cI(), RPayFixture.root()
+        );
+        assertEq(keccak256(reencoded), keccak256(RPayFixture.publicValues()));
+    }
+
+    /// Report on-chain gas of verifying our real R_pay proof.
+    function test_gas_ourRealGroth16Verify() public {
+        uint256 g = gasleft();
+        sp1.verifyProof(RPayFixture.programVKey(), RPayFixture.publicValues(), RPayFixture.proof());
+        emit log_named_uint("rpay_groth16_verify_gas", g - gasleft());
+    }
+
+    /// A bit-flip inside our proof body fails the pairing check.
+    function test_ourProof_rejectsTamperedProof() public {
+        bytes memory bad = RPayFixture.proof();
+        bad[8] ^= 0x01; // first byte past the 4-byte selector
+        vm.expectRevert();
+        sp1.verifyProof(RPayFixture.programVKey(), RPayFixture.publicValues(), bad);
+    }
+
+    /// Perturbing our public values (a different R_pay statement) fails.
+    function test_ourProof_rejectsTamperedPublicValues() public {
+        bytes memory badPV = RPayFixture.publicValues();
+        badPV[31] ^= 0x01; // flip a bit in delta
+        vm.expectRevert();
+        sp1.verifyProof(RPayFixture.programVKey(), badPV, RPayFixture.proof());
+    }
+
+    /// A wrong program vkey fails.
+    function test_ourProof_rejectsWrongVKey() public {
+        vm.expectRevert();
+        sp1.verifyProof(keccak256("not our program"), RPayFixture.publicValues(), RPayFixture.proof());
+    }
+
+    /// verifyPayment with a perturbed statement returns false (real verifier
+    /// rejects the mismatched public values; never reverts).
+    function test_verifyPayment_ourProof_rejectsWrongStatement() public {
+        SP1PayVerifier pay =
+            new SP1PayVerifier(address(sp1), RPayFixture.programVKey(), address(0));
+        assertFalse(
+            pay.verifyPayment(
+                RPayFixture.delta() + 1,
+                RPayFixture.nI(),
+                RPayFixture.cI(),
+                RPayFixture.root(),
+                RPayFixture.proof()
+            ),
+            "a different delta is a different statement and must not verify"
+        );
     }
 }
 

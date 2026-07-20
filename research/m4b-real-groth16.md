@@ -88,7 +88,43 @@ Timings (M-series, 8 cores usable in colima, 16 GB host — run 2026-07-19):
   proof produced.
 - host-side verify: not reached.
 
-### BLOCKER — gnark Groth16 wrap OOMs on this machine
+### RESOLVED (2026-07-20) — proof generated on the RTX 3080, wired + verified on-chain
+
+The RAM blocker below was resolved by moving only the final gnark Groth16 wrap
+to the 32GB+ RTX 3080 (option (a)). The Mac-produced gnark witness
+(`groth16_witness.json`, from the STARK core -> compress -> shrink -> wrap that
+completed natively) was proved on the 3080 under WSL distro `sp1`, using the
+canonical SP1 **v6.1.0** trusted-setup artifacts in `/root/circuit`
+(`groth16_pk.bin` 5.8GB, `groth16_vk.bin`, `groth16_circuit.bin` 2.4GB) via the
+`sp1-recursion-gnark-cli` `prove` subcommand. Output:
+`/mnt/d/wsl/output-test.bin` (1670 bytes, bincode `Groth16Bn254Proof`, sha256
+`b20440d7…3941c`).
+
+Provenance checks (all passing, see `contracts/test/fixtures/rpay-groth16.json`):
+
+- The proof's two gnark public inputs are exactly **our** statement:
+  `public_input[0]` == program vkey `0x000be6d3…` and `public_input[1]` ==
+  `sha256(publicValues) & ((1<<253)-1)` over our 128-byte R_pay public values.
+- The proof's `encoded_proof` decodes to `abi.encode(exitCode=0, vkRoot, nonce=0,
+  uint256[8])` with `vkRoot == VK_ROOT()` of v6.1.0.
+- The vendored `lib/sp1-contracts/.../v6.1.0/Groth16Verifier.sol` embeds the
+  identical verifying key to the 3080's `/root/circuit/groth16_vk.bin` (its
+  generated `Groth16Verifier.sol` differs only by the `^` in the pragma), so the
+  on-chain pairing uses the exact VK that produced the proof.
+
+On-chain proof bytes = the 4-byte v6.1.0 selector `0x4388a21c`
+(== `VERIFIER_HASH()[0:4]`) ++ `encoded_proof` = **356 bytes**. This verifies
+on-chain against the vendored `SP1VerifierGroth16` v6.1.0 and, crucially, routes
+through `SP1PayVerifier.verifyPayment(...)` on the **TRUE path** returning true.
+See `contracts/test/SP1PayVerifier.t.sol :: SP1PayVerifierOurRealGroth16Test`
+(9 tests) and `RPayFixture`.
+
+- **R_pay Groth16 on-chain verify gas: 231,018** (v6.1.0, our proof).
+- `forge test` now: **39 passed, 0 failed** (all suites).
+
+The original blocker analysis is retained below for the record.
+
+### BLOCKER (historical) — gnark Groth16 wrap OOMs on the 16GB Mac
 
 The docker gnark step read the R1CS then died with `Docker command failed`
 and no application error (only the `linux/amd64 on arm64` platform warning on
@@ -113,8 +149,14 @@ fetch failed) — the underlying cause is the docker OOM above.
 
 ## 3b. On-chain path — proven with SP1's REAL published Groth16 proof
 
-Because our own R_pay proof is RAM-blocked, the on-chain verification path is
-proven end-to-end with SP1's canonical published Groth16 proof (the Fibonacci
+> Update 2026-07-20: our own R_pay proof is no longer RAM-blocked (§3 RESOLVED);
+> it is now generated on the RTX 3080 and verified on-chain against v6.1.0. The
+> SP1 canonical-fixture path below is retained as an independent second proof of
+> the primitive (against v4.0.0-rc.3). Both run in the test suite.
+
+Because our own R_pay proof was RAM-blocked at the time, the on-chain
+verification path was first proven end-to-end with SP1's canonical published
+Groth16 proof (the Fibonacci
 example, `contracts/test/fixtures/sp1-canonical-groth16.json`), which is a
 GENUINE Groth16 proof. Its 4-byte selector `0x11b6a09d` matches the vendored
 `SP1VerifierGroth16` **v4.0.0-rc.3** `VERIFIER_HASH()`, so the vendored
@@ -181,26 +223,31 @@ On-chain side (all under `contracts/`):
 6. **Prover latency**: local groth16 wrap is minutes-scale; for production
    use the Succinct prover network (same proof bytes, same verifier).
 
-## 5. Outcome (2026-07-19 milestone)
+## 5. Outcome (2026-07-19 milestone; updated 2026-07-20)
 
-Shippable milestone reached, **genesis-branch only**, with one RAM-gated gap:
+Shippable milestone reached, **genesis-branch only**. The 2026-07-19 RAM gap is
+now **closed** (proof generated on the RTX 3080, §3 RESOLVED):
 
 - Guest + witness + host + program vkey + 128-byte public values: **done and
   correct** (execute-verified). vkey `0x000be6d3…`.
-- Real R_pay Groth16 proof: **NOT produced** — gnark wrap OOMs on this 16 GB
-  Mac (§3 blocker). Needs a >=32 GB host or the Succinct prover network. No
-  code change required to unblock.
-- On-chain verification path: **PROVEN** with SP1's real published Groth16
-  proof against the vendored `SP1VerifierGroth16` — 209,896 gas, tamper-
-  rejection, and correct `verifyPayment` re-encode/forward. `forge test
-  --match-contract SP1PayVerifier` = **11 passed, 0 failed**.
+- Real R_pay Groth16 proof: **PRODUCED** on the RTX 3080 and **verified
+  on-chain** against the vendored `SP1VerifierGroth16` v6.1.0. It is bound to our
+  statement (public inputs == our vkey + `sha256(publicValues)&mask`) and routes
+  through `SP1PayVerifier.verifyPayment` on the TRUE path, returning true —
+  231,018 gas. No contract change was needed to unblock. Fixture:
+  `contracts/test/fixtures/rpay-groth16.json`.
+- On-chain verification path: **PROVEN** two ways — (i) our own real R_pay proof
+  above (v6.1.0), and (ii) SP1's real published Groth16 proof against v4.0.0-rc.3
+  (209,896 gas, retained as `SP1Fixture`). Tamper-rejection (bit-flipped proof,
+  perturbed public values, wrong vkey) and correct `verifyPayment`
+  re-encode/forward are covered for both. `forge test` = **39 passed, 0 failed**
+  (of which `--match-contract SP1PayVerifier` = 20 passed).
 
 ### Precise remaining gap
 
-1. **Our own R_pay Groth16 proof** (fixture-vs-fresh): the on-chain TRUE path
-   of `verifyPayment` with *our* proof is unexecuted only because the local
-   wrap is RAM-blocked. Everything up to and including the wrap ran; the gnark
-   step and its 32 GB requirement are the sole blocker.
+1. ~~**Our own R_pay Groth16 proof** (fixture-vs-fresh)~~ — **DONE 2026-07-20**.
+   The on-chain TRUE path of `verifyPayment` with *our* proof now executes and
+   passes; the wrap ran on a 32GB+ host (RTX 3080), no code change required.
 2. **SignedBranch disjunct** (the intended scope cut for this milestone): the
    guest proves only the genesis branch of R_pay — a complete, sound instance
    for first payments. The flat `{GenesisBranch, SignedBranch}` disjunction is
