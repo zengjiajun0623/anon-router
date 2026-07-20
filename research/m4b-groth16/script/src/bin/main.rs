@@ -39,6 +39,35 @@ struct JWitness {
     r_i: String,
     rec_index: u32,
     rec_path: Vec<String>,
+    // Signed-branch fields (Phase 4); dummies are filled in when absent so a
+    // genesis fixture without them still drives the full-disjunction guest.
+    #[serde(rename = "C_prev", default)]
+    c_prev: Option<String>,
+    #[serde(default)]
+    r_prev: Option<String>,
+    #[serde(default)]
+    sig_index: Option<u32>,
+    #[serde(default)]
+    wots_sig: Option<String>,
+    #[serde(default)]
+    auth_path: Option<String>,
+}
+
+fn dummy_bytes(seed: &[u8], label: &str, n: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::with_capacity(n);
+    let mut ctr: u32 = 0;
+    while out.len() < n {
+        let mut m = Sha256::new();
+        m.update(b"rpay-dummy");
+        m.update(label.as_bytes());
+        m.update(ctr.to_be_bytes());
+        m.update(seed);
+        out.extend_from_slice(&m.finalize());
+        ctr += 1;
+    }
+    out.truncate(n);
+    out
 }
 
 #[derive(Deserialize)]
@@ -81,6 +110,16 @@ fn main() {
     stdin.write(&fx.witness.rec_index);
     let path_flat: Vec<u8> = fx.witness.rec_path.iter().flat_map(|p| hx(p)).collect();
     stdin.write_vec(path_flat);
+    // signed-branch fields (dummies when absent — genesis fixture)
+    let seed = hx(&fx.witness.r_i);
+    let opt = |v: &Option<String>, label: &str, n: usize| -> Vec<u8> {
+        v.as_ref().map(|s| hx(s)).unwrap_or_else(|| dummy_bytes(&seed, label, n))
+    };
+    stdin.write_vec(opt(&fx.witness.c_prev, "C_prev", 32));
+    stdin.write_vec(opt(&fx.witness.r_prev, "r_prev", 32));
+    stdin.write(&fx.witness.sig_index.unwrap_or(0x0aa));
+    stdin.write_vec(opt(&fx.witness.wots_sig, "wots_sig", 67 * 32));
+    stdin.write_vec(opt(&fx.witness.auth_path, "auth_path", 12 * 32));
 
     let client = ProverClient::from_env();
 

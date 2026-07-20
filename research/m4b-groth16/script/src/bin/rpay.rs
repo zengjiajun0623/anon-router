@@ -1,16 +1,26 @@
-//! rpay — per-payment host CLI for the R_pay genesis-branch SP1 guest.
+//! rpay — per-payment host CLI for the R_pay SP1 guest (full disjunction:
+//! genesis OR signed parent, branch hidden).
 //!
 //! This is the production driver behind `confetti/sp1.py::RealSP1Prover`:
-//! the CLI wallet calls `prove` (core STARK, ~25 s on an M4 laptop) and the
-//! router calls `verify` (sub-second with a warm vkey cache). The guest ELF
-//! is embedded, so verification is pinned to the exact compiled circuit.
+//! the CLI wallet calls `prove` (core STARK, native CPU on an M4 laptop) and
+//! the router calls `verify` (sub-second with a warm vkey cache). The guest
+//! ELF is embedded, so verification is pinned to the exact compiled circuit.
+//!
+//! The fixture witness carries the signed-branch fields (C_prev, r_prev,
+//! sig_index, wots_sig, auth_path) for BOTH branches — real parent data for a
+//! signed payment, uniformly random dummies for a genesis payment (filled by
+//! sp1.py; deterministic host-side fill if absent, for old fixtures). The
+//! guest always executes both branch checks, so the proof shape does not
+//! reveal which branch held.
 //!
 //! Usage:
-//!   rpay prove  <fixture.json>   <proof.out>   — {statement, witness} JSON in,
+//!   rpay prove   <fixture.json>   <proof.out>  — {statement, witness} JSON in,
 //!                                               bincode SP1 core proof out
-//!   rpay verify <statement.json> <proof.in>    — exit 0 iff the proof is valid
+//!   rpay verify  <statement.json> <proof.in>   — exit 0 iff the proof is valid
 //!                                               AND its public values equal
 //!                                               abi(delta, N_i, C_i, root)
+//!   rpay execute <fixture.json>                — run the guest only (no proof):
+//!                                               fast witness check + cycle count
 //!   rpay vkey                                  — print the guest vkey hash
 //!
 //! Timing/result metadata is printed as one JSON object on stdout.
@@ -53,6 +63,40 @@ struct JWitness {
     r_i: String,
     rec_index: u32,
     rec_path: Vec<String>,
+    // Signed-branch fields. Real parent data for a signed payment; uniformly
+    // random dummies for genesis (normally filled by sp1.py — defaulted here
+    // only so pre-Phase-4 genesis fixtures still load).
+    #[serde(rename = "C_prev", default)]
+    c_prev: Option<String>,
+    #[serde(default)]
+    r_prev: Option<String>,
+    #[serde(default)]
+    sig_index: Option<u32>,
+    #[serde(default)]
+    wots_sig: Option<String>, // 67*32 bytes, flat hex
+    #[serde(default)]
+    auth_path: Option<String>, // height*32 bytes, flat hex
+}
+
+const WOTS_LEN: usize = 67;
+const DUMMY_XMSS_HEIGHT: usize = 12; // matches the router's CHANNEL_HEIGHT default
+
+/// Deterministic uniform-looking filler for absent signed-branch fields
+/// (legacy genesis fixtures): sha256 counter-mode over the witness randomness.
+fn dummy_bytes(seed: &[u8], label: &str, n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let mut ctr: u32 = 0;
+    while out.len() < n {
+        let mut m = Sha256::new();
+        m.update(b"rpay-dummy");
+        m.update(label.as_bytes());
+        m.update(ctr.to_be_bytes());
+        m.update(seed);
+        out.extend_from_slice(&m.finalize());
+        ctr += 1;
+    }
+    out.truncate(n);
+    out
 }
 
 #[derive(Deserialize)]
@@ -121,19 +165,14 @@ fn light_client_and_vk() -> (tokio::runtime::Runtime, LightProver, SP1VerifyingK
     (rt, client, vk, secs, false)
 }
 
-fn cmd_prove(fixture_path: &str, proof_out: &str) {
-    let fx: Fixture = serde_json::from_str(
-        &fs::read_to_string(fixture_path).expect("cannot read fixture json"),
-    )
-    .expect("bad fixture json");
-
+fn build_stdin(fx: &Fixture) -> SP1Stdin {
     let mut stdin = SP1Stdin::new();
     // statement
     stdin.write(&fx.statement.delta);
     stdin.write_vec(hx(&fx.statement.n_i));
     stdin.write_vec(hx(&fx.statement.c_i));
     stdin.write_vec(hx(&fx.statement.root));
-    // witness
+    // witness (common)
     stdin.write_vec(hx(&fx.witness.cid));
     stdin.write(&fx.witness.d);
     stdin.write_vec(hx(&fx.witness.c));
@@ -146,6 +185,70 @@ fn cmd_prove(fixture_path: &str, proof_out: &str) {
     stdin.write(&fx.witness.rec_index);
     let path_flat: Vec<u8> = fx.witness.rec_path.iter().flat_map(|p| hx(p)).collect();
     stdin.write_vec(path_flat);
+    // witness (signed branch; dummies if absent)
+    let seed = hx(&fx.witness.r_i);
+    let opt = |v: &Option<String>, label: &str, n: usize| -> Vec<u8> {
+        match v {
+            Some(s) => {
+                let b = hx(s);
+                assert_eq!(b.len(), n, "witness field {label} must be {n} bytes");
+                b
+            }
+            None => dummy_bytes(&seed, label, n),
+        }
+    };
+    stdin.write_vec(opt(&fx.witness.c_prev, "C_prev", 32));
+    stdin.write_vec(opt(&fx.witness.r_prev, "r_prev", 32));
+    stdin.write(&fx.witness.sig_index.unwrap_or(0x0aa));
+    stdin.write_vec(opt(&fx.witness.wots_sig, "wots_sig", WOTS_LEN * 32));
+    match &fx.witness.auth_path {
+        Some(s) => {
+            let b = hx(s);
+            assert_eq!(b.len() % 32, 0, "auth_path must be a multiple of 32 bytes");
+            stdin.write_vec(b);
+        }
+        None => stdin.write_vec(dummy_bytes(&seed, "auth_path", DUMMY_XMSS_HEIGHT * 32)),
+    }
+    stdin
+}
+
+fn load_fixture(fixture_path: &str) -> Fixture {
+    serde_json::from_str(&fs::read_to_string(fixture_path).expect("cannot read fixture json"))
+        .expect("bad fixture json")
+}
+
+fn cmd_execute(fixture_path: &str) {
+    let fx = load_fixture(fixture_path);
+    let stdin = build_stdin(&fx);
+    let client = ProverClient::from_env();
+    let t = Instant::now();
+    let (pv, report) = match client.execute(ELF, stdin).run() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("guest rejected witness: {e}");
+            exit(2);
+        }
+    };
+    // A guest assert failure panics -> halt with a non-zero exit code (the
+    // executor still returns Ok). Treat that as rejection.
+    if report.exit_code != 0 {
+        eprintln!("guest rejected witness: exit code {}", report.exit_code);
+        exit(2);
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "cycles": report.total_instruction_count(),
+            "execute_s": t.elapsed().as_secs_f64(),
+            "public_values": hex::encode(pv.as_slice()),
+        })
+    );
+}
+
+fn cmd_prove(fixture_path: &str, proof_out: &str) {
+    let fx = load_fixture(fixture_path);
+    let stdin = build_stdin(&fx);
 
     let client = ProverClient::from_env();
 
@@ -157,6 +260,10 @@ fn cmd_prove(fixture_path: &str, proof_out: &str) {
             exit(2);
         }
     };
+    if report.exit_code != 0 {
+        eprintln!("guest rejected witness: exit code {}", report.exit_code);
+        exit(2);
+    }
     let cycles = report.total_instruction_count();
 
     let t = Instant::now();
@@ -239,6 +346,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("prove") if args.len() == 4 => cmd_prove(&args[2], &args[3]),
         Some("verify") if args.len() == 4 => cmd_verify(&args[2], &args[3]),
+        Some("execute") if args.len() == 3 => cmd_execute(&args[2]),
         Some("vkey") => {
             let (_rt, _client, vk, _, _) = light_client_and_vk();
             println!("{}", vk.bytes32());
@@ -247,6 +355,7 @@ fn main() {
             eprintln!(
                 "usage: rpay prove <fixture.json> <proof.out>\n       \
                  rpay verify <statement.json> <proof.in>\n       \
+                 rpay execute <fixture.json>\n       \
                  rpay vkey"
             );
             exit(64);

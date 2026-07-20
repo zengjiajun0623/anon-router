@@ -43,22 +43,35 @@ checked) but not **zero-knowledge** — the payment witness travels in the
 clear. It is confined to one class behind the `Prover` interface, and as of
 Phase 1 it is the dev/test double only (`CHANNEL_PROVER=clear`).
 
-**Phase 1 (done): `RealSP1Prover` (`sp1.py`)** closes the gap for the
-**genesis branch** — the first payment on a channel carries a real SP1 core
-STARK (~2.8 MB) produced by the `rpay` host binary
-(`research/m4b-groth16/`, guest = the exact byte-compatible genesis branch
-of `check_R_pay`). Measured on an M4 laptop: **~25 s prove wall
-(11-12 s core STARK)**, **~0.5 s router-side verify** (LightProver + cached
-vkey; statement binding checked against `abi(delta, N_i, C_i, root)` inside
-the binary). The witness never leaves the client. Router selects the backend
-with `CHANNEL_PROVER=sp1|clear` and advertises it in `/channel/params`;
-SP1 payments ride in the `_channel_payment` body field (too big for a
-header). Proof pipelining (payment i+1 depends only on the parent, so it
-proves during the user's think-time) hides the latency in steady state.
+**Phases 1+4 (done): `RealSP1Prover` (`sp1.py`)** closes the gap for **both
+branches** — every payment carries a real SP1 core STARK (~2.84 MB) produced
+by the `rpay` host binary (`research/m4b-groth16/`, guest = the exact
+byte-compatible flat disjunction of `check_R_pay`: genesis OR signed parent,
+with `xmss_verify` — WOTS w=16, 67 chains + auth path — in-guest for the
+signed side). The guest always executes BOTH branch checks (a genesis payment
+feeds uniformly random dummies into the signed slots, sized by
+`/channel/params.xmss_height`), so cycle count, proof size, and public inputs
+are identically distributed across branches: the proof does not reveal
+whether a payment is the channel's first. Measured on an M4 laptop (10-core,
+16 GB, 2026-07-20): **median 48.8 s core prove (~64 s wall)** for a
+signed-branch payment, genesis 52.8 s core (same workload class by
+construction, ~4.6-5.0 M cycles both), **~0.5 s router-side verify**
+(LightProver + cached vkey; statement binding checked against
+`abi(delta, N_i, C_i, root)` inside the binary). The witness — including
+which branch, the parent commitment, and Bob's signature — never leaves the
+client. Router selects the backend with `CHANNEL_PROVER=sp1|clear` and
+advertises it in `/channel/params`; SP1 payments ride in the
+`_channel_payment` body field (too big for a header). Proof pipelining
+(payment i+1 depends only on the parent, so it proves during the user's
+think-time) hides the latency in steady state as long as messages arrive
+≥ ~1 min apart; burst traffic queues.
 
-**Phase 4 (open): SignedBranch** — non-genesis payments still need
-`xmss_verify` inside the guest (~2 M cycles per the Phase-0 bench); until
-then `RealSP1Prover.prove` raises `NotImplementedError` past payment #1.
+**RAM caveat (measured 2026-07-20):** the ~4.7 M-cycle proof fits a 16 GB
+M4 only when the machine is otherwise idle (the 4-proof bench completed);
+proving while the router + other services were resident thrashed the same
+machine to 0 GB free and the prover was killed. Budget ≥ 24 GB for proving
+alongside anything else, or prove on a bigger box (e.g. the 25 GB Linux
+host).
 
 ## Off-chain vs on-chain (M4a vs M4b)
 

@@ -1,34 +1,42 @@
-"""RealSP1Prover — the SP1 STARK backend for R_pay (Phase 1: genesis branch).
+"""RealSP1Prover — the SP1 STARK backend for R_pay (Phase 4: full disjunction).
 
 Drop-in implementation of the swappable `Prover` protocol from relation.py.
 Unlike ClearWitnessProver, the payment proof `pi` reveals NOTHING beyond the
 public statement (delta, N_i, C_i, root): the witness (cid, c, r_open,
-balances, r_i, Merkle position) stays on the client.
+balances, r_i, Merkle position, the parent branch and Bob's signature) stays
+on the client.
 
 Mechanics
   * prove()  — shells out to the `rpay` host binary (research/m4b-groth16),
-    which embeds the R_pay genesis-branch guest ELF and produces a core SP1
-    STARK (~10-30 s native on an Apple-silicon laptop, ~2.8 MB). Returns a
-    self-describing JSON envelope: {"scheme": ..., "proof": base64(bincode)}.
+    which embeds the R_pay guest ELF (genesis OR signed parent, the flat
+    disjunction of check_R_pay) and produces a core SP1 STARK (native CPU on
+    an Apple-silicon laptop, ~3 MB). Returns a self-describing JSON envelope:
+    {"scheme": ..., "proof": base64(bincode)}.
   * verify() — `rpay verify` checks the STARK against the vkey of the
     embedded guest AND that the proof's committed public values equal
     abi.encode(delta, N_i, C_i, root); statement binding is enforced in the
     binary, not here.
 
-Scope (Phase 1): GenesisBranch only — the first payment on a channel.
-SignedBranch (XMSS parent signature inside the guest) is Phase 4; proving a
-non-genesis payment with this prover raises NotImplementedError.
+Branch hiding: the public inputs are identical for both branches, and the
+guest always executes BOTH branch checks — a genesis payment feeds uniformly
+random dummies into the signed-branch slots (same distribution as real parent
+commitments/signature chains), so neither the statement, the proof shape, nor
+the cycle-count distribution reveals whether a payment is the channel's first
+(genesis) or a later one (signed parent). The dummy XMSS auth path uses
+`xmss_height` (default 12 — the router's CHANNEL_HEIGHT default) so its length
+matches real countersignatures.
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+import secrets
 import subprocess
 import tempfile
 from typing import Optional
 
-from .relation import GenesisBranch, Statement, Witness, check_R_pay
+from .relation import GenesisBranch, SignedBranch, Statement, Witness, check_R_pay
 
 SCHEME = "sp1-rpay-core-v1"
 
@@ -38,19 +46,51 @@ DEFAULT_BIN = os.path.join(_REPO, "research", "m4b-groth16", "target", "release"
 PROVE_TIMEOUT_S = 900
 VERIFY_TIMEOUT_S = 300
 
+WOTS_LEN = 67                # confetti/wots.py LEN (w=16 over sha256)
+DEFAULT_XMSS_HEIGHT = 12     # router Recipient default (server CHANNEL_HEIGHT)
 
-def _fixture_json(st: Statement, w: Witness) -> dict:
+
+def _signed_fields(w: Witness, xmss_height: int) -> dict:
+    """The signed-branch witness slots — real parent data for a SignedBranch,
+    fresh uniform randomness for genesis (identical distribution: commitments
+    and hash-chain values are uniform 32-byte strings, so the guest's chain
+    walk over the dummies is statistically indistinguishable from a real
+    verify — the branch does not leak through the proof)."""
+    b = w.branch
+    if isinstance(b, SignedBranch):
+        s = b.sigma_prev
+        return {
+            "C_prev": b.C_prev.hex(),
+            "r_prev": b.r_prev.hex(),
+            "sig_index": s.index,
+            "wots_sig": b"".join(s.wots_sig).hex(),
+            "auth_path": b"".join(s.auth_path).hex(),
+        }
+    return {
+        "C_prev": secrets.token_bytes(32).hex(),
+        "r_prev": secrets.token_bytes(32).hex(),
+        "sig_index": secrets.randbelow(1 << xmss_height),
+        "wots_sig": secrets.token_bytes(WOTS_LEN * 32).hex(),
+        "auth_path": secrets.token_bytes(xmss_height * 32).hex(),
+    }
+
+
+def _fixture_json(st: Statement, w: Witness, xmss_height: int) -> dict:
     """The rpay input format (same shape as research/m4b-groth16/fixture.json)."""
     b = w.branch
+    witness = {
+        "cid": w.cid.hex(), "D": w.D, "c": w.c.hex(),
+        "r_open": w.r_open.hex(), "C_open": w.C_open.hex(),
+        "pk_B": w.pk_B.hex(), "bal_prev": w.bal_prev,
+        "bal_i": w.bal_i, "r_i": w.r_i.hex(),
+        "rec_index": b.rec_index,
+        "rec_path": [p.hex() for p in b.rec_path],
+    }
+    witness.update(_signed_fields(w, xmss_height))
     return {
         "statement": {"delta": st.delta, "N_i": st.N_i.hex(), "C_i": st.C_i.hex(),
                       "root": st.root.hex()},
-        "witness": {"cid": w.cid.hex(), "D": w.D, "c": w.c.hex(),
-                    "r_open": w.r_open.hex(), "C_open": w.C_open.hex(),
-                    "pk_B": w.pk_B.hex(), "bal_prev": w.bal_prev,
-                    "bal_i": w.bal_i, "r_i": w.r_i.hex(),
-                    "rec_index": b.rec_index,
-                    "rec_path": [p.hex() for p in b.rec_path]},
+        "witness": witness,
     }
 
 
@@ -60,12 +100,19 @@ def _statement_json(st: Statement) -> dict:
 
 
 class RealSP1Prover:
-    """Real zero-knowledge prover for the genesis branch of R_pay."""
+    """Real zero-knowledge prover for R_pay (genesis + signed branches).
+
+    `xmss_height` sizes the DUMMY auth path a genesis payment feeds into the
+    signed-branch slots; it should equal the router's XMSS tree height so
+    genesis and signed proofs stay shape-identical (real signed payments carry
+    the countersignature's own path, whatever its height)."""
 
     zero_knowledge = True
 
-    def __init__(self, bin_path: Optional[str] = None):
+    def __init__(self, bin_path: Optional[str] = None,
+                 xmss_height: int = DEFAULT_XMSS_HEIGHT):
         self.bin_path = bin_path or os.environ.get("RPAY_BIN", DEFAULT_BIN)
+        self.xmss_height = xmss_height
         self.last_prove_info: Optional[dict] = None  # timing/cycles of last prove
         self.last_verify_info: Optional[dict] = None
 
@@ -82,10 +129,8 @@ class RealSP1Prover:
         err = check_R_pay(st, w)
         if err:
             raise ValueError(f"cannot prove invalid statement: {err}")
-        if not isinstance(w.branch, GenesisBranch):
-            raise NotImplementedError(
-                "RealSP1Prover covers the genesis branch only (first payment); "
-                "SignedBranch proving (XMSS in-guest) is Phase 4")
+        if not isinstance(w.branch, (GenesisBranch, SignedBranch)):
+            raise ValueError(f"unknown branch type {type(w.branch).__name__}")
         if not self.available():
             raise RuntimeError(
                 f"rpay binary not found at {self.bin_path} — build it with: "
@@ -94,10 +139,14 @@ class RealSP1Prover:
             fixture = os.path.join(td, "fixture.json")
             proof = os.path.join(td, "proof.bin")
             with open(fixture, "w") as f:
-                json.dump(_fixture_json(st, w), f)
+                json.dump(_fixture_json(st, w, self.xmss_height), f)
             r = self._run(["prove", fixture, proof], PROVE_TIMEOUT_S)
             if r.returncode != 0:
-                raise RuntimeError(f"rpay prove failed: {r.stderr.strip()}")
+                # returncode < 0 = killed by a signal (e.g. -9 under memory
+                # pressure); stderr is usually empty then, so say so.
+                raise RuntimeError(
+                    f"rpay prove failed (rc={r.returncode}): "
+                    f"{r.stderr.strip() or r.stdout.strip()[-400:] or '(no output)'}")
             try:
                 self.last_prove_info = json.loads(r.stdout.strip().splitlines()[-1])
             except (ValueError, IndexError):
@@ -137,5 +186,5 @@ class RealSP1Prover:
     def close_values(self, st: Statement, pi: bytes) -> dict:
         raise NotImplementedError(
             "unsigned close needs the R_closeUnsigned circuit exposing "
-            "(bal, N_next) as public inputs — not part of Phase 1; the payment "
+            "(bal, N_next) as public inputs — not part of Phase 4; the payment "
             "proof deliberately hides them")

@@ -560,6 +560,10 @@ def channel_params():
         # witness-hiding; pi is ~3.7 MB so send it in the `_channel_payment`
         # body field, not the header) or "clear" (dev test double).
         "prover": CHANNEL_PROVER,
+        # XMSS tree height of this router's countersigning key. Genesis
+        # payments size their DUMMY signed-branch auth path to this so first
+        # payments stay shape-identical to later (signed-parent) ones.
+        "xmss_height": bob.xmss.height,
     }
 
 

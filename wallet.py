@@ -138,10 +138,13 @@ class Wallet:
         Persists the Payer locally (demo persistence; see channel.py notes).
 
         The payment-proof backend follows the router: "sp1" means every payment
-        carries a real SP1 STARK (witness-hiding, ~25 s native proving);
+        carries a real SP1 STARK (witness-hiding, ~1 min native proving);
         "clear" is the dev test double (witness in the clear, NOT anonymous)."""
         params = self.http.get(f"{self.url}/channel/params").json()
-        prover = RealSP1Prover() if params.get("prover", "clear") == "sp1" else None
+        prover = (
+            RealSP1Prover(xmss_height=int(params.get("xmss_height", 12)))
+            if params.get("prover", "clear") == "sp1" else None
+        )
         if prover is not None and not prover.available():
             raise RuntimeError(
                 f"router requires SP1 payment proofs but the rpay prover binary "
@@ -192,7 +195,7 @@ class Wallet:
         if payer.D - payer.tip.bal < price:
             raise RuntimeError("channel balance below price; open a new channel")
         if payer_prover == "sp1":
-            print("proving payment (SP1 STARK, ~25s native)...", file=sys.stderr)
+            print("proving payment (SP1 STARK, ~1 min native)...", file=sys.stderr)
         t0 = time.time()
         m, pending = payer.build_payment(price)
         prove_s = time.time() - t0
