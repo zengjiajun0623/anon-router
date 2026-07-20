@@ -138,10 +138,14 @@ def main() -> int:
     cho.add_argument("credits", type=int)
     chs.add_parser("status")
 
-    sv = sub.add_parser("serve", help="run a thin OpenAI-compatible prover daemon "
-                        "(point any app at http://host:port/v1)")
+    sv = sub.add_parser("serve", help="run a local OpenAI-compatible proxy so any "
+                        "agent/tool gets private ecash-paid inference — point it at "
+                        "http://host:port/v1, no code changes")
     sv.add_argument("--host", default="127.0.0.1")
     sv.add_argument("--port", type=int, default=8788)
+    sv.add_argument("--channel", action="store_true",
+                    help="use the confetti trust-min prover daemon instead of the "
+                         "ecash proxy (advanced: needs the prover binary + server deps)")
 
     m = sub.add_parser("models")
     m.add_argument("--search", default=None)
@@ -237,11 +241,19 @@ def main() -> int:
             print(f"deposit {s['deposit']} · spent {s['spent']} · "
                   f"remaining {s['remaining']} · payments {s['payments']}")
     elif args.cmd == "serve":
-        import uvicorn
-        os.environ.setdefault("ANON_ROUTER_URL", w.url)
-        print(f"prover daemon → router {w.url}\n"
-              f"point any OpenAI app at http://{args.host}:{args.port}/v1", file=sys.stderr)
-        uvicorn.run("serve:app", host=args.host, port=args.port, log_level="warning")
+        daemon_key = os.environ.get("ANON_DAEMON_KEY", "")
+        if args.channel:
+            try:
+                import uvicorn
+            except ImportError:
+                p.error("--channel needs the server deps (pip install fastapi uvicorn)")
+            os.environ.setdefault("ANON_ROUTER_URL", w.url)
+            print(f"confetti prover daemon → router {w.url}\n"
+                  f"point any OpenAI app at http://{args.host}:{args.port}/v1", file=sys.stderr)
+            uvicorn.run("serve:app", host=args.host, port=args.port, log_level="warning")
+        else:
+            from serve_ecash import run_proxy
+            run_proxy(w, host=args.host, port=args.port, daemon_key=daemon_key)
     elif args.cmd == "models":
         data = w.http.get(f"{w.url}/v1/models").json()["data"]
         for entry in data:

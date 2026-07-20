@@ -40,14 +40,27 @@ anon-router models --search gpt
 
 (Running from the repo without installing? `.venv/bin/python cli.py <same args>`.)
 
-## Two ways to spend
+## Use it from your agent / tool ("swap the API")
 
-- **Private (recommended): `cli.py chat`** — pays with blind-signed ecash, so
-  neither the router nor the provider can tie a request to your deposit.
-- **Convenient: any OpenAI-compatible tool** — point `base_url` at
-  `<router>/v1` and use your `sk-anon-…` account key as the bearer token. This
-  spends the account balance directly (pseudonymous, not unlinkable) and works
-  with Cursor, the OpenAI SDK, etc.
+Already have something that speaks the OpenAI API (Cursor, aider, the OpenAI SDK,
+your own agent)? Two ways to point it here:
+
+**Private (recommended) — run the local proxy, point your tool at it:**
+```bash
+anon-router claim 5000            # make sure your wallet has ecash
+anon-router serve                 # local proxy on http://127.0.0.1:8788/v1
+# then in your tool:  base_url = http://127.0.0.1:8788/v1   (api_key = anything)
+```
+Every request the tool makes is paid with blind-signed ecash — the router can't
+link your tool's requests to each other or to your deposit. No code changes in
+the tool. (Set `ANON_DAEMON_KEY` to require a bearer key on the proxy.)
+
+**Convenient (pseudonymous) — no local proxy:** point `base_url` at `<router>/v1`
+and use your `sk-anon-…` account key as the bearer token. Spends the account
+balance directly; simplest, but the router can link that key's requests.
+
+## Or just chat in the terminal
+`anon-router chat "…"` — private (ecash), no other tool needed.
 
 ## Privacy hygiene
 Fund from a fresh wallet, deposit a common round amount, spend over time, and
