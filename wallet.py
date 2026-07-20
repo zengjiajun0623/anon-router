@@ -4,11 +4,13 @@ import json
 import os
 import pickle
 import secrets
+import sys
 import time
 
 import httpx
 
 from confetti.channel import Payer
+from confetti.sp1 import RealSP1Prover
 from confetti.wire import payment_to_j, sig_from_j
 from mint import blind, decompose, unblind
 
@@ -133,9 +135,19 @@ class Wallet:
 
     def channel_open(self, deposit: int) -> dict:
         """Open a confetti channel with the router funded by `deposit` credits.
-        Persists the Payer locally (demo persistence; see channel.py notes)."""
+        Persists the Payer locally (demo persistence; see channel.py notes).
+
+        The payment-proof backend follows the router: "sp1" means every payment
+        carries a real SP1 STARK (witness-hiding, ~25 s native proving);
+        "clear" is the dev test double (witness in the clear, NOT anonymous)."""
         params = self.http.get(f"{self.url}/channel/params").json()
-        payer = Payer(deposit, bytes.fromhex(params["pk_B"]))
+        prover = RealSP1Prover() if params.get("prover", "clear") == "sp1" else None
+        if prover is not None and not prover.available():
+            raise RuntimeError(
+                f"router requires SP1 payment proofs but the rpay prover binary "
+                f"is missing at {prover.bin_path} — build it with: "
+                "cd research/m4b-groth16 && cargo build --release --bin rpay")
+        payer = Payer(deposit, bytes.fromhex(params["pk_B"]), prover)
         resp = self.http.post(
             f"{self.url}/channel/open",
             json={"cid": payer.cid.hex(), "D": deposit,
@@ -171,14 +183,35 @@ class Wallet:
         params = self.http.get(f"{self.url}/channel/params").json()
         price = params["price_per_request"]
         payer = self._load_channel()
+        router_prover = params.get("prover", "clear")
+        payer_prover = "sp1" if isinstance(payer.prover, RealSP1Prover) else "clear"
+        if router_prover != payer_prover:
+            raise RuntimeError(
+                f"channel was opened with the {payer_prover!r} prover but the "
+                f"router now requires {router_prover!r}; open a new channel")
         if payer.D - payer.tip.bal < price:
             raise RuntimeError("channel balance below price; open a new channel")
+        if payer_prover == "sp1":
+            print("proving payment (SP1 STARK, ~25s native)...", file=sys.stderr)
+        t0 = time.time()
         m, pending = payer.build_payment(price)
-        header = base64.b64encode(json.dumps(payment_to_j(m)).encode()).decode()
+        prove_s = time.time() - t0
+        if payer_prover == "sp1":
+            print(f"payment proof ready in {prove_s:.1f}s "
+                  f"({len(m.pi)} byte envelope)", file=sys.stderr)
+        payment_j = payment_to_j(m)
+        header_b64 = base64.b64encode(json.dumps(payment_j).encode()).decode()
         body = {"model": model, "messages": messages, "stream": False, **kwargs}
+        headers = {}
+        # A real STARK proof (~3.7 MB base64) blows past HTTP header limits;
+        # ship it in the reserved body field instead. Small (clear) proofs keep
+        # using the header for backward compatibility.
+        if len(header_b64) > 8000:
+            body["_channel_payment"] = payment_j
+        else:
+            headers["X-Channel-Payment"] = header_b64
         resp = self.http.post(
-            f"{self.url}/v1/chat/completions", json=body,
-            headers={"X-Channel-Payment": header},
+            f"{self.url}/v1/chat/completions", json=body, headers=headers,
         )
         resp.raise_for_status()
         countersign = resp.headers.get("X-Channel-Countersign")

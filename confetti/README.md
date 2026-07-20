@@ -40,12 +40,25 @@ The whole payment protocol, running off-chain against an in-memory referee:
 
 `ClearWitnessProver` provides **knowledge soundness** (every constraint is
 checked) but not **zero-knowledge** — the payment witness travels in the
-clear. That is the *only* missing property, and it is confined to one class
-behind the `Prover` interface. The Phase-0 benchmark
-(`research/phase0-proving-benchmark.md`) measured the real STARK cost:
-**MARGINAL, ~25 s median** on an M4, viable via proof pipelining (payment
-i+1 depends only on the parent, so it proves in the background during the
-user's think-time). Swapping `Sp1Prover` in changes nothing else in the stack.
+clear. It is confined to one class behind the `Prover` interface, and as of
+Phase 1 it is the dev/test double only (`CHANNEL_PROVER=clear`).
+
+**Phase 1 (done): `RealSP1Prover` (`sp1.py`)** closes the gap for the
+**genesis branch** — the first payment on a channel carries a real SP1 core
+STARK (~2.8 MB) produced by the `rpay` host binary
+(`research/m4b-groth16/`, guest = the exact byte-compatible genesis branch
+of `check_R_pay`). Measured on an M4 laptop: **~25 s prove wall
+(11-12 s core STARK)**, **~0.5 s router-side verify** (LightProver + cached
+vkey; statement binding checked against `abi(delta, N_i, C_i, root)` inside
+the binary). The witness never leaves the client. Router selects the backend
+with `CHANNEL_PROVER=sp1|clear` and advertises it in `/channel/params`;
+SP1 payments ride in the `_channel_payment` body field (too big for a
+header). Proof pipelining (payment i+1 depends only on the parent, so it
+proves during the user's think-time) hides the latency in steady state.
+
+**Phase 4 (open): SignedBranch** — non-genesis payments still need
+`xmss_verify` inside the guest (~2 M cycles per the Phase-0 bench); until
+then `RealSP1Prover.prove` raises `NotImplementedError` past payment #1.
 
 ## Off-chain vs on-chain (M4a vs M4b)
 

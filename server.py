@@ -26,6 +26,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from mint import DENOMS, Mint
 from confetti.chain import ChannelRecord
 from confetti.channel import Contract, Recipient
+from confetti.relation import ClearWitnessProver
+from confetti.sp1 import RealSP1Prover
 from confetti.wire import payment_from_j, sig_to_j
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -99,8 +101,33 @@ mint = Mint(_master())
 # in-memory for M4a — a restart resets the registry and XMSS signer; persistence
 # and an on-chain contract land in M4b.
 CHANNEL_PRICE = int(os.environ.get("CHANNEL_PRICE", "50"))
-channel_contract = Contract(tau=int(os.environ.get("CHANNEL_TAU", "7")))
+# Payment-proof backend. "sp1" (default) = real SP1 STARK per payment: the
+# proof hides the witness and the router verifies it cryptographically via the
+# rpay binary. "clear" = ClearWitnessProver, the fast NON-ZK test double
+# (witness travels in the clear) — tests and dev only.
+CHANNEL_PROVER = os.environ.get("CHANNEL_PROVER", "sp1")
+if CHANNEL_PROVER == "sp1":
+    channel_prover = RealSP1Prover()
+    if CHANNEL_LANE_ENABLED and not channel_prover.available():
+        raise RuntimeError(
+            f"CHANNEL_PROVER=sp1 but rpay binary missing at {channel_prover.bin_path}; "
+            "build it (cd research/m4b-groth16 && cargo build --release --bin rpay) "
+            "or set CHANNEL_PROVER=clear (dev only, not zero-knowledge)"
+        )
+elif CHANNEL_PROVER == "clear":
+    channel_prover = ClearWitnessProver()
+else:
+    raise RuntimeError(f"CHANNEL_PROVER must be 'sp1' or 'clear', got {CHANNEL_PROVER!r}")
+channel_contract = Contract(tau=int(os.environ.get("CHANNEL_TAU", "7")),
+                            prover=channel_prover)
 bob = Recipient(height=int(os.environ.get("CHANNEL_HEIGHT", "12")))
+# Serializes countersigning (XMSS index) while verify runs off the event loop.
+channel_accept_lock = threading.Lock()
+
+
+def _channel_accept(m, price: int):
+    with channel_accept_lock:
+        return bob.accept(channel_contract, m, price=price)
 
 db = sqlite3.connect(
     os.environ.get("STATE_DB_PATH", os.path.join(ROOT, "state.db")),
@@ -152,6 +179,7 @@ def log_safety_config():
         "anon-router SAFE config: "
         f"faucet={'on' if DEV_FAUCET else 'off'} "
         f"channel_lane={'on' if CHANNEL_LANE_ENABLED else 'off'} "
+        f"channel_prover={CHANNEL_PROVER} "
         f"daily_cap_usd={DAILY_USD_CAP}"
     )
 
@@ -528,6 +556,10 @@ def channel_params():
         "price_per_request": CHANNEL_PRICE,
         "credit_usd": CREDIT_USD,
         "tau_days": channel_contract.tau,
+        # which payment-proof backend this router accepts: "sp1" (real STARK,
+        # witness-hiding; pi is ~3.7 MB so send it in the `_channel_payment`
+        # body field, not the header) or "clear" (dev test double).
+        "prover": CHANNEL_PROVER,
     }
 
 
@@ -652,6 +684,12 @@ async def models():
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     body = await request.json()
+    # Channel payments too large for a header (the SP1 STARK proof is ~3.7 MB
+    # base64) ride in this reserved body field. Pop it unconditionally so no
+    # lane ever forwards payment material upstream.
+    channel_payment_body = (
+        body.pop("_channel_payment", None) if isinstance(body, dict) else None
+    )
     base, key, free, upstream_model = resolve_route(str(body.get("model", "")))
     body["model"] = upstream_model
     upstream_headers = {"Content-Type": "application/json"}
@@ -743,16 +781,27 @@ async def chat(request: Request):
         )
 
     channel_header = request.headers.get("X-Channel-Payment")
-    if channel_header:
+    if channel_header or channel_payment_body is not None:
         if not CHANNEL_LANE_ENABLED:
             raise HTTPException(503, "channel lane disabled (no on-chain escrow wired)")
         try:
-            m = payment_from_j(json.loads(base64.b64decode(channel_header)))
+            payment_j = (
+                json.loads(base64.b64decode(channel_header))
+                if channel_header
+                else channel_payment_body
+            )
+            m = payment_from_j(payment_j)
         except Exception:
-            raise HTTPException(400, "X-Channel-Payment must be base64 JSON")
+            raise HTTPException(
+                400,
+                "channel payment must be base64 JSON in X-Channel-Payment "
+                "or a JSON object in the _channel_payment body field",
+            )
         reservation_day, reserved_usd = await _reserve_daily_cap()
         try:
-            sigma = bob.accept(channel_contract, m, price=CHANNEL_PRICE)
+            # STARK verification shells out to the rpay binary (~0.5 s); run it
+            # off the event loop so other lanes stay responsive.
+            sigma = await asyncio.to_thread(_channel_accept, m, CHANNEL_PRICE)
         except ValueError as e:
             await _reconcile_spend(reservation_day, reserved_usd, 0.0)
             raise HTTPException(402, f"channel payment rejected: {e}")
