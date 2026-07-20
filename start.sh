@@ -11,7 +11,8 @@ PORT="${PORT:-8402}"
 # The hidden-service key lives on the /data volume so the .onion address is
 # stable across redeploys. Over the onion the router sees only a Tor circuit,
 # never a client IP, and there is no exit node in the path.
-if [ "${TOR_ONION:-1}" != "0" ] && command -v tor >/dev/null 2>&1; then
+# Off by default for the MVP (set TOR_ONION=1 to publish the onion service later).
+if [ "${TOR_ONION:-0}" = "1" ] && command -v tor >/dev/null 2>&1; then
   mkdir -p /data/tor_hs && chmod 700 /data/tor_hs
   printf 'SocksPort 0\nDataDirectory /tmp/tor\nHiddenServiceDir /data/tor_hs\nHiddenServiceVersion 3\nHiddenServicePort 80 127.0.0.1:%s\n' "$PORT" > /tmp/torrc
   echo "start: launching tor onion service"
