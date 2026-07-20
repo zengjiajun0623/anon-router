@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anon-router-cli"
+version = "0.1.0"
+description = "Pay crypto for AI inference, privately, from your terminal"
+readme = "CLI.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.27",
+    "web3>=7",          # on-chain deposit signing (anon-router deposit)
+    "eth-account>=0.13",
+    "socksio>=1.0",     # optional --tor over a SOCKS proxy
+]
+
+[project.scripts]
+anon-router = "cli:main"
+
+# Package only the CLI client — the flat client modules + the confetti library,
+# NOT the server (server.py/watcher.py/store.py). Explicit lists disable
+# auto-discovery so the server files are never pulled in.
+[tool.setuptools]
+py-modules = ["cli", "wallet", "mint", "ec"]
+
+[tool.setuptools.packages.find]
+include = ["confetti*"]

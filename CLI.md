@@ -7,37 +7,38 @@ ever sees the router — never you.
 > Testnet alpha: deposits use **Sepolia test ETH** (valueless). Don't put real
 > funds in. See [PRIVACY.md](PRIVACY.md) for exactly what is and isn't private.
 
-## Install (client only)
+## Install
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements-client.txt
+python3 -m venv .venv && .venv/bin/pip install .   # from this repo (Python 3.10+)
 ```
 
-The CLI talks to the hosted router by default. To use your own, set
-`export ANON_ROUTER_URL=https://your-router` (or pass `--url`).
+That puts an `anon-router` command on your PATH. It talks to the hosted router by
+default; to use your own set `export ANON_ROUTER_URL=https://your-router` (or
+`--url`).
 
 ## Use it
 
 ```bash
-PY=.venv/bin/python
-
 # 1. Mint an anonymous key (no signup). This is a wallet — back up ~/.anon-router.
-$PY cli.py account
+anon-router account
 
 # 2a. Fund it by depositing test ETH on-chain. Put YOUR Sepolia key in a file
 #     {"private_key": "0x..."}  (or export ANON_DEPOSIT_KEY), then:
-$PY cli.py deposit 0.001 --key myfunding.json     # waits for the credit (~30s)
+anon-router deposit 0.001 --key myfunding.json     # waits for the credit (~30s)
 #  ...or 2b. redeem a voucher code someone gave you:
-$PY cli.py redeem ar-XXXXXXXXXXXXXXXXXXXX
+anon-router redeem ar-XXXXXXXXXXXXXXXXXXXX
 
 # 3. Convert your balance into unlinkable ecash (this breaks the deposit link).
-$PY cli.py claim 5000
+anon-router claim 5000
 
 # 4. Chat — paid per request with ecash, unlinkable to your deposit.
-$PY cli.py chat "hello there" --model openai/gpt-4o-mini
-$PY cli.py balance
-$PY cli.py models --search gpt
+anon-router chat "hello there" --model openai/gpt-4o-mini
+anon-router balance
+anon-router models --search gpt
 ```
+
+(Running from the repo without installing? `.venv/bin/python cli.py <same args>`.)
 
 ## Two ways to spend
 
