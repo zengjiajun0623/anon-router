@@ -168,8 +168,7 @@ async def privacy_headers(request: Request, call_next):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
-        "style-src 'self' 'unsafe-inline'; script-src 'self' "
-        "'sha256-gkyHUsRdzdPu6KtWzlGmD+4VazcOqAZeFwmXlLvwU9A='"
+        "style-src 'self' 'unsafe-inline'; script-src 'self'"
     )
     return response  # Server header suppressed via uvicorn --no-server-header
 
@@ -186,6 +185,15 @@ def ecash_js():
     from fastapi.responses import FileResponse
     return FileResponse(
         os.path.join(ROOT, "web", "ecash.js"), media_type="text/javascript"
+    )
+
+
+@app.get("/app.js")
+def app_js():
+    """Frontend app module (same-origin; no CDN loads, no inline script)."""
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        os.path.join(ROOT, "web", "app.js"), media_type="text/javascript"
     )
 
 

@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>anon-router — pay crypto for AI inference</title>
+<title>anon-router · pay crypto for AI inference</title>
 <style>
   :root {
-    --bg: #0b0d0e; --panel: #14181a; --panel2: #0f1315; --text: #e7eaeb;
-    --muted: #889096; --accent: #4db6a4; --accent-dim: #2f6d63;
-    --border: #222a2d; --danger: #d98a6a; --radius: 10px;
+    --bg: #f6f7f8; --panel: #ffffff; --panel2: #f1f4f5; --text: #1a1e20;
+    --muted: #5c6770; --accent: #0f766e; --accent-dim: #b7dcd5;
+    --border: #dde3e6; --danger: #a8502f; --radius: 10px;
   }
   * { box-sizing: border-box; }
   body {
@@ -32,33 +32,48 @@
   .step { display: flex; align-items: baseline; gap: 10px; }
   .step .n { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
   button {
-    background: var(--accent); color: #05100e; border: none; font-weight: 600;
+    background: var(--accent); color: #ffffff; border: none; font-weight: 600;
     padding: 10px 16px; border-radius: 8px; cursor: pointer; font-size: 14px;
   }
   button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button.small { padding: 7px 12px; font-size: 13px; font-weight: 500; }
   button:disabled { opacity: 0.45; cursor: default; }
+  button.copy {
+    flex: none; background: transparent; color: var(--muted);
+    border: 1px solid var(--border); font-weight: 500; font-size: 11.5px;
+    padding: 3px 9px; border-radius: 6px;
+  }
+  button.copy:hover { color: var(--text); border-color: var(--accent-dim); }
+  button.copy.done { color: var(--accent); border-color: var(--accent-dim); }
+  button.linklike {
+    background: none; border: none; padding: 0; font-size: 12.5px;
+    color: var(--muted); font-weight: 400; cursor: pointer;
+    text-decoration: underline; text-underline-offset: 3px;
+  }
+  button.linklike:hover { color: var(--text); }
   input, select {
     background: var(--panel2); border: 1px solid var(--border); color: var(--text);
     padding: 10px 12px; border-radius: 8px; font-size: 14px; width: 100%;
   }
   .row { display: flex; gap: 10px; align-items: center; }
-  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0;
+  .kv { display: flex; align-items: center; gap: 12px; padding: 8px 0;
     border-bottom: 1px solid var(--border); font-size: 13px; }
   .kv:last-child { border-bottom: none; }
-  .kv .k { color: var(--muted); }
-  .kv .v { text-align: right; word-break: break-all; }
+  .kv .k { color: var(--muted); flex: none; }
+  .kv .v { flex: 1; text-align: right; word-break: break-all; }
   .bal { font-size: 30px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
-  .bal small { font-size: 14px; color: var(--muted); }
   .muted { color: var(--muted); }
   .hidden { display: none; }
   .chat { display: flex; flex-direction: column; height: 340px; }
   .log { flex: 1; overflow-y: auto; padding: 4px 2px; display: flex; flex-direction: column; gap: 12px; }
   .msg { max-width: 88%; padding: 9px 13px; border-radius: 10px; white-space: pre-wrap; font-size: 14px; }
-  .msg.u { align-self: flex-end; background: var(--accent-dim); color: #eafffb; }
+  .msg.u { align-self: flex-end; background: var(--accent-dim); color: #0b3d38; }
   .msg.a { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); }
+  .msg.err { background: var(--panel2); border: 1px solid rgba(168, 80, 47, 0.35); color: var(--danger); }
   .composer { display: flex; gap: 8px; margin-top: 12px; }
   .pill { display: inline-block; font-size: 12px; color: var(--accent); border: 1px solid var(--accent-dim);
     border-radius: 999px; padding: 2px 10px; }
+  .pill.soon { color: var(--muted); border-color: var(--border); }
   .note { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
   .foot { margin-top: 40px; font-size: 12.5px; color: var(--muted); }
 </style>
@@ -79,17 +94,29 @@
       <div id="key-start">
         <div class="step"><span class="n">→</span>
           <div>No signup. Click to mint an anonymous API key.</div></div>
-        <div style="margin-top:14px"><button id="mint">Get API key</button></div>
+        <div class="row" style="margin-top:14px">
+          <button id="mint">Get API key</button>
+          <button id="import-start" class="linklike" type="button">Returning? Restore a wallet backup</button>
+          <span class="note" id="wallet-note-start" style="margin:0"></span>
+        </div>
       </div>
       <div id="key-info" class="hidden">
-        <div class="kv"><span class="k">API key</span><span class="v mono" id="apikey"></span></div>
-        <div class="kv"><span class="k">Base URL</span><span class="v mono" id="baseurl"></span></div>
-        <div class="note">Use it with any OpenAI-compatible tool: set <code>base_url</code> and this
-          key. Keep it safe — it holds your credits.</div>
-        <div style="margin-top:12px"><button id="rotate" class="ghost">New session key</button>
-          <span class="note" style="display:inline;margin-left:8px">Keys are free and unlinkable —
-            rotate per session to avoid tying requests together.</span></div>
+        <div class="kv"><span class="k">API key</span>
+          <span class="v mono" id="apikey"></span>
+          <button class="copy" id="copy-key" type="button">Copy</button></div>
+        <div class="kv"><span class="k">Base URL</span>
+          <span class="v mono" id="baseurl"></span>
+          <button class="copy" id="copy-base" type="button">Copy</button></div>
+        <div class="note">Use it with any OpenAI-compatible tool: set <code>base_url</code>
+          and this key. This is a wallet, not an account. Back it up. Recharge the same
+          wallet and your balance adds up.</div>
+        <div class="row" style="margin-top:12px">
+          <button id="export" class="ghost small" type="button">Back up wallet</button>
+          <button id="import-again" class="ghost small" type="button">Import wallet</button>
+          <span class="note" id="wallet-note" style="margin:0"></span>
+        </div>
       </div>
+      <input type="file" id="import-file" accept="application/json,.json" class="hidden" />
     </div>
 
     <!-- STEP 2 -->
@@ -97,12 +124,13 @@
       <h2>2 · Deposit for credits</h2>
       <div id="deposit-locked" class="muted">Get a key first.</div>
       <div id="deposit-body" class="hidden">
-        <div class="row" style="margin-bottom:8px">
+        <div class="row" style="margin-bottom:4px">
           <input id="amount" type="number" step="0.001" value="0.05" min="0" />
           <span class="muted" style="white-space:nowrap">ETH</span>
           <button id="deposit">Deposit with wallet</button>
         </div>
-        <div class="bal">$<span id="balance">0.00</span><small id="usd"></small></div>
+        <div class="note" id="deposit-usd" style="margin:0 0 10px"></div>
+        <div class="bal">$<span id="balance">0.00</span></div>
         <div class="note" id="bal-side" style="margin-top:2px"></div>
       </div>
     </div>
@@ -125,47 +153,26 @@
           <input id="prompt" placeholder="Ask anything…" />
           <button id="send">Send</button>
         </div>
+        <div class="note hidden" id="chat-hint" style="margin-top:8px"></div>
       </div>
     </div>
-  </div>
 
-    <!-- TRUST-MINIMIZED LANE -->
+    <!-- TRUST-MINIMIZED LANE (server-gated off; no controls shown until it works) -->
     <div class="card">
-      <h2>Trust-minimized lane <span class="pill">on-chain escrow</span></h2>
+      <h2>Trust-minimized lane <span class="pill soon">coming soon</span></h2>
       <p class="muted" style="margin-top:0;font-size:14px">
-        The simple lane above is custodial — we hold your float. This lane doesn't.
-        Your deposit is escrowed in a contract we cannot touch; you can reclaim it
-        unilaterally at any time. A stale/rolled-back close is provably challengeable.
+        The lane above is custodial: we hold your float. This lane will not.
+        Your deposit sits in an escrow contract we cannot touch, and you can
+        reclaim it unilaterally at any time. A stale or rolled-back close is
+        provably challengeable.
       </p>
-      <div id="ch-locked" class="muted">No on-chain escrow configured (set CONFETTI_ADDRESS).</div>
-      <div id="ch-body" class="hidden">
-        <div class="row" style="margin-bottom:12px">
-          <input id="ch-amount" type="number" step="0.001" value="0.1" min="0" />
-          <span class="muted" style="white-space:nowrap">ETH</span>
-          <button id="ch-open">Open escrow channel</button>
-        </div>
-        <div id="ch-status" class="hidden">
-          <div class="kv"><span class="k">Escrowed in contract</span>
-            <span class="v mono"><span id="ch-deposit">0</span> ETH</span></div>
-          <div class="kv"><span class="k">Held by</span>
-            <span class="v mono" id="ch-contract"></span></div>
-          <div class="kv"><span class="k">Recipient (router)</span>
-            <span class="v mono" id="ch-recipient"></span></div>
-          <div class="kv"><span class="k">Your exit</span>
-            <span class="v">unilateral — close & withdraw below</span></div>
-          <div class="row" style="margin-top:14px">
-            <button id="ch-close" class="ghost">Close (refund)</button>
-            <button id="ch-finalize" class="ghost" disabled>Finalize</button>
-            <button id="ch-withdraw" class="ghost" disabled>Withdraw</button>
-          </div>
-          <div class="note" id="ch-note">Per-request payments over the channel are unlinkable ZK
-            proofs. In-browser proving is the remaining piece; today the CLI does it
-            (<code>cli.py chat --channel</code>). The escrow + exit shown here are real on-chain
-            transactions you sign.</div>
-        </div>
-      </div>
+      <p class="muted" style="font-size:14px;margin-bottom:0">
+        The protocol runs today from the CLI against a local testnet
+        (<code>cli.py chat --channel</code>). In-browser proving is not finished,
+        so this lane is switched off on the hosted demo. No buttons here until
+        they do something real.
+      </p>
     </div>
-  </div>
 
     <!-- PRIVACY STATEMENT -->
     <div class="card">
@@ -182,278 +189,12 @@
   </div>
 
   <div class="foot">
-    Testnet demo (local Anvil). The contract's safety core is machine-checked (Lean) and reviewed
-    by three independent models. Nothing is deployed to a public chain.
+    Testnet demo. Deposits use Sepolia test ETH; no real funds are involved.
+    The escrow contract's safety core is machine-checked (Lean) and reviewed
+    by three independent models.
   </div>
 </div>
 
-<script type="module">
-import * as ecash from '/ecash.js';
-
-let account = null;
-let keys = null;         // /mint/keys payload (denomination pubkeys etc.)
-let claiming = false;
-let lastAcctBal = 0;
-let polling = false;
-
-// ---- ecash wallet: blind-signed tokens held in this browser ----
-const WALLET_KEY = 'anon-router-ecash-v1';
-const PENDING_CLAIM_KEY = 'anon-router-pending-claim-v1';
-const PENDING_CHANGE_KEY = 'anon-router-pending-change-v1';
-const loadWallet = () => { try { return JSON.parse(localStorage.getItem(WALLET_KEY)) || []; } catch (e) { return []; } };
-const saveWallet = t => localStorage.setItem(WALLET_KEY, JSON.stringify(t));
-const ecashBalance = () => loadWallet().reduce((s, t) => s + t.amount, 0);
-
-async function mintKeys() {
-  if (!keys) keys = await (await fetch('/mint/keys')).json();
-  return keys;
-}
-
-const payMode = () => 'ecash';  // in-browser chat is always private ecash
-
-function renderBalance() {
-  const eb = ecashBalance();
-  const cu = keys ? keys.credit_usd : 0.0001;
-  const bal = document.getElementById('balance');
-  const usd = document.getElementById('usd');
-  const side = document.getElementById('bal-side');
-  bal.textContent = (eb * cu).toFixed(2);
-  usd.textContent = '';
-  side.textContent = lastAcctBal > 0 ? 'Claiming your deposit…' : '';
-}
-
-async function mint() {
-  const r = await fetch('/account/new', {method: 'POST'});
-  account = await r.json();
-  document.getElementById('key-start').classList.add('hidden');
-  document.getElementById('key-info').classList.remove('hidden');
-  document.getElementById('apikey').textContent = account.api_key;
-  document.getElementById('baseurl').textContent = account.base_url;
-  document.getElementById('deposit-locked').classList.add('hidden');
-  document.getElementById('deposit-body').classList.remove('hidden');
-  if (!polling) { polling = true; pollBalance(); }
-}
-
-async function claimToEcash(balance) {
-  claiming = true;
-  try {
-    const k = await mintKeys();
-    let pending = null;
-    try { pending = JSON.parse(localStorage.getItem(PENDING_CLAIM_KEY)); } catch (e) {}
-    if (pending && pending.keyHash !== account.key_hash) {
-      throw new Error('a pending ecash claim belongs to a different session key');
-    }
-    if (!pending) {
-      pending = {
-        idempotencyKey: crypto.randomUUID(),
-        keyHash: account.key_hash,
-        blinds: await ecash.prepareMint(balance),
-      };
-      localStorage.setItem(PENDING_CLAIM_KEY, JSON.stringify(pending));
-    }
-    const minted = await ecash.submitMint('', '/mint/claim', pending.blinds, {
-      Authorization: 'Bearer ' + account.api_key,
-      'Idempotency-Key': pending.idempotencyKey,
-    }, k.pubkeys);
-    saveWallet(loadWallet().concat(minted));
-    localStorage.removeItem(PENDING_CLAIM_KEY);
-    lastAcctBal = 0;
-  } finally { claiming = false; }
-}
-
-async function pollBalance() {
-  if (account) {
-    try {
-      const r = await fetch('/account/status', {headers: {Authorization: 'Bearer ' + account.api_key}});
-      const d = await r.json();
-      lastAcctBal = d.balance;
-      if (payMode() === 'ecash' && (lastAcctBal > 0 || localStorage.getItem(PENDING_CLAIM_KEY)) && !claiming) {
-        await claimToEcash(lastAcctBal);
-      }
-    } catch (e) {}
-  }
-  renderBalance();
-  setTimeout(pollBalance, 2500);
-}
-
-async function deposit() {
-  if (!account) return;
-  if (!window.ethereum) { alert('No browser wallet found. Install one like MetaMask to deposit.'); return; }
-  const eth = document.getElementById('amount').value;
-  const wei = BigInt(Math.round(parseFloat(eth) * 1e18));
-  const accts = await window.ethereum.request({method: 'eth_requestAccounts'});
-  const data = account.deposit_selector + account.key_hash.replace(/^0x/, '');
-  await window.ethereum.request({
-    method: 'eth_sendTransaction',
-    params: [{from: accts[0], to: account.vault_address, value: '0x' + wei.toString(16), data}],
-  });
-}
-
-function add(role, text) {
-  const el = document.createElement('div');
-  el.className = 'msg ' + (role === 'user' ? 'u' : 'a');
-  el.textContent = text;
-  const log = document.getElementById('log');
-  log.appendChild(el); log.scrollTop = log.scrollHeight;
-  return el;
-}
-
-async function redeemPendingChange() {
-  const receipt = localStorage.getItem(PENDING_CHANGE_KEY);
-  if (!receipt) return;
-  const k = await mintKeys();
-  const settle = await ecash.redeemChange('', receipt, k.pubkeys);
-  if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
-  localStorage.removeItem(PENDING_CHANGE_KEY);
-}
-
-async function send() {
-  const input = document.getElementById('prompt');
-  const text = input.value.trim();
-  if (!text) return;
-  const model = document.getElementById('model').value;
-  const free = model.startsWith('local/');   // local lane is free, no payment
-  const mode = payMode();
-  if (!free && mode === 'bearer' && !account) { alert('Get a key first.'); return; }
-  input.value = '';
-  add('user', text);
-  const pending = add('assistant', '…');
-  const headers = {'Content-Type': 'application/json'};
-  let spent = null;   // ecash tokens attached to this request
-  let r = null;
-  let requestStarted = false;
-  try {
-    if (!free) {
-      if (mode === 'ecash') {
-        await redeemPendingChange();
-        const k = await mintKeys();
-        const sel = ecash.selectTokens(loadWallet(), Math.max(2000, k.min_prepay));
-        spent = sel.spend;
-        saveWallet(sel.keep);
-        renderBalance();
-        headers['X-Cash'] = ecash.encodeCash(sel.spend);
-      } else {
-        headers['Authorization'] = 'Bearer ' + account.api_key;
-      }
-    }
-    requestStarted = true;
-    r = await fetch('/v1/chat/completions', {
-      method: 'POST', headers,
-      body: JSON.stringify({model, messages: [{role: 'user', content: text}]}),
-    });
-    const receipt = r.headers.get('X-Change-Receipt');
-    if (receipt) localStorage.setItem(PENDING_CHANGE_KEY, receipt);
-    const d = await r.json();
-    if (!r.ok) pending.textContent = '⚠ ' + (d.detail || JSON.stringify(d));
-    else pending.textContent = d.choices?.[0]?.message?.content || '(no content)';
-    if (receipt) {
-      await redeemPendingChange();
-    }
-  } catch (e) {
-    if (spent && !requestStarted) saveWallet(loadWallet().concat(spent));
-    pending.textContent = '⚠ ' + e.message;
-  }
-  renderBalance();
-}
-
-// ---- trust-minimized lane (on-chain escrow) ----
-let cfg = null, channelCid = null;
-
-const pad32 = h => h.replace(/^0x/, '').padStart(64, '0');           // left-pad (address/uint)
-const padR32 = h => h.replace(/^0x/, '').padEnd(64, '0');            // right-pad (bytesN)
-const rndHex = n => { const a = new Uint8Array(n); crypto.getRandomValues(a);
-  return [...a].map(b => b.toString(16).padStart(2, '0')).join(''); };
-
-async function ethCall(to, data) {
-  return window.ethereum.request({method: 'eth_call', params: [{to, data}, 'latest']});
-}
-async function ethSend(to, data, valueWei) {
-  const accts = await window.ethereum.request({method: 'eth_requestAccounts'});
-  const p = {from: accts[0], to, data};
-  if (valueWei !== undefined) p.value = '0x' + valueWei.toString(16);
-  return window.ethereum.request({method: 'eth_sendTransaction', params: [p]});
-}
-
-async function loadConfig() {
-  cfg = await (await fetch('/config')).json();
-  if (cfg.confetti_address) {
-    document.getElementById('ch-locked').classList.add('hidden');
-    document.getElementById('ch-body').classList.remove('hidden');
-    document.getElementById('ch-contract').textContent = cfg.confetti_address;
-    document.getElementById('ch-recipient').textContent = 'router (' + cfg.router_pk_B.slice(0, 14) + '…)';
-  }
-}
-
-async function channelOpen() {
-  if (!window.ethereum) { alert('No injected wallet found.'); return; }
-  const eth = document.getElementById('ch-amount').value;
-  const wei = BigInt(Math.round(parseFloat(eth) * 1e18));
-  channelCid = '0x' + rndHex(16);                                    // bytes16
-  const pkB = '0x' + cfg.router_pk_B.replace(/^0x/, '');
-  const cOpen = '0x' + rndHex(32);
-  const accts = await window.ethereum.request({method: 'eth_requestAccounts'});
-  // open(bytes16 cid, address bob, bytes32 pkB, bytes32 cOpen)
-  const data = cfg.selectors.open + padR32(channelCid) + pad32(accts[0]) + pad32(pkB) + pad32(cOpen);
-  await ethSend(cfg.confetti_address, data, wei);
-  document.getElementById('ch-status').classList.remove('hidden');
-  document.getElementById('ch-close').disabled = false;
-  pollChannel();
-}
-
-async function pollChannel() {
-  if (!channelCid) return;
-  try {
-    // channels(bytes16) -> (uint256 deposit, ...)
-    const out = await ethCall(cfg.confetti_address, cfg.selectors.channels + padR32(channelCid));
-    const deposit = BigInt('0x' + out.replace(/^0x/, '').slice(0, 64));
-    document.getElementById('ch-deposit').textContent = (Number(deposit) / 1e18).toFixed(4);
-  } catch (e) {}
-  setTimeout(pollChannel, 3000);
-}
-
-async function channelClose() {
-  // closeGenesis(bytes16 cid, bytes32 n1, bytes proof) — full refund path
-  const n1 = '0x' + rndHex(32);
-  const data = cfg.selectors.closeGenesis + padR32(channelCid) + pad32(n1)
-    + pad32('0x60') + pad32('0x0');            // empty bytes proof (offset 0x60, len 0)
-  await ethSend(cfg.confetti_address, data);
-  document.getElementById('ch-note').textContent =
-    'Close submitted. After the challenge window (60s on this testnet), Finalize then Withdraw.';
-  setTimeout(() => { document.getElementById('ch-finalize').disabled = false; }, 62000);
-}
-
-async function channelFinalize() {
-  await ethSend(cfg.confetti_address, cfg.selectors.finalize + padR32(channelCid));
-  document.getElementById('ch-withdraw').disabled = false;
-}
-
-async function channelWithdraw() {
-  await ethSend(cfg.confetti_address, cfg.selectors.withdraw);
-  document.getElementById('ch-note').textContent =
-    'Withdrawn. Your deposit was escrowed on-chain the whole time and returned to you unilaterally.';
-}
-
-async function rotate() {
-  // Mint a fresh unlinkable key for a new session. Prior credits stay on the
-  // old key (fund the new one, or keep both); this is about not tying sessions.
-  const r = await fetch('/account/new', {method: 'POST'});
-  account = await r.json();
-  document.getElementById('apikey').textContent = account.api_key;
-  lastAcctBal = 0;
-  renderBalance();   // ecash carries over: tokens are the browser's, not the key's
-}
-
-document.getElementById('mint').onclick = mint;
-document.getElementById('rotate').onclick = rotate;
-document.getElementById('deposit').onclick = deposit;
-document.getElementById('send').onclick = send;
-document.getElementById('prompt').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
-document.getElementById('ch-open').onclick = channelOpen;
-document.getElementById('ch-close').onclick = channelClose;
-document.getElementById('ch-finalize').onclick = channelFinalize;
-document.getElementById('ch-withdraw').onclick = channelWithdraw;
-loadConfig();
-mintKeys().then(redeemPendingChange).then(renderBalance).catch(() => renderBalance());
-</script>
+<script type="module" src="/app.js"></script>
 </body>
 </html>
