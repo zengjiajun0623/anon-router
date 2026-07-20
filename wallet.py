@@ -18,10 +18,14 @@ CHANNEL_PATH = os.path.expanduser("~/.anon-router/channel.pkl")
 
 
 class Wallet:
-    def __init__(self, mint_url: str = DEFAULT_MINT, path: str = WALLET_PATH):
+    def __init__(self, mint_url: str = DEFAULT_MINT, path: str = WALLET_PATH,
+                 tor: bool = False):
         self.url = mint_url.rstrip("/")
         self.path = path
-        self.http = httpx.Client(timeout=300)
+        # tor: route everything through the local Tor SOCKS proxy so requests
+        # reach the .onion over Tor (the router never sees a client IP).
+        proxy = "socks5h://127.0.0.1:9050" if tor else None
+        self.http = httpx.Client(timeout=300, proxy=proxy)
         self._load()
         self._keys = None
 

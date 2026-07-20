@@ -1,5 +1,6 @@
 fastapi==0.139.2
 uvicorn==0.51.0
 httpx==0.28.1
+socksio==1.0.0
 web3==7.16.0
 eth-account==0.13.7

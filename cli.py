@@ -16,6 +16,8 @@ from wallet import Wallet
 def main() -> int:
     p = argparse.ArgumentParser(prog="anon-router")
     p.add_argument("--url", default=None, help="router URL (default env/localhost)")
+    p.add_argument("--tor", action="store_true",
+                   help="route over Tor SOCKS 127.0.0.1:9050 to the .onion (needs tor running)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     t = sub.add_parser("topup", help="dev faucet topup")
@@ -43,7 +45,9 @@ def main() -> int:
     m.add_argument("--search", default=None)
 
     args = p.parse_args()
-    w = Wallet(args.url) if args.url else Wallet()
+    ONION = "http://buudenzevnvddmb7crzki7daedc7p4hnsvint66xtala2y2bs3afobad.onion"
+    url = args.url or (ONION if args.tor else None)
+    w = Wallet(mint_url=url, tor=args.tor) if url else Wallet(tor=args.tor)
 
     if args.cmd == "topup":
         bal = w.topup(args.credits)

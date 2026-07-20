@@ -26,3 +26,5 @@ state.db.anvil.bak
 state.db-shm
 state.db-wal
 state.db-*
+.watcher_credited
+.watcher_halt
