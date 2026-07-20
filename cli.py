@@ -147,6 +147,10 @@ def main() -> int:
                     help="use the confetti trust-min prover daemon instead of the "
                          "ecash proxy (advanced: needs the prover binary + server deps)")
 
+    st = sub.add_parser("setup", help="show setup state (mints an account if none) — "
+                        "for agents: use --json to drive setup programmatically")
+    st.add_argument("--json", action="store_true")
+
     m = sub.add_parser("models")
     m.add_argument("--search", default=None)
 
@@ -254,6 +258,33 @@ def main() -> int:
         else:
             from serve_ecash import run_proxy
             run_proxy(w, host=args.host, port=args.port, daemon_key=daemon_key)
+    elif args.cmd == "setup":
+        acct = w.account or w.new_account()
+        ecash = w.balance()
+        try:
+            acct_bal = w.account_status()["balance"]
+        except Exception:
+            acct_bal = 0
+        funded = (ecash + acct_bal) > 0
+        proxy_url = "http://127.0.0.1:8788/v1"
+        if not funded:
+            nxt = ("fund it: `anon-router redeem <voucher>` (no crypto), or "
+                   "`anon-router deposit <eth> --key <file>`; then `anon-router claim`")
+        elif ecash < 500:
+            nxt = f"claim ecash: `anon-router claim {min(acct_bal, 50000)}`, then `anon-router serve`"
+        else:
+            nxt = "`anon-router serve &`, then set your tool's OPENAI_BASE_URL to proxy_url"
+        info = {"router": w.url, "account_key": acct["api_key"], "ecash_balance": ecash,
+                "account_balance": acct_bal, "funded": funded, "ready_to_serve": ecash >= 500,
+                "proxy_url": proxy_url, "next_step": nxt}
+        if args.json:
+            print(json.dumps(info))
+        else:
+            print(f"router:        {w.url}")
+            print(f"account key:   {acct['api_key']}")
+            print(f"ecash balance: {ecash}   ·   account (claimable): {acct_bal}")
+            print(f"ready to serve: {info['ready_to_serve']}")
+            print(f"next:          {nxt}")
     elif args.cmd == "models":
         data = w.http.get(f"{w.url}/v1/models").json()["data"]
         for entry in data:

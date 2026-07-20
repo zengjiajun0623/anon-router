@@ -24,7 +24,10 @@ def _credit_usd() -> float:
 
 
 def main() -> int:
-    db = sqlite3.connect(os.path.join(ROOT, "state.db"))
+    # Use the SAME database the router reads (STATE_DB_PATH — /data/state.db in
+    # prod). Defaulting to ROOT/state.db wrote vouchers to a DB the server never
+    # sees, so redemptions failed with "unknown voucher".
+    db = sqlite3.connect(os.environ.get("STATE_DB_PATH", os.path.join(ROOT, "state.db")))
     db.execute(
         "CREATE TABLE IF NOT EXISTS vouchers(code TEXT PRIMARY KEY, credits INT, state TEXT)"
     )

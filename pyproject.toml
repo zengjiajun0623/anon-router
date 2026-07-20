@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "anon-router-cli"
+name = "anon-router"
 version = "0.1.0"
 description = "Pay crypto for AI inference, privately, from your terminal"
 readme = "CLI.md"
