@@ -86,6 +86,12 @@ RECEIPT_STALE_SEC = max(
     int(os.environ.get("RECEIPT_STALE_SEC", "900")),
     MAX_STREAM_TOTAL_SEC + int(STREAM_READ_TIMEOUT_S) + 120)
 
+# Data minimization: delete settled claim/receipt records once they are far past
+# any legitimate replay/recovery window. They hold amount+timing metadata that,
+# retained forever, is a standing correlation dossier — so prune it. Kept well
+# above RECEIPT_STALE_SEC so in-flight recovery is never affected. 0 disables.
+DATA_RETENTION_SEC = int(os.environ.get("DATA_RETENTION_SEC", str(7 * 24 * 3600)))
+
 if DEV_FAUCET and urlparse(UPSTREAM).hostname not in {"localhost", "127.0.0.1"}:
     message = "REFUSING TO START: DEV_FAUCET requires a localhost upstream"
     print(message)
@@ -230,8 +236,10 @@ db.execute(
     "CREATE TABLE IF NOT EXISTS seen_deposits(txhash TEXT PRIMARY KEY)"
 )
 # Idempotent claim records: a lost/retried claim returns the cached signatures
-# instead of debiting the account a second time. `ts` lets a janitor expire them
-# so the correlation surface (which account claimed when) does not persist.
+# instead of debiting the account a second time. `ts` lets the periodic janitor
+# (_recover_stale_receipts, DATA_RETENTION_SEC) delete them once far past the
+# replay window, so the correlation surface (which account claimed when) does not
+# persist indefinitely.
 db.execute(
     "CREATE TABLE IF NOT EXISTS claims(idem_key TEXT PRIMARY KEY, response TEXT, ts INTEGER)"
 )
@@ -382,24 +390,37 @@ def privacy():
     """Machine-readable privacy posture — the honest boundary."""
     onion = _onion_address()
     return {
-        "no_account": True,
+        "no_signup": True,
         "no_card_no_kyc": True,
         "no_cookies_or_sessions": True,
+        "funding_account": ("an on-chain deposit creates a pseudonymous account row "
+                            "(keyed by a hash, holds the credited balance until you "
+                            "claim it to ecash); a voucher needs no account at all"),
         "auth": ("ecash (blind-signed) pays for inference — no bearer key on the "
                  "inference path; the account key funds/claims only, never buys a call"),
         "live_lane": "ecash (blind-signature, custodial)",
         "roadmap_lane": "confetti channel (non-custodial, per-request ZK)",
-        "payment_unlinkable": ("cryptographically unlinkable at the signature layer "
-                               "(blind-signed ecash); the custodial router still sees "
-                               "deposit and redemption amounts + timing, so deposit a "
-                               "common round amount and spend over time to avoid "
-                               "statistical correlation"),
+        "payment_unlinkable": ("no DIRECT cryptographic link at the blind-signature "
+                               "layer (the router never sees which issued token became "
+                               "which spend). In practice the custodial router still sees "
+                               "claim/spend amounts, denominations, and timing, and "
+                               "retains claim/receipt records for a bounded window, so "
+                               "correlation strength depends on how many others are "
+                               "claiming and spending in the same window — small on an "
+                               "early alpha. Deposit a common round amount, spend over "
+                               "time, and use Tor to raise it"),
+        "data_retention": ("claim + settled-receipt records (amounts, timing) are pruned "
+                           f"after {DATA_RETENTION_SEC // 86400} days; the spent-token set "
+                           "is kept permanently for double-spend safety"),
         "what_provider_sees": "only the router — not your identity, IP, or card",
-        "what_router_sees": ("prompt content + connection metadata (IP/timing). Ecash "
-                             "spends carry no account identifier, so they are not linkable "
-                             "by any key; but without Tor the source IP + timing still "
-                             "correlate your requests — connect over the .onion to remove "
-                             "that channel"),
+        "what_router_sees": ("prompt content + connection metadata (IP/timing) + spend "
+                             "amounts. Ecash spends carry no account identifier, so they "
+                             "are not linkable by any key. The .onion removes the source-IP "
+                             "channel; timing and amount correlation remain even over Tor, "
+                             "so also space out claims and spends"),
+        "hosting_note": ("the app does not log IPs (--no-access-log), but the hosting "
+                        "platform's edge terminates TLS and can see request IPs in its own "
+                        "logs; the .onion bypasses that edge entirely"),
         "what_the_model_sees": ("your prompt content — it must, to answer you; use a "
                                 "local/self-hosted model to keep content off third parties"),
         "transport": {"onion_live": bool(onion), "onion": onion or None},
@@ -666,7 +687,8 @@ async def _recover_stale_receipts() -> int:
     request's fresh receipt is never touched — safe even with multiple workers or
     a rolling restart. NULL ts (pre-migration receipts) are treated as stale."""
     async with db_write_lock:
-        cutoff = int(time.time()) - RECEIPT_STALE_SEC
+        now_ts = int(time.time())
+        cutoff = now_ts - RECEIPT_STALE_SEC
         stale = db.execute(
             "SELECT id, res_day, res_usd FROM receipts "
             "WHERE state='pending' AND (ts IS NULL OR ts < ?)",
@@ -680,10 +702,13 @@ async def _recover_stale_receipts() -> int:
             # double-release across workers and no leak on a crash between the
             # two writes (they commit together). Inlined (not _reconcile_spend) to
             # avoid re-entering db_write_lock.
+            # Set ts to settlement time so the data-retention window (below) starts
+            # now — the payer still needs it to recover the refund. Without this, a
+            # receipt with an ancient spend-ts would be pruned in this same sweep.
             cur = db.execute(
-                "UPDATE receipts SET cost=0, state='final' "
+                "UPDATE receipts SET cost=0, state='final', ts=? "
                 "WHERE id=? AND state='pending'",
-                (_id,),
+                (now_ts, _id),
             )
             if cur.rowcount == 1:
                 n += 1
@@ -692,6 +717,15 @@ async def _recover_stale_receipts() -> int:
                         "UPDATE spend_ledger SET usd=MAX(0, usd-?) WHERE day=?",
                         (float(usd), day),
                     )
+        # Data-minimization prune (runs on the same periodic sweep). Only settled
+        # receipts and old claims are removed; the `spent` nullifier set is kept
+        # forever (double-spend safety) and lives+pending receipts are untouched.
+        if DATA_RETENTION_SEC > 0:
+            old = int(time.time()) - DATA_RETENTION_SEC
+            db.execute("DELETE FROM claims WHERE ts IS NOT NULL AND ts < ?", (old,))
+            db.execute(
+                "DELETE FROM receipts WHERE state IN ('final', 'redeemed') "
+                "AND ts IS NOT NULL AND ts < ?", (old,))
         db.commit()
     if n:
         print(f"anon-router: recovered {n} stale receipt(s) -> full refund")

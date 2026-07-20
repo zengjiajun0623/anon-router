@@ -562,6 +562,27 @@ wireCopy('copy-key', 'apikey');
 updateSendState();
 mintKeys().then(redeemPendingChange).then(renderBalance).catch(() => renderBalance());
 
+// Populate the model dropdown from the LIVE catalog so it never offers a retired
+// model. Keep a small curated shortlist (in preference order); fall back to the
+// static gpt-4o-mini option if the catalog can't be fetched.
+const PREFERRED_MODELS = [
+  'openai/gpt-4o-mini', 'openai/gpt-4o',
+  'anthropic/claude-sonnet-4.5', 'anthropic/claude-haiku-4.5',
+  'google/gemini-2.0-flash-001', 'meta-llama/llama-3.3-70b-instruct',
+];
+fetch('/v1/models').then((r) => r.json()).then((d) => {
+  const live = new Set((d.data || []).map((m) => m.id));
+  const pick = PREFERRED_MODELS.filter((m) => live.has(m));
+  if (!pick.length) return;                       // keep the static default
+  const sel = $('model');
+  sel.innerHTML = '';
+  for (const id of pick) {
+    const o = document.createElement('option');
+    o.value = id; o.textContent = id;
+    sel.appendChild(o);
+  }
+}).catch(() => {});
+
 // Show the Tor .onion address in the footer when the router publishes one.
 fetch('/privacy').then((r) => r.json()).then((p) => {
   const onion = p && p.transport && p.transport.onion;

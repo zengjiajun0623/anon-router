@@ -82,10 +82,11 @@
 <div class="wrap">
   <header>
     <h1>anon-router</h1>
-    <p>Deposit crypto, get credits, chat privately. No account, no card.</p>
+    <p>Deposit crypto, get credits, chat privately. No signup, no card, no KYC.</p>
     <p class="sub muted">Try it in the browser below. To call it from code or an agent,
-      run the local proxy and point any OpenAI or Anthropic tool at it —
-      <a href="/quickstart">Quickstart</a>. Your spends can't be linked to your deposit.</p>
+      run the local proxy and point any OpenAI or Anthropic tool at it,
+      <a href="/quickstart">Quickstart</a>. Your spends carry no identity and are
+      cryptographically decoupled from your deposit.</p>
   </header>
 
   <div class="grid">
@@ -144,12 +145,10 @@
       <div class="row" style="margin-bottom:12px">
         <select id="model">
           <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
-          <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
-          <option value="local/qwen3:8b">local/qwen3:8b (free)</option>
         </select>
       </div>
-      <div class="note" style="margin:0 0 12px">Private by default: your spends can't be linked to
-        your deposit.</div>
+      <div class="note" style="margin:0 0 12px">Private by default: your spends carry no identity and
+        aren't cryptographically tied to your deposit.</div>
       <div class="chat">
         <div class="log" id="log"></div>
         <div class="composer">
@@ -163,23 +162,24 @@
     <!-- PRIVACY STATEMENT (minimal, honest) -->
     <div class="card">
       <h2>What's private</h2>
-      <div class="kv"><span class="k">No account, no card, no KYC</span><span class="v">✓</span></div>
-      <div class="kv"><span class="k">Your spends can't be linked to your deposit</span><span class="v">✓ blind-signed ecash</span></div>
+      <div class="kv"><span class="k">No signup, no card, no KYC</span><span class="v">✓ (a deposit makes a pseudonymous account; a voucher makes none)</span></div>
+      <div class="kv"><span class="k">No direct link from a spend to your deposit</span><span class="v">✓ blind-signed ecash</span></div>
       <div class="kv"><span class="k">The provider only ever sees the router, never you</span><span class="v">✓</span></div>
-      <div class="note">Honest limits: unlinkability is cryptographic (blind signatures), but without Tor
-        your IP and timing still correlate your requests — connect over the <code>.onion</code> to remove
-        that. The model reads your prompt (use a <code>local/*</code> model to keep it off third parties);
-        the balance is custodial; funding is pseudonymous (fund fresh, round amounts). Full posture at
-        <code>/privacy</code>.</div>
+      <div class="note">Honest limits: the blind signatures remove the <em>direct</em> cryptographic link,
+        but in practice unlinkability is only as strong as how many others are claiming and spending in the
+        same window (small on this early alpha). The router still sees amounts and timing, and our app
+        doesn't log IPs but the hosting edge can, so connect over the <code>.onion</code> and space out
+        claims and spends. The model reads your prompt (use a <code>local/*</code> model to keep it off
+        third parties); the balance is custodial. Full posture at <code>/privacy</code>.</div>
     </div>
   </div>
 
   <div class="foot">
     Testnet demo. Deposits use Sepolia test ETH; no real funds are involved.
-    The escrow contract's safety core is machine-checked (Lean) and reviewed
-    by three independent models.
+    Today's deposits sit in a custodial vault (we hold the float — keep balances small).
+    The non-custodial escrow, whose safety core is machine-checked (Lean), is on the roadmap.
     <div id="onion-line" class="hidden" style="margin-top:8px">
-      Reachable over Tor (no IP, no exit node): <code id="onion-addr" class="mono"></code>
+      Reachable over Tor (hides your IP, no exit node): <code id="onion-addr" class="mono"></code>
     </div>
   </div>
 </div>

@@ -27,10 +27,11 @@ _ALIASES = {
     "gpt-4o": "openai/gpt-4o", "gpt-4o-mini": "openai/gpt-4o-mini",
     "gpt-4.1": "openai/gpt-4.1", "gpt-4.1-mini": "openai/gpt-4.1-mini",
     "gpt-4-turbo": "openai/gpt-4-turbo", "gpt-3.5-turbo": "openai/gpt-3.5-turbo",
-    "claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
-    "claude-3-5-sonnet": "anthropic/claude-3.5-sonnet",
-    "claude-3.5-haiku": "anthropic/claude-3.5-haiku",
-    "claude-3-opus": "anthropic/claude-3-opus",
+    # Map bare Claude names to CURRENT live slugs (the 3.5 catalog is retired).
+    "claude-3.5-sonnet": "anthropic/claude-sonnet-4.5",
+    "claude-3-5-sonnet": "anthropic/claude-sonnet-4.5",
+    "claude-sonnet": "anthropic/claude-sonnet-4.5",
+    "claude-haiku": "anthropic/claude-haiku-4.5",
 }
 
 
@@ -233,7 +234,12 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
             translate to the OpenAI lane, pay ecash, translate the answer back."""
             import anthropic_proxy as ap
             model_out = body.get("model", "")
-            oreq = ap.to_openai(body)
+            try:
+                oreq = ap.to_openai(body)
+            except ValueError as e:
+                # e.g. non-text content on this text-only lane — refuse clearly
+                return self._json(400, {"type": "error", "error": {
+                    "type": "invalid_request_error", "message": str(e)}})
             oreq["model"] = ap.map_model(model_out, _available_models())  # valid live id
 
             if not body.get("stream"):

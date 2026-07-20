@@ -8,12 +8,12 @@ non-interactive and safe to script.
 Needs Python 3.10+. A virtualenv is the always-works path (macOS often has no bare `pip`):
 ```bash
 python3 -m venv anon-router-env && source anon-router-env/bin/activate
-pip install git+https://github.com/zengjiajun0623/anon-router.git   # PyPI package coming
+pip install anon-router
 ```
 Or one global command with pipx/uv (no venv to activate):
 ```bash
-uv tool install git+https://github.com/zengjiajun0623/anon-router.git
-# or: pipx install git+https://github.com/zengjiajun0623/anon-router.git
+uv tool install anon-router
+# or: pipx install anon-router
 ```
 This adds an `anon-router` command. It targets the hosted router by default — no
 config needed. (Override with `ANON_ROUTER_URL` only for a self-hosted router.)

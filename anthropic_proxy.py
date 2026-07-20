@@ -83,6 +83,12 @@ def to_openai(req: dict) -> dict:
             t = b.get("type")
             if t == "text":
                 text_parts.append(b.get("text", ""))
+            elif t in ("image", "document"):
+                # This lane is text-only. Refuse loudly instead of silently
+                # dropping the block (which would send an unrelated answer).
+                raise ValueError(
+                    "this endpoint accepts text only; image/document content "
+                    "is not supported")
             elif t == "tool_use":  # assistant asked to call a tool
                 tool_calls.append({
                     "id": b.get("id"), "type": "function",
@@ -196,6 +202,13 @@ def stream_anthropic(openai_lines, model: str, msg_id: str = "msg_stream"):
             chunk = json.loads(payload)
         except Exception:
             continue
+        if chunk.get("error"):  # upstream error delivered as a `data:` line
+            e = chunk["error"]
+            msg = e.get("message", str(e)) if isinstance(e, dict) else str(e)
+            yield _sse("error", {"type": "error",
+                                 "error": {"type": "api_error", "message": msg}})
+            yield _sse("message_stop", {"type": "message_stop"})
+            return
         ch = (chunk.get("choices") or [{}])[0]
         delta = ch.get("delta") or {}
         if ch.get("finish_reason"):

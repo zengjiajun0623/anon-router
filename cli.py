@@ -330,9 +330,28 @@ def main() -> int:
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    except (httpx.HTTPError, httpx.TransportError) as e:
+    except httpx.HTTPStatusError as e:
+        # The router DID answer, with a 4xx/5xx — show its real reason, not a
+        # misleading "couldn't reach the router".
+        detail = None
+        try:
+            detail = e.response.json().get("detail")
+        except Exception:
+            detail = (e.response.text or "").strip()[:300]
+        print(f"error: router returned {e.response.status_code}: {detail or e}",
+              file=sys.stderr)
+        return 1
+    except (httpx.TransportError, httpx.HTTPError) as e:
         print(f"error: could not reach the router ({e.__class__.__name__}). "
               f"Check your connection, or pass --url <router>.", file=sys.stderr)
+        return 1
+    except (KeyError, ValueError, OSError) as e:
+        # e.g. a funding key file missing "private_key", bad JSON, or an
+        # unreadable path — a clean line beats a raw traceback for a new user.
+        print(f"error: {e.__class__.__name__}: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # last resort: never dump a traceback at the user
+        print(f"error: {e.__class__.__name__}: {e}", file=sys.stderr)
         return 1
 
 

@@ -21,6 +21,37 @@ def _needed_credits(text: str) -> int | None:
     m = re.search(r"<\s*(\d+)\s*credits needed", text)
     return int(m.group(1)) if m else None
 
+
+def _router_reason(text: str) -> str | None:
+    """Pull the router's human error out of a 402/4xx body (FastAPI puts it in
+    `detail`), so the client can show the REAL reason (e.g. a per-request spend
+    cap that says 'lower max_tokens') instead of a wrong 'claim more ecash'."""
+    try:
+        d = json.loads(text)
+    except Exception:
+        return text.strip() or None
+    if isinstance(d, dict):
+        det = d.get("detail") if "detail" in d else d.get("error")
+        if isinstance(det, str):
+            return det
+        if isinstance(det, dict):
+            return det.get("message") or str(det)
+    return None
+
+
+def _payment_error(needed, balance: int, text: str) -> str:
+    """Turn a non-retryable 402 into an ACTIONABLE message. Only say 'claim more'
+    when the request genuinely needs more credits than the wallet holds; otherwise
+    surface the router's real reason (e.g. the per-request spend cap, which says to
+    lower max_tokens — claiming more would not help)."""
+    if needed and needed > balance:
+        return (f"insufficient ecash: this request needs {needed} credits, you have "
+                f"{balance}. Run `anon-router claim` (or fund more).")
+    reason = _router_reason(text)
+    if reason:
+        return reason
+    return f"request rejected (402); you have {balance} credits"
+
 from confetti.channel import Payer
 from confetti.sp1 import RealSP1Prover
 from confetti.wire import payment_to_j, sig_from_j
@@ -52,8 +83,11 @@ class Wallet:
         # No keep-alive: every request opens a fresh connection so the router
         # can't link a wallet's requests to each other by TCP/TLS session
         # (blind signatures are pointless if the transport is the identifier).
+        # Read timeout must exceed the router's max stream duration (~600s) or a
+        # long generation dies client-side AFTER the model already produced it.
+        # Connect stays short so a dead host fails fast.
         self.http = httpx.Client(
-            timeout=300, proxy=proxy,
+            timeout=httpx.Timeout(660.0, connect=15.0), proxy=proxy,
             limits=httpx.Limits(max_keepalive_connections=0),
             headers={"Connection": "close"})
         self._load()
@@ -548,9 +582,7 @@ class Wallet:
                 if needed and needed > need and needed <= self.balance():
                     need = needed
                     continue
-                raise RuntimeError(
-                    f"insufficient ecash for this request (needs {needed or '?'}, "
-                    f"have {self.balance()}); run: cli.py claim <credits>")
+                raise RuntimeError(_payment_error(needed, self.balance(), text))
             if resp.status_code == 400:
                 self.tokens.extend(chosen)  # pre-spend validation error
                 self.pending = None
@@ -605,8 +637,8 @@ class Wallet:
                 chosen = self._select(need)
             except RuntimeError:
                 raise RuntimeError(
-                    "all ecash tokens were rejected as invalid (signed by a router "
-                    "that rotated its mint key). Run: cli.py claim <credits>")
+                    f"not enough spendable ecash (need {need}, have {self.balance()}). "
+                    f"Run `anon-router claim` to add credits.")
             blanks = self._make_change_blanks()
             self.pending = {"tokens": chosen, "blanks": blanks}  # crash-recovery
             self._save()
@@ -643,9 +675,7 @@ class Wallet:
                 if needed and needed > need and needed <= self.balance():
                     need = needed
                     continue
-                raise RuntimeError(
-                    f"insufficient ecash for this request (needs {needed or '?'}, "
-                    f"have {self.balance()}); run: cli.py claim <credits>")
+                raise RuntimeError(_payment_error(needed, self.balance(), resp.text))
             if resp.status_code == 400:
                 # PRE-spend validation error; tokens not burned, restore them.
                 self.tokens.extend(chosen)

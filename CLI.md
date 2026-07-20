@@ -55,9 +55,10 @@ Every request the tool makes is paid with blind-signed ecash — the router can'
 link your tool's requests to each other or to your deposit. No code changes in
 the tool. (Set `ANON_DAEMON_KEY` to require a bearer key on the proxy.)
 
-**Convenient (pseudonymous) — no local proxy:** point `base_url` at `<router>/v1`
-and use your `sk-anon-…` account key as the bearer token. Spends the account
-balance directly; simplest, but the router can link that key's requests.
+> Note: there is no hosted-API-key lane. A persistent bearer key would be a
+> linkable identifier, so inference is paid only with client-attached ecash
+> (via the local proxy above). Pointing an OpenAI client straight at the router
+> with an `sk-anon-…` key returns 402 by design.
 
 ### Claude Code
 The proxy also speaks the Anthropic Messages API (streaming + tool use), so

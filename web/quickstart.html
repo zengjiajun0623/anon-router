@@ -104,16 +104,15 @@
           <code class="inl">pip</code>):</p>
         <pre>python3 -m venv anon-env
 source anon-env/bin/activate
-pip install git+https://github.com/zengjiajun0623/anon-router.git</pre>
+pip install anon-router</pre>
         <details>
           <summary>Other ways to install</summary>
           <p class="note">One global command, no venv to activate, with
             <a href="https://pipx.pypa.io" target="_blank" rel="noopener">pipx</a> or
             <a href="https://docs.astral.sh/uv" target="_blank" rel="noopener">uv</a>:</p>
-          <pre>pipx install git+https://github.com/zengjiajun0623/anon-router.git
+          <pre>pipx install anon-router
 <span class="c"># or</span>
-uv tool install git+https://github.com/zengjiajun0623/anon-router.git</pre>
-          <p class="note" style="margin-bottom:0">A published <code class="inl">pip install anon-router</code> is coming.</p>
+uv tool install anon-router</pre>
         </details>
       </div>
     </li>
@@ -127,14 +126,20 @@ uv tool install git+https://github.com/zengjiajun0623/anon-router.git</pre>
         <p class="note">Mints spendable credit right away. That's it. On to step 3.</p>
         <details>
           <summary>Or deposit testnet ETH instead</summary>
-          <p class="note">Deposit Sepolia test ETH from a funding key file (never paste a raw key on
-            the command line), then drain the whole balance to ecash:</p>
-          <pre>anon-router deposit 0.05 --key wallet.json
+          <p class="note"><strong>Most people should use a voucher above, or deposit in the
+            <a href="/">browser</a></strong> (connect a wallet, click Deposit, no files). This CLI path is
+            for automation or if you already have a funding key handy.</p>
+          <p class="note">The deposit is sent from an Ethereum account you control. Put that account's
+            private key in a small JSON file (its path is what <code class="inl">--key</code> points at,
+            anywhere you like); we read it from the file so the raw key never lands in your shell history:</p>
+          <pre><span class="c"># wallet.json  (an account that holds Sepolia test ETH)</span>
+{ "private_key": "0x&lt;64 hex chars&gt;" }</pre>
+          <pre>anon-router deposit 0.05 --key ./wallet.json
 anon-router claim</pre>
-          <p class="note" style="margin-bottom:0">Need test ETH? Free from a faucet
+          <p class="note" style="margin-bottom:0">Need test ETH in that account? Free from a faucet
             (<a href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia" target="_blank" rel="noopener">Google Cloud</a>
             or <a href="https://sepolia-faucet.pk910.de" target="_blank" rel="noopener">pk910</a>),
-            sent to your funding wallet's address.</p>
+            sent to that account's address.</p>
         </details>
       </div>
     </li>
@@ -186,12 +191,16 @@ export ANTHROPIC_API_KEY=anon
 claude</pre>
     </div>
   </div>
-  <p class="note">Cursor, aider, LangChain, LiteLLM: anything OpenAI-compatible works with the same
-    base URL and any key.</p>
+  <p class="note">Cursor, aider, LangChain, LiteLLM: anything that speaks OpenAI chat-completions or the
+    Anthropic Messages API works with the same base URL and any key. It's text chat, not the full OpenAI
+    surface (no embeddings/responses endpoints, no image input).</p>
+  <p class="note">Note on streaming: the proxy settles each request's ecash before replying, so the answer
+    arrives once it's complete rather than token by token. That keeps concurrent agent requests from racing
+    your wallet; the trade is a long generation shows no output until it finishes.</p>
 
   <h2 class="section">Models</h2>
   <p>Use provider-prefixed IDs like <code class="inl">openai/gpt-4o-mini</code> or
-    <code class="inl">anthropic/claude-3.5-sonnet</code>; bare names (<code class="inl">gpt-4o-mini</code>)
+    <code class="inl">anthropic/claude-sonnet-4.5</code>; bare names (<code class="inl">gpt-4o-mini</code>)
     are mapped for you; <code class="inl">local/*</code> is free. List everything with
     <code class="inl">anon-router models</code>. Billing rounds to a 1-credit ($0.0001) minimum per request.</p>
 

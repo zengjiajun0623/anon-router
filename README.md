@@ -1,9 +1,11 @@
 # anon-router
 
-Pay crypto for AI inference. An OpenAI-compatible endpoint where you deposit
-ETH/USDC, get an API key, and call any model — the provider never sees a name
-or a card, and the payment rail can't link a request to the deposit that
-funded it.
+Pay crypto for AI inference. Deposit testnet ETH (or redeem a voucher), get
+credits, and call any model. The provider only ever sees an anonymous router,
+and your spends are cryptographically decoupled from the deposit that funded
+them. You use it through a small local proxy (`anon-router serve`) that speaks
+the OpenAI and Anthropic APIs; there is no hosted API key, because a persistent
+key would be a linkable identifier, so that lane was removed.
 
 ## Try the demo (local)
 
@@ -13,9 +15,11 @@ funded it.
 #   http://127.0.0.1:8402   (KEEP=1 ./run_e2e.sh leaves it running)
 ```
 
-The site (`web/index.html`): click **Get API key** (no signup), **deposit ETH**
-from any wallet, watch credits land in ~2s, and **chat** — or point Cursor / any
-OpenAI client at the base URL with that key. Fewer steps than OpenRouter.
+The site (`web/index.html`): create a wallet (no signup), **deposit ETH** from
+any wallet (it switches you to Sepolia), watch credits land in ~2s, and **chat**
+in the browser. To use it from code or an agent (Cursor, Claude Code, the OpenAI
+SDK), run the local proxy (`anon-router serve`) and point the tool at
+`http://127.0.0.1:8788`; see `CLI.md` or the `/quickstart` page.
 
 ## What's built
 
