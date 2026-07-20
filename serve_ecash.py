@@ -183,9 +183,40 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
             # streaming (Claude Code requires it)
             oreq["stream"] = True
             oreq["stream_options"] = {"include_usage": True}
+            # Consume the ENTIRE upstream stream UNDER the wallet lock (prod-side
+            # I/O is fast), peel the in-band change, and finish_stream — THEN
+            # release the lock and write to the client. The lock therefore never
+            # spans client I/O: holding it across the client write deadlocks a
+            # client like Claude Code that fires concurrent requests (the 2nd
+            # blocks on the lock while the 1st blocks writing to a not-yet-draining
+            # client). It also serializes the single `pending` slot cleanly. Trade:
+            # the Anthropic client isn't token-streamed (the full answer arrives at
+            # once); headless `claude -p` is unaffected.
+            buffered = []
+            change_holder = {}
             try:
                 with lock:
                     resp = wallet.open_stream(oreq)
+                    try:
+                        for line in resp.iter_lines():
+                            s = line.strip() if isinstance(line, str) else line.decode(errors="ignore").strip()
+                            if s == "event: x-cash-change":
+                                change_holder["seen"] = True
+                                continue
+                            if change_holder.get("seen") and s.startswith("data: "):
+                                try:
+                                    change_holder["payload"] = json.loads(s[6:])
+                                except Exception:
+                                    pass
+                                change_holder["seen"] = False
+                                continue
+                            buffered.append(line)
+                    finally:
+                        resp.close()
+                        try:
+                            wallet.finish_stream(change_holder.get("payload"))
+                        except Exception:
+                            pass
             except RuntimeError as e:
                 return self._json(402, {"type": "error", "error": {
                     "type": "insufficient_balance",
@@ -197,36 +228,12 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
-            # Peel the trailing in-band change event out of the upstream SSE so it
-            # never reaches the Anthropic client, then settle the ecash change.
-            change_holder = {}
-
-            def _lines():
-                for line in resp.iter_lines():
-                    s = line.strip() if isinstance(line, str) else line.decode(errors="ignore").strip()
-                    if s == "event: x-cash-change":
-                        change_holder["seen"] = True
-                        continue
-                    if change_holder.get("seen") and s.startswith("data: "):
-                        try:
-                            change_holder["payload"] = json.loads(s[6:])
-                        except Exception:
-                            pass
-                        change_holder["seen"] = False
-                        continue
-                    yield line
-
             try:
-                for sse in ap.stream_anthropic(_lines(), model_out):
+                for sse in ap.stream_anthropic(iter(buffered), model_out):
                     self.wfile.write(sse.encode())
                     self.wfile.flush()
-            finally:
-                resp.close()
-                with lock:
-                    try:
-                        wallet.finish_stream(change_holder.get("payload"))
-                    except Exception:
-                        pass
+            except Exception:
+                pass
 
         def _stream(self, reply: dict):
             """Emit the completion as OpenAI-compatible SSE (one content chunk +

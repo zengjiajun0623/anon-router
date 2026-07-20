@@ -5,11 +5,21 @@ import base64
 import json
 import os
 import pickle
+import re
 import secrets
 import sys
 import time
 
 import httpx
+
+
+def _needed_credits(text: str) -> int | None:
+    """Parse the router's cost-bound 402 (`prepay N < M credits needed ...`) to
+    learn how much this request actually needs, so the client can retry with an
+    adequate prepay (big requests — e.g. Claude Code's system prompt + many tool
+    schemas — need far more than the default 2000)."""
+    m = re.search(r"<\s*(\d+)\s*credits needed", text)
+    return int(m.group(1)) if m else None
 
 from confetti.channel import Payer
 from confetti.sp1 import RealSP1Prover
@@ -525,10 +535,24 @@ class Wallet:
                 self.pending = None  # dead tokens weren't spent; drop them
                 self._save()
                 continue  # dropped by _select; retry with the rest
-            if resp.status_code in (400, 402):
-                # PRE-spend rejection only (validation / cost-bound / cap): tokens
-                # were not burned, so restore them.
+            if resp.status_code == 402:
+                # Cost-bound rejection (PRE-spend): the request needs more prepay
+                # than we attached. Restore the tokens and RETRY with enough — big
+                # requests (Claude Code) far exceed the default prepay.
+                text = resp.read().decode("utf-8", "ignore")
+                resp.close()
                 self.tokens.extend(chosen)
+                self.pending = None
+                self._save()
+                needed = _needed_credits(text)
+                if needed and needed > need and needed <= self.balance():
+                    need = needed
+                    continue
+                raise RuntimeError(
+                    f"insufficient ecash for this request (needs {needed or '?'}, "
+                    f"have {self.balance()}); run: cli.py claim <credits>")
+            if resp.status_code == 400:
+                self.tokens.extend(chosen)  # pre-spend validation error
                 self.pending = None
                 self._save()
                 resp.close()
@@ -609,9 +633,21 @@ class Wallet:
                 self.pending = None  # dead tokens weren't spent; drop them
                 self._save()
                 continue
-            if resp.status_code in (400, 402):
-                # A PRE-spend rejection only (validation / cost-bound / daily cap
-                # all run before any token is burned). Safe to restore the tokens.
+            if resp.status_code == 402:
+                # Cost-bound rejection (PRE-spend): restore tokens and RETRY with
+                # enough prepay (a big request needs more than the default).
+                self.tokens.extend(chosen)
+                self.pending = None
+                self._save()
+                needed = _needed_credits(resp.text)
+                if needed and needed > need and needed <= self.balance():
+                    need = needed
+                    continue
+                raise RuntimeError(
+                    f"insufficient ecash for this request (needs {needed or '?'}, "
+                    f"have {self.balance()}); run: cli.py claim <credits>")
+            if resp.status_code == 400:
+                # PRE-spend validation error; tokens not burned, restore them.
                 self.tokens.extend(chosen)
                 self.pending = None
                 self._save()
