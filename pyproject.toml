@@ -23,7 +23,7 @@ anon-router = "cli:main"
 # NOT the server (server.py/watcher.py/store.py). Explicit lists disable
 # auto-discovery so the server files are never pulled in.
 [tool.setuptools]
-py-modules = ["cli", "wallet", "mint", "ec", "serve_ecash"]
+py-modules = ["cli", "wallet", "mint", "ec", "serve_ecash", "anthropic_proxy"]
 
 [tool.setuptools.packages.find]
 include = ["confetti*"]

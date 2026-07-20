@@ -59,6 +59,18 @@ the tool. (Set `ANON_DAEMON_KEY` to require a bearer key on the proxy.)
 and use your `sk-anon-…` account key as the bearer token. Spends the account
 balance directly; simplest, but the router can link that key's requests.
 
+### Claude Code
+The proxy also speaks the Anthropic Messages API (streaming + tool use), so
+Claude Code runs against it with two env vars:
+```bash
+anon-router serve                 # local proxy, leave it running
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+export ANTHROPIC_API_KEY=anon-router     # any non-empty value
+claude                            # every request now pays private ecash
+```
+The model names Claude Code sends are mapped to a valid router model
+automatically; full agentic tool use works.
+
 ## Or just chat in the terminal
 `anon-router chat "…"` — private (ecash), no other tool needed.
 

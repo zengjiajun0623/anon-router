@@ -64,6 +64,19 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
         except Exception:
             pass  # best-effort; a truly empty wallet still returns a clear 402
 
+    import time as _time
+    _models = {"set": None, "ts": 0.0}
+
+    def _available_models():
+        if _models["set"] is None or _time.time() - _models["ts"] > 600:
+            try:
+                r = wallet.http.get(f"{wallet.url}/v1/models", timeout=10)
+                _models["set"] = {m["id"] for m in r.json().get("data", [])}
+                _models["ts"] = _time.time()
+            except Exception:
+                pass
+        return _models["set"] or set()
+
     # First-run onboarding: make sure there's an account to fund.
     if not wallet.account and wallet.balance() == 0:
         try:
@@ -91,6 +104,7 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
             return self.headers.get("Authorization", "") == f"Bearer {daemon_key}"
 
         def do_GET(self):
+            self.path = self.path.split("?", 1)[0]  # drop query (Claude Code sends ?beta=true)
             if self.path.rstrip("/") == "/healthz":
                 self._json(200, {"ok": True, "balance": wallet.balance(),
                                  "router": wallet.url})
@@ -104,7 +118,10 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
-            if not self.path.rstrip("/").endswith("/chat/completions"):
+            path = self.path.split("?", 1)[0].rstrip("/")  # drop query (?beta=true)
+            is_msgs = path.endswith("/messages")          # Anthropic (Claude Code)
+            is_chat = path.endswith("/chat/completions")  # OpenAI
+            if not (is_msgs or is_chat):
                 return self._json(404, {"error": "not found"})
             if not self._authed():
                 return self._json(401, {"error": "missing or invalid daemon key"})
@@ -113,6 +130,8 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                 body = json.loads(self.rfile.read(n) or b"{}")
             except Exception:
                 return self._json(400, {"error": "invalid JSON body"})
+            if is_msgs:
+                return self._messages(body)
             messages = body.get("messages")
             if not messages:
                 return self._json(400, {"error": "messages required"})
@@ -135,6 +154,66 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                 self._stream(reply)
             else:
                 self._json(200, reply)
+
+        def _messages(self, body: dict):
+            """Anthropic Messages API (POST /v1/messages) for Claude Code etc.:
+            translate to the OpenAI lane, pay ecash, translate the answer back."""
+            import anthropic_proxy as ap
+            model_out = body.get("model", "")
+            oreq = ap.to_openai(body)
+            oreq["model"] = ap.map_model(model_out, _available_models())  # valid live id
+
+            if not body.get("stream"):
+                oreq.pop("stream", None)
+                msgs, model = oreq.pop("messages"), oreq.pop("model")
+                try:
+                    with lock:
+                        _refill_if_low()
+                        reply, _ = wallet.chat(msgs, model=model, stream=False, **oreq)
+                except RuntimeError as e:
+                    return self._json(402, {"type": "error", "error": {
+                        "type": "insufficient_balance",
+                        "message": f"{e}. Run `anon-router claim <credits>`."}})
+                except Exception as e:
+                    return self._json(502, {"type": "error", "error": {"message": str(e)}})
+                if isinstance(reply, dict) and reply.get("error"):  # upstream error body
+                    e = reply["error"]
+                    return self._json(400, {"type": "error", "error": {
+                        "type": "api_error",
+                        "message": e.get("message", str(e)) if isinstance(e, dict) else str(e)}})
+                return self._json(200, ap.to_anthropic(reply, model_out))
+
+            # streaming (Claude Code requires it)
+            oreq["stream"] = True
+            oreq["stream_options"] = {"include_usage": True}
+            try:
+                with lock:
+                    _refill_if_low()
+                    resp = wallet.open_stream(oreq)
+            except RuntimeError as e:
+                return self._json(402, {"type": "error", "error": {
+                    "type": "insufficient_balance",
+                    "message": f"{e}. Run `anon-router claim <credits>`."}})
+            except Exception as e:
+                return self._json(502, {"type": "error", "error": {"message": str(e)}})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for sse in ap.stream_anthropic(resp.iter_lines(), model_out):
+                    self.wfile.write(sse.encode())
+                    self.wfile.flush()
+            finally:
+                receipt = resp.headers.get("X-Change-Receipt")
+                resp.close()
+                if receipt:
+                    with lock:
+                        try:
+                            wallet.redeem_change(receipt)
+                        except Exception:
+                            pass
 
         def _stream(self, reply: dict):
             """Emit the completion as OpenAI-compatible SSE (one content chunk +
@@ -165,15 +244,20 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
             acct_bal = wallet.account_status().get("balance", 0)
         except Exception:
             pass
+    base = f"http://{host}:{port}"
     print(f"\nanon-router ecash proxy  →  router {wallet.url}", flush=True)
-    print(f"  point your agent/tool at:  base_url = http://{host}:{port}/v1   "
-          f"(api_key = anything)", flush=True)
+    print(f"  OpenAI tools (Cursor, aider, SDK):  base_url = {base}/v1   (api_key = anything)",
+          flush=True)
+    print("  Claude Code — run it against this proxy with two env vars:", flush=True)
+    print(f"      export ANTHROPIC_BASE_URL={base}", flush=True)
+    print("      export ANTHROPIC_API_KEY=anon-router      # any non-empty value", flush=True)
+    print("      claude              # every request now pays private ecash", flush=True)
     print(f"  spendable ecash: {bal}   ·   account (auto-claimed as needed): {acct_bal}",
           flush=True)
     if bal + acct_bal < refill_low:
         print("  low/empty balance — fund it once, then it auto-tops-up:", flush=True)
         print("      anon-router deposit 0.001 --key <yourkey.json>", flush=True)
-    print("  every request pays private, unlinkable ecash. Ctrl-C to stop.\n", flush=True)
+    print("  the provider sees only the router — never who paid. Ctrl-C to stop.\n", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

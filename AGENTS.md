@@ -49,6 +49,19 @@ Or set `base_url = http://127.0.0.1:8788/v1` in the tool's config. Bare model
 names work (`gpt-4o`, `claude-3.5-sonnet`, …). Every request now pays private
 ecash — the provider only ever sees the router, never the user.
 
+### 5b. Claude Code specifically
+Claude Code speaks the Anthropic Messages API, not OpenAI — the proxy serves both
+(`/v1/messages` with streaming + tool use). Point Claude Code at it with two env
+vars, then use `claude` normally:
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+export ANTHROPIC_API_KEY=anon-router          # any non-empty value; ignored locally
+claude                                          # or: claude -p "…"
+```
+Anthropic model names Claude Code sends (`claude-sonnet-4-5`, `claude-opus-4-5`,
+…) are resolved to a currently-valid router model automatically. Full agentic
+tool use (Read/Bash/Edit) works — verified end to end.
+
 ## 6. Verify
 ```bash
 curl -s http://127.0.0.1:8788/v1/chat/completions \

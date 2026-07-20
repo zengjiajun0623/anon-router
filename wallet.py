@@ -402,6 +402,30 @@ class Wallet:
                  for t in chosen]
         return base64.b64encode(json.dumps(spend).encode()).decode()
 
+    def open_stream(self, body: dict, prepay: int = 2000):
+        """Attach ecash and open a STREAMING POST to /v1/chat/completions,
+        self-healing around dead tokens. Returns an httpx streaming Response the
+        caller iterates with .iter_lines(); afterwards call
+        redeem_change(resp.headers['X-Change-Receipt']) and resp.close()."""
+        need = max(prepay, self.keys()["min_prepay"])
+        for _ in range(min(len(self.tokens) + 4, 40)):
+            chosen = self._select(need)  # raises if empty -> caller surfaces
+            req = self.http.build_request(
+                "POST", f"{self.url}/v1/chat/completions", json=body,
+                headers={"X-Cash": self._xcash(chosen)})
+            resp = self.http.send(req, stream=True)
+            if resp.status_code == 400 and "invalid token" in resp.read().decode(
+                    "utf-8", "ignore").lower():
+                resp.close()
+                continue  # dead tokens (dropped by _select); retry with the rest
+            if resp.status_code >= 400:
+                self.tokens.extend(chosen)
+                self._save()
+                resp.close()
+                resp.raise_for_status()
+            return resp
+        raise RuntimeError("no spendable ecash token; run: cli.py claim")
+
     def chat(self, messages: list[dict], model: str, prepay: int = 2000,
              stream: bool = False, **kwargs):
         url = f"{self.url}/v1/chat/completions"
