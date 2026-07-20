@@ -19,6 +19,8 @@ either Genesis or SignedParent (the disjunction R_pay hides).
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -188,6 +190,12 @@ class ClearWitnessProver:
         err = check_R_pay(st, w)
         if err:
             raise ValueError(f"cannot prove invalid statement: {err}")
+        # Dev-only: simulate the real STARK prover's ~45s latency so the
+        # pipelining path can be exercised without the 28 GB SP1 proof. Never
+        # set in production (the clear prover is not zero-knowledge anyway).
+        fake = os.environ.get("ANON_FAKE_PROVE_S")
+        if fake:
+            time.sleep(float(fake))
         return json.dumps(_witness_to_j(w)).encode()
 
     def verify(self, st: Statement, pi: bytes) -> bool:

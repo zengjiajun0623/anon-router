@@ -17,6 +17,9 @@ from mint import blind, decompose, unblind
 DEFAULT_MINT = os.environ.get("ANON_ROUTER_URL", "http://127.0.0.1:8402")
 WALLET_PATH = os.path.expanduser("~/.anon-router/wallet.json")
 CHANNEL_PATH = os.path.expanduser("~/.anon-router/channel.pkl")
+# A payment proved ahead of time (during the previous reply's think-time) so the
+# next chat message spends instantly instead of blocking ~45s on the prover.
+PREPARED_PATH = CHANNEL_PATH + ".prepared"
 
 
 class Wallet:
@@ -182,31 +185,112 @@ class Wallet:
         return {"deposit": payer.D, "spent": payer.tip.bal,
                 "remaining": payer.D - payer.tip.bal, "payments": payer.tip.index}
 
-    def channel_chat(self, messages: list[dict], model: str, **kwargs):
-        params = self.http.get(f"{self.url}/channel/params").json()
-        price = params["price_per_request"]
-        payer = self._load_channel()
+    def _channel_params(self) -> dict:
+        return self.http.get(f"{self.url}/channel/params").json()
+
+    def _channel_require_prover(self, payer: Payer, params: dict) -> str:
         router_prover = params.get("prover", "clear")
         payer_prover = "sp1" if isinstance(payer.prover, RealSP1Prover) else "clear"
         if router_prover != payer_prover:
             raise RuntimeError(
                 f"channel was opened with the {payer_prover!r} prover but the "
                 f"router now requires {router_prover!r}; open a new channel")
+        return payer_prover
+
+    # ---- pipelined proving (prove payment N+1 during reply N's think-time) ----
+    #
+    # A confetti payment costs ~45s of client-side STARK proving. Doing that on
+    # the critical path means every message waits ~45s before inference starts.
+    # Instead we split proving from spending: after each message settles we prove
+    # the *next* payment in the background while the user reads the reply, so the
+    # next message spends an already-proven token instantly. Only the very first
+    # message of a fresh channel pays the full latency; the rest is hidden as
+    # long as think-time >= prove-time.
+    #
+    # A prepared payment reads the channel tip but never advances it (only a
+    # countersignature does), so proving ahead is always safe: worst case the
+    # proof is discarded unused. Each prepared payment reveals the tip's
+    # committed next-nullifier N_i, so there is at most ONE per tip — re-proving
+    # the same tip returns the cached one rather than burning a second nullifier.
+
+    def _save_prepared(self, prepared: dict) -> None:
+        os.makedirs(os.path.dirname(PREPARED_PATH), exist_ok=True)
+        with open(PREPARED_PATH, "wb") as f:
+            pickle.dump(prepared, f)
+        os.chmod(PREPARED_PATH, 0o600)
+
+    def _clear_prepared(self) -> None:
+        self._prepared = None
+        try:
+            os.remove(PREPARED_PATH)
+        except FileNotFoundError:
+            pass
+
+    def prepared_ready(self) -> dict | None:
+        """A prepared payment valid for the current tip, or None. Loads the
+        persisted one from a previous session so the first message stays instant
+        across CLI restarts; discards it if the tip has since advanced."""
+        prepared = getattr(self, "_prepared", None)
+        if prepared is None and os.path.exists(PREPARED_PATH):
+            try:
+                with open(PREPARED_PATH, "rb") as f:
+                    prepared = pickle.load(f)
+            except Exception:
+                prepared = None
+        if prepared is None:
+            return None
+        payer = self._load_channel()
+        if prepared.get("for_index") != payer.tip.index or prepared["m"].N_i != payer.tip.N_next:
+            self._clear_prepared()
+            return None
+        self._prepared = prepared
+        return prepared
+
+    def channel_prove_next(self, price: int | None = None) -> dict:
+        """Prove the next payment for the current tip (the ~45s step). Returns a
+        prepared-payment dict to spend later with channel_pay_prepared. Safe to
+        call from a background thread: it only reads the channel, and persists
+        the result (not the channel) so it never races the spend path."""
+        cached = self.prepared_ready()
+        if cached is not None and (price is None or cached["price"] == price):
+            return cached
+        params = self._channel_params()
+        price = price or params["price_per_request"]
+        payer = self._load_channel()
+        self._channel_require_prover(payer, params)
         if payer.D - payer.tip.bal < price:
             raise RuntimeError("channel balance below price; open a new channel")
-        if payer_prover == "sp1":
-            print("proving payment (SP1 STARK, ~1 min native)...", file=sys.stderr)
         t0 = time.time()
-        m, pending = payer.build_payment(price)
-        prove_s = time.time() - t0
-        if payer_prover == "sp1":
-            print(f"payment proof ready in {prove_s:.1f}s "
-                  f"({len(m.pi)} byte envelope)", file=sys.stderr)
+        m, pending = payer.build_payment(price)   # proves; reads tip, no mutation
+        prepared = {"for_index": payer.tip.index, "m": m, "pending": pending,
+                    "price": price, "prove_s": time.time() - t0}
+        self._prepared = prepared
+        self._save_prepared(prepared)
+        return prepared
+
+    def channel_pay_prepared(self, prepared: dict, messages: list[dict],
+                             model: str, **kwargs):
+        """Spend an already-proven payment: post it with the request, take the
+        countersignature, advance the tip. No proving happens here — this is the
+        instant path once channel_prove_next has run ahead."""
+        payer = self._load_channel()
+        if prepared.get("for_index") != payer.tip.index:
+            raise RuntimeError("prepared payment is stale; the tip advanced")
+        m, pending, price = prepared["m"], prepared["pending"], prepared["price"]
+        reply = self._channel_post(payer, m, pending, messages, model, **kwargs)
+        self._save_channel(payer)
+        self._clear_prepared()
+        return reply, {"cost": price, "remaining": payer.D - payer.tip.bal}
+
+    def _channel_post(self, payer: Payer, m, pending, messages: list[dict],
+                      model: str, **kwargs) -> dict:
+        """POST a built payment + request, apply the countersignature to `payer`
+        (advancing its tip in place). Shared by the cold and pipelined paths."""
         payment_j = payment_to_j(m)
         header_b64 = base64.b64encode(json.dumps(payment_j).encode()).decode()
         body = {"model": model, "messages": messages, "stream": False, **kwargs}
         headers = {}
-        # A real STARK proof (~3.7 MB base64) blows past HTTP header limits;
+        # A real STARK proof (~3.8 MB base64) blows past HTTP header limits;
         # ship it in the reserved body field instead. Small (clear) proofs keep
         # using the header for backward compatibility.
         if len(header_b64) > 8000:
@@ -222,8 +306,29 @@ class Wallet:
             raise RuntimeError("router did not countersign the payment")
         sigma = sig_from_j(json.loads(base64.b64decode(countersign)))
         payer.on_countersign(pending, sigma)   # advances the tip only if valid
+        return resp.json()
+
+    def channel_chat(self, messages: list[dict], model: str, **kwargs):
+        """Cold single-shot channel payment: prove on the critical path, then
+        spend. The interactive REPL uses channel_prove_next/pay_prepared instead
+        to hide the proving latency."""
+        params = self._channel_params()
+        price = params["price_per_request"]
+        payer = self._load_channel()
+        payer_prover = self._channel_require_prover(payer, params)
+        if payer.D - payer.tip.bal < price:
+            raise RuntimeError("channel balance below price; open a new channel")
+        if payer_prover == "sp1":
+            print("proving payment (SP1 STARK, ~45s native)...", file=sys.stderr)
+        t0 = time.time()
+        m, pending = payer.build_payment(price)
+        if payer_prover == "sp1":
+            print(f"payment proof ready in {time.time() - t0:.1f}s "
+                  f"({len(m.pi)} byte envelope)", file=sys.stderr)
+        reply = self._channel_post(payer, m, pending, messages, model, **kwargs)
         self._save_channel(payer)
-        return resp.json(), {"cost": price, "remaining": payer.D - payer.tip.bal}
+        self._clear_prepared()   # tip moved; any prepared token is now stale
+        return reply, {"cost": price, "remaining": payer.D - payer.tip.bal}
 
     def chat(self, messages: list[dict], model: str, prepay: int = 2000,
              stream: bool = False, **kwargs):
