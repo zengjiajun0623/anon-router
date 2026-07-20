@@ -6,6 +6,7 @@ change via a one-time receipt.
 
 Run: uvicorn server:app --host 127.0.0.1 --port 8402
 """
+import asyncio
 import base64
 import hmac
 import json
@@ -53,6 +54,7 @@ DEV_FAUCET = os.environ.get("DEV_FAUCET", "0") == "1"
 FAUCET_MAX = int(os.environ.get("FAUCET_MAX", "500000"))  # per topup call, dev only
 CHANNEL_LANE_ENABLED = os.environ.get("CHANNEL_LANE_ENABLED", "0") == "1"
 DAILY_USD_CAP = float(os.environ.get("DAILY_USD_CAP", "0"))
+MAX_REQUEST_USD = max(CREDIT_USD, float(os.environ.get("MAX_REQUEST_USD", "0.50")))
 ACCOUNT_RATE_PER_MIN = int(os.environ.get("ACCOUNT_RATE_PER_MIN", "120"))
 
 if DEV_FAUCET and urlparse(UPSTREAM).hostname not in {"localhost", "127.0.0.1"}:
@@ -104,6 +106,8 @@ db = sqlite3.connect(
     os.environ.get("STATE_DB_PATH", os.path.join(ROOT, "state.db")),
     check_same_thread=False,
 )
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA busy_timeout=5000")
 db.execute("CREATE TABLE IF NOT EXISTS spent(secret TEXT PRIMARY KEY)")
 db.execute(
     "CREATE TABLE IF NOT EXISTS receipts("
@@ -126,6 +130,7 @@ db.execute(
 )
 db.execute("CREATE TABLE IF NOT EXISTS spend_ledger(day TEXT PRIMARY KEY, usd REAL)")
 db.commit()
+db_write_lock = asyncio.Lock()
 
 account_creations = deque()
 account_rate_lock = threading.Lock()
@@ -219,51 +224,66 @@ def _sign_outputs(outputs: list[dict]) -> list[dict]:
         raise HTTPException(400, str(e))
 
 
-def _spend(tokens: list[dict]) -> int:
+async def _spend(tokens: list[dict]) -> int:
     total = sum(int(t.get("amount", 0)) for t in tokens)
     if total < MIN_PREPAY:
         raise HTTPException(402, f"prepay {total} < minimum {MIN_PREPAY} credits")
     for t in tokens:
         if not mint.verify(int(t["amount"]), t["secret"], t["C"]):
             raise HTTPException(400, "invalid token signature")
-    cur = db.cursor()
-    try:
-        for t in tokens:
-            cur.execute("INSERT INTO spent(secret) VALUES (?)", (t["secret"],))
-    except sqlite3.IntegrityError:
-        db.rollback()
-        raise HTTPException(400, "token already spent")
-    db.commit()
+    async with db_write_lock:
+        cur = db.cursor()
+        try:
+            for t in tokens:
+                cur.execute("INSERT INTO spent(secret) VALUES (?)", (t["secret"],))
+            db.commit()
+        except sqlite3.IntegrityError:
+            db.rollback()
+            raise HTTPException(400, "token already spent")
     return total
 
 
-def _finalize(receipt_id: str, cost: int) -> None:
-    db.execute(
-        "UPDATE receipts SET cost=?, state='final' WHERE id=? AND state='pending'",
-        (cost, receipt_id),
-    )
-    db.commit()
+async def _finalize(receipt_id: str, cost: int) -> None:
+    async with db_write_lock:
+        db.execute(
+            "UPDATE receipts SET cost=?, state='final' WHERE id=? AND state='pending'",
+            (cost, receipt_id),
+        )
+        db.commit()
 
 
-def _check_daily_cap() -> None:
+async def _reserve_daily_cap() -> float:
     if DAILY_USD_CAP <= 0:
-        return
-    row = db.execute(
-        "SELECT usd FROM spend_ledger WHERE day=date('now')"
-    ).fetchone()
-    if row and row[0] >= DAILY_USD_CAP:
-        raise HTTPException(402, "daily budget reached, try later")
+        return 0.0
+    estimate = max(0.0, MAX_REQUEST_USD)
+    async with db_write_lock:
+        row = db.execute(
+            "SELECT usd FROM spend_ledger WHERE day=date('now')"
+        ).fetchone()
+        today_usd = float(row[0]) if row else 0.0
+        if today_usd + estimate > DAILY_USD_CAP:
+            raise HTTPException(402, "daily budget reached, try later")
+        db.execute(
+            "INSERT INTO spend_ledger(day, usd) VALUES (date('now'), ?) "
+            "ON CONFLICT(day) DO UPDATE SET usd=usd+excluded.usd",
+            (estimate,),
+        )
+        db.commit()
+    return estimate
 
 
-def _record_spend(cost_usd: float | None) -> None:
-    if cost_usd is None:
-        return
-    db.execute(
-        "INSERT INTO spend_ledger(day, usd) VALUES (date('now'), ?) "
-        "ON CONFLICT(day) DO UPDATE SET usd=usd+excluded.usd",
-        (float(cost_usd),),
-    )
-    db.commit()
+async def _reconcile_spend(reserved_usd: float, actual_usd: float) -> None:
+    async with db_write_lock:
+        db.execute(
+            "INSERT INTO spend_ledger(day, usd) VALUES (date('now'), ?) "
+            "ON CONFLICT(day) DO UPDATE SET usd=usd+excluded.usd",
+            (float(actual_usd) - reserved_usd,),
+        )
+        db.commit()
+
+
+def _billed_usd(cost_usd: float | None, credits: int) -> float:
+    return credits * CREDIT_USD if cost_usd is None else float(cost_usd)
 
 
 def _usd_to_credits(cost_usd: float | None) -> int:
@@ -310,7 +330,7 @@ def _key_hash(api_key: str) -> str:
 
 
 @app.post("/account/new")
-def account_new():
+async def account_new():
     """Mint a fresh bearer API key. Fund it by depositing ETH to the vault
     referencing its key_hash; the watcher credits it."""
     now = time.monotonic()
@@ -322,11 +342,12 @@ def account_new():
         account_creations.append(now)
     api_key = "sk-anon-" + secrets.token_urlsafe(24)
     kh = _key_hash(api_key)
-    db.execute(
-        "INSERT INTO accounts(api_key, key_hash, balance) VALUES (?, ?, 0)",
-        (api_key, kh),
-    )
-    db.commit()
+    async with db_write_lock:
+        db.execute(
+            "INSERT INTO accounts(api_key, key_hash, balance) VALUES (?, ?, 0)",
+            (api_key, kh),
+        )
+        db.commit()
     from web3 import Web3
     return {
         "api_key": api_key,
@@ -367,18 +388,21 @@ async def account_credit(request: Request):
     kh, credits, txhash = body["key_hash"], int(body["credits"]), body["txhash"]
     # dedup per LOG, not per tx: one tx can emit several Deposited events
     event_id = f"{txhash}:{body.get('log_index', 0)}"
-    cur = db.cursor()
-    if cur.execute("SELECT 1 FROM seen_deposits WHERE txhash=?", (event_id,)).fetchone():
-        return {"status": "already_credited"}  # idempotent per deposit event
-    cur.execute(
-        "UPDATE accounts SET balance=balance+? WHERE key_hash=?", (credits, kh)
-    )
-    if cur.rowcount == 0:
-        db.rollback()
-        # do NOT mark seen: the account may be created later and re-scanned
-        return {"status": "no_such_account"}
-    cur.execute("INSERT INTO seen_deposits(txhash) VALUES (?)", (event_id,))
-    db.commit()
+    async with db_write_lock:
+        cur = db.cursor()
+        if cur.execute(
+            "SELECT 1 FROM seen_deposits WHERE txhash=?", (event_id,)
+        ).fetchone():
+            return {"status": "already_credited"}  # idempotent per deposit event
+        cur.execute(
+            "UPDATE accounts SET balance=balance+? WHERE key_hash=?", (credits, kh)
+        )
+        if cur.rowcount == 0:
+            db.rollback()
+            # do NOT mark seen: the account may be created later and re-scanned
+            return {"status": "no_such_account"}
+        cur.execute("INSERT INTO seen_deposits(txhash) VALUES (?)", (event_id,))
+        db.commit()
     return {"status": "credited", "credits": credits}
 
 
@@ -418,62 +442,56 @@ async def mint_claim(request: Request):
     is the payment-private path (funding is linkable; use is not)."""
     auth = request.headers.get("Authorization", "")
     key = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
-    bal = _account_balance(key)
-    if bal is None:
-        raise HTTPException(401, "unknown API key")
+    outputs = _parse_outputs(await request.json())
+    total = sum(int(o["amount"]) for o in outputs)
+    signatures = _sign_outputs(outputs)
 
     # Idempotency: a client retrying a claim (lost response, timeout) sends the
     # same Idempotency-Key and gets the cached signatures back, never a second
     # debit. Keyed under the account so one key can't replay another's claim.
     idem = request.headers.get("Idempotency-Key")
     idem_key = f"{_key_hash(key)}:{idem}" if idem else None
-    if idem_key:
+    async with db_write_lock:
         try:
-            db.execute(
-                "INSERT INTO claims(idem_key, response) VALUES (?, '')", (idem_key,)
-            )
-            db.commit()
-        except sqlite3.IntegrityError:
-            db.rollback()
-            row = db.execute(
-                "SELECT response FROM claims WHERE idem_key=?", (idem_key,)
-            ).fetchone()
-            if row and row[0]:
-                return json.loads(row[0])
-            raise HTTPException(409, "claim with this Idempotency-Key is in progress")
+            if idem_key:
+                row = db.execute(
+                    "SELECT response FROM claims WHERE idem_key=?", (idem_key,)
+                ).fetchone()
+                if row:
+                    if row[0]:
+                        return json.loads(row[0])
+                    raise HTTPException(
+                        409, "claim with this Idempotency-Key is in progress"
+                    )
+                db.execute(
+                    "INSERT INTO claims(idem_key, response) VALUES (?, '')",
+                    (idem_key,),
+                )
+            bal = _account_balance(key)
+            if bal is None:
+                raise HTTPException(401, "unknown API key")
+            if total > bal:
+                raise HTTPException(402, f"claim {total} exceeds balance {bal}")
 
-    try:
-        outputs = _parse_outputs(await request.json())
-        total = sum(int(o["amount"]) for o in outputs)
-        if total > bal:
-            raise HTTPException(402, f"claim {total} exceeds balance {bal}")
-
-        # Signing is pure, so failures happen before the debit. The debit and
-        # completed idempotency response are then committed atomically.
-        signatures = _sign_outputs(outputs)
-        cur = db.execute(
-            "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
-            (total, key, total),
-        )
-        if cur.rowcount == 0:
-            db.rollback()
-            raise HTTPException(409, "balance changed, retry")
-        response = {"signatures": signatures}
-        if idem_key:
-            db.execute(
-                "UPDATE claims SET response=? WHERE idem_key=?",
-                (json.dumps(response), idem_key),
+            # Signing is pure, so failures happen before the debit. The debit and
+            # completed idempotency response are then committed atomically.
+            cur = db.execute(
+                "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
+                (total, key, total),
             )
-        db.commit()
-        return response
-    except Exception:
-        db.rollback()
-        if idem_key:
-            db.execute(
-                "DELETE FROM claims WHERE idem_key=? AND response=''", (idem_key,)
-            )
+            if cur.rowcount == 0:
+                raise HTTPException(409, "balance changed, retry")
+            response = {"signatures": signatures}
+            if idem_key:
+                db.execute(
+                    "UPDATE claims SET response=? WHERE idem_key=?",
+                    (json.dumps(response), idem_key),
+                )
             db.commit()
-        raise
+            return response
+        except Exception:
+            db.rollback()
+            raise
 
 
 @app.get("/channel/params")
@@ -523,25 +541,28 @@ def voucher_info(code: str):
 
 @app.post("/mint/voucher/{code}")
 async def redeem_voucher(code: str, request: Request):
-    row = db.execute(
-        "SELECT credits, state FROM vouchers WHERE code=?", (code,)
-    ).fetchone()
-    if not row:
-        raise HTTPException(404, "unknown voucher")
-    credits = row[0]
     outputs = _parse_outputs(await request.json())
     if any(int(o["amount"]) not in DENOMS for o in outputs):
         raise HTTPException(400, "output amounts must be valid denominations")
-    if sum(int(o["amount"]) for o in outputs) != credits:
-        raise HTTPException(400, f"outputs must sum to {credits} credits")
-    # mark redeemed atomically before signing so a concurrent redeem can't double-issue
-    cur = db.execute(
-        "UPDATE vouchers SET state='redeemed' WHERE code=? AND state='issued'", (code,)
-    )
-    db.commit()
-    if cur.rowcount == 0:
-        raise HTTPException(400, "voucher already redeemed")
-    return {"credits": credits, "signatures": _sign_outputs(outputs)}
+    signatures = _sign_outputs(outputs)
+    async with db_write_lock:
+        row = db.execute(
+            "SELECT credits, state FROM vouchers WHERE code=?", (code,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "unknown voucher")
+        credits = row[0]
+        if sum(int(o["amount"]) for o in outputs) != credits:
+            raise HTTPException(400, f"outputs must sum to {credits} credits")
+        # Mark redeemed atomically so a concurrent redeem can't double-issue.
+        cur = db.execute(
+            "UPDATE vouchers SET state='redeemed' WHERE code=? AND state='issued'",
+            (code,),
+        )
+        db.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(400, "voucher already redeemed")
+    return {"credits": credits, "signatures": signatures}
 
 
 @app.get("/mint/change/{receipt_id}")
@@ -558,18 +579,26 @@ def change_info(receipt_id: str):
 
 @app.post("/mint/change/{receipt_id}")
 async def redeem_change(receipt_id: str, request: Request):
-    row = db.execute(
-        "SELECT prepaid, cost, state FROM receipts WHERE id=?", (receipt_id,)
-    ).fetchone()
-    if not row:
-        raise HTTPException(404, "unknown receipt")
-    prepaid, cost, state = row
-    if state == "pending":
-        raise HTTPException(409, "request still in flight, retry shortly")
-    if state != "final":
-        raise HTTPException(409, "already redeemed or not final")
-    change = max(0, prepaid - cost)
-    if change == 0:
+    raw_body = await request.body()
+    async with db_write_lock:
+        row = db.execute(
+            "SELECT prepaid, cost, state FROM receipts WHERE id=?", (receipt_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "unknown receipt")
+        prepaid, cost, state = row
+        if state == "pending":
+            raise HTTPException(409, "request still in flight, retry shortly")
+        if state != "final":
+            raise HTTPException(409, "already redeemed or not final")
+        change = max(0, prepaid - cost)
+        if change:
+            outputs = _parse_outputs(json.loads(raw_body))
+            if sum(int(o["amount"]) for o in outputs) != change:
+                raise HTTPException(400, f"outputs must sum to change of {change} credits")
+            signatures = _sign_outputs(outputs)
+        else:
+            signatures = []
         cur = db.execute(
             "UPDATE receipts SET state='redeemed' WHERE id=? AND state='final'",
             (receipt_id,),
@@ -577,18 +606,7 @@ async def redeem_change(receipt_id: str, request: Request):
         db.commit()
         if cur.rowcount == 0:
             raise HTTPException(409, "already redeemed or not final")
-        return {"change": 0, "cost": cost, "signatures": []}
-    outputs = _parse_outputs(await request.json())
-    if sum(int(o["amount"]) for o in outputs) != change:
-        raise HTTPException(400, f"outputs must sum to change of {change} credits")
-    cur = db.execute(
-        "UPDATE receipts SET state='redeemed' WHERE id=? AND state='final'",
-        (receipt_id,),
-    )
-    db.commit()
-    if cur.rowcount == 0:
-        raise HTTPException(409, "already redeemed or not final")
-    return {"change": change, "cost": cost, "signatures": _sign_outputs(outputs)}
+    return {"change": change, "cost": cost, "signatures": signatures}
 
 
 @app.get("/v1/models")
@@ -647,18 +665,31 @@ async def chat(request: Request):
             raise HTTPException(401, "unknown API key")
         if bal <= 0:
             raise HTTPException(402, "insufficient credits; deposit ETH to top up")
-        _check_daily_cap()
+        reserved_usd = await _reserve_daily_cap()
         body["usage"] = {"include": True}
-        async with httpx.AsyncClient(timeout=300) as client:
-            r = await client.post(url, json=body, headers=upstream_headers)
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                r = await client.post(url, json=body, headers=upstream_headers)
+        except Exception:
+            await _reconcile_spend(reserved_usd, 0.0)
+            raise
         if r.status_code != 200:
-            return JSONResponse(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": r.text}, status_code=r.status_code)
+            await _reconcile_spend(reserved_usd, 0.0)
+            return JSONResponse(
+                r.json()
+                if r.headers.get("content-type", "").startswith("application/json")
+                else {"error": r.text},
+                status_code=r.status_code,
+            )
         data = r.json()
         cost_usd = (data.get("usage") or {}).get("cost")
         cost = _usd_to_credits(cost_usd)
-        db.execute("UPDATE accounts SET balance=balance-? WHERE api_key=?", (cost, key))
-        db.commit()
-        _record_spend(cost_usd)
+        async with db_write_lock:
+            db.execute(
+                "UPDATE accounts SET balance=balance-? WHERE api_key=?", (cost, key)
+            )
+            db.commit()
+        await _reconcile_spend(reserved_usd, _billed_usd(cost_usd, cost))
         return JSONResponse(
             data,
             headers={"X-Cost-Credits": str(cost), "X-Balance": str(max(0, bal - cost))},
@@ -668,22 +699,31 @@ async def chat(request: Request):
     if channel_header:
         if not CHANNEL_LANE_ENABLED:
             raise HTTPException(503, "channel lane disabled (no on-chain escrow wired)")
-        _check_daily_cap()
         try:
             m = payment_from_j(json.loads(base64.b64decode(channel_header)))
         except Exception:
             raise HTTPException(400, "X-Channel-Payment must be base64 JSON")
+        reserved_usd = await _reserve_daily_cap()
         try:
             sigma = bob.accept(channel_contract, m, price=CHANNEL_PRICE)
         except ValueError as e:
+            await _reconcile_spend(reserved_usd, 0.0)
             raise HTTPException(402, f"channel payment rejected: {e}")
         countersign = base64.b64encode(json.dumps(sig_to_j(sigma)).encode()).decode()
         body["usage"] = {"include": True}
-        async with httpx.AsyncClient(timeout=300) as client:
-            r = await client.post(url, json=body, headers=upstream_headers)
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                r = await client.post(url, json=body, headers=upstream_headers)
+        except Exception:
+            await _reconcile_spend(
+                reserved_usd, _billed_usd(None, CHANNEL_PRICE)
+            )
+            raise
         data = r.json()
-        if r.status_code == 200:
-            _record_spend((data.get("usage") or {}).get("cost"))
+        cost_usd = (data.get("usage") or {}).get("cost") if r.status_code == 200 else None
+        await _reconcile_spend(
+            reserved_usd, _billed_usd(cost_usd, CHANNEL_PRICE)
+        )
         return JSONResponse(
             data,
             status_code=r.status_code,
@@ -699,14 +739,20 @@ async def chat(request: Request):
     except Exception:
         raise HTTPException(400, "X-Cash must be base64 JSON token list")
 
-    _check_daily_cap()
-    prepaid = _spend(tokens)
+    reserved_usd = await _reserve_daily_cap()
+    try:
+        prepaid = await _spend(tokens)
+    except Exception:
+        await _reconcile_spend(reserved_usd, 0.0)
+        raise
     receipt_id = secrets.token_hex(16)
-    db.execute(
-        "INSERT INTO receipts(id, prepaid, cost, state) VALUES (?, ?, 0, 'pending')",
-        (receipt_id, prepaid),
-    )
-    db.commit()
+    async with db_write_lock:
+        db.execute(
+            "INSERT INTO receipts(id, prepaid, cost, state) "
+            "VALUES (?, ?, 0, 'pending')",
+            (receipt_id, prepaid),
+        )
+        db.commit()
 
     body["usage"] = {"include": True}  # OpenRouter returns exact USD cost
 
@@ -746,8 +792,13 @@ async def chat(request: Request):
                     if cost_usd is None and produced_output
                     else _usd_to_credits(cost_usd)
                 )
-                _finalize(receipt_id, min(prepaid, cost))
-                _record_spend(cost_usd)
+                billed = min(prepaid, cost)
+                # A disconnect after output keeps the full prepay; this can
+                # over-charge on a network flake, but avoids free inference.
+                await _finalize(receipt_id, billed)
+                await _reconcile_spend(
+                    reserved_usd, _billed_usd(cost_usd, billed)
+                )
 
         return StreamingResponse(
             gen(),
@@ -755,10 +806,16 @@ async def chat(request: Request):
             headers={"X-Change-Receipt": receipt_id},
         )
 
-    async with httpx.AsyncClient(timeout=300) as client:
-        r = await client.post(url, json=body, headers=upstream_headers)
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            r = await client.post(url, json=body, headers=upstream_headers)
+    except Exception:
+        await _finalize(receipt_id, 0)
+        await _reconcile_spend(reserved_usd, 0.0)
+        raise
     if r.status_code != 200:
-        _finalize(receipt_id, 0)  # upstream failed: full refund via change
+        await _finalize(receipt_id, 0)  # upstream failed: full refund via change
+        await _reconcile_spend(reserved_usd, 0.0)
         return JSONResponse(
             r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": r.text},
             status_code=r.status_code,
@@ -767,8 +824,8 @@ async def chat(request: Request):
     data = r.json()
     cost_usd = (data.get("usage") or {}).get("cost")
     cost = min(prepaid, _usd_to_credits(cost_usd))
-    _finalize(receipt_id, cost)
-    _record_spend(cost_usd)
+    await _finalize(receipt_id, cost)
+    await _reconcile_spend(reserved_usd, _billed_usd(cost_usd, cost))
     return JSONResponse(
         data,
         headers={"X-Change-Receipt": receipt_id, "X-Cost-Credits": str(cost)},
