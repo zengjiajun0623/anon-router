@@ -1,8 +1,42 @@
 # anon-router
 
+Pay crypto for AI inference. An OpenAI-compatible endpoint where you deposit
+ETH/USDC, get an API key, and call any model — the provider never sees a name
+or a card, and the payment rail can't link a request to the deposit that
+funded it.
+
+## Try the demo (local)
+
+```bash
+./run_e2e.sh            # anvil + contracts + router + watcher, asserts 7/7 stages
+# then open the site:
+#   http://127.0.0.1:8402   (KEEP=1 ./run_e2e.sh leaves it running)
+```
+
+The site (`web/index.html`): click **Get API key** (no signup), **deposit ETH**
+from any wallet, watch credits land in ~2s, and **chat** — or point Cursor / any
+OpenAI client at the base URL with that key. Fewer steps than OpenRouter.
+
+## What's built
+
+| Lane | What it gives you | Trust |
+|---|---|---|
+| **Simple** (`sk-anon-*` bearer key + `CreditVault`) | deposit → key → any OpenAI client | custodial (operator holds float) |
+| **Ecash** (blind-signed tokens) | unlinkable prepaid credits | trusted mint |
+| **Channel** (confetti zk payment channels, on-chain escrow) | deposits escrowed on-chain, unlinkable per-request payments | trust-minimized: operator can't steal/freeze |
+| **Free** (`local/*`) | self-hosted models, no payment | — |
+
+**Verification:** the on-chain contract has three independent code reviews
+(Fable, Codex, Kimi) plus a machine-checked Lean proof of its safety core
+(conservation, no-theft, terminality) — see [VERIFICATION.md](VERIFICATION.md).
+The settlement core is also written in the [Verity](https://veritylang.com) Lean
+EDSL that compiles to EVM. Testnet-only; nothing is deployed to a public chain.
+
+---
+
 Payer-anonymous, OpenAI-compatible inference proxy. Prepay for credits, spend them as blind-signed bearer tokens: the router can verify every payment but cannot link any request to the deposit that funded it, or link two requests to each other.
 
-v1 rail is Cashu-style blind signatures (BDHKE) with a trusted mint. v2 replaces the trusted mint with confetti zk payment channels (see `../zk-payments-confetti/PROTOCOL.md`) so the router also cannot steal or freeze deposits.
+v1 rail is Cashu-style blind signatures (BDHKE) with a trusted mint. The channel lane replaces the trusted mint with confetti zk payment channels (see `../zk-payments-confetti/PROTOCOL.md`) so the router also cannot steal or freeze deposits.
 
 ## How it works
 
@@ -79,9 +113,20 @@ Override the upstream with `LOCAL_UPSTREAM` in `.env`.
 - Streaming change redemption requires polling the receipt after the stream ends.
 - Dev faucet stands in for the USDC deposit watcher.
 
+## Milestones
+
+- **v0** — blind-signature mint, OpenRouter proxy, exact-cost metering. Done.
+- **Voucher resale** — operator sells codes, buyers redeem for anonymous credits. Done.
+- **Simple lane** — `CreditVault` deposit → bearer key → any OpenAI client; site + watcher. Done.
+- **M4a** — confetti off-chain channel protocol + router lane. Done.
+- **M4b** — on-chain escrow (`ConfettiChannels`), deposits leave custody, 3-reviewer + Lean-proof gate. Done (local Anvil).
+- **Verity** — settlement core written in Lean, compiled to EVM. In progress.
+- **M4b-real** — SP1 Groth16 verifier replacing the mock. In progress (Docker/colima).
+
 ## Roadmap
 
-- USDC deposit watcher replacing the faucet
+- USDC deposit lane (same as `CreditVault`, ERC-20 `transferFrom`)
 - Known-answer sampling audits of upstreams, published scores
 - new-api/one-api payment module (中转站 integration)
-- Confetti channel rail (pending Phase 0 proving benchmark in `research/`)
+- Durable persistence of the router's off-chain state (dedup/inbox/XMSS)
+- Public deploy to Ethereum Sepolia (operator holds the key; counsel gate first)
