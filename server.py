@@ -84,6 +84,24 @@ def resolve_route(model: str) -> tuple[str, str | None, bool, str]:
     return UPSTREAM, OPENROUTER_KEY, False, model
 
 
+# Strict allowlist of fields the router forwards to the upstream provider: only
+# inference parameters, never identity/session/tracking/retention. Anything not
+# listed here (user, metadata, store, session_id, trace, and any future field)
+# is dropped so it cannot reach the provider — see chat().
+UPSTREAM_ALLOWED_FIELDS = frozenset({
+    "model", "messages", "prompt", "stream", "stream_options",
+    "temperature", "top_p", "top_k", "min_p", "top_a",
+    "max_tokens", "max_completion_tokens", "n", "stop", "seed",
+    "presence_penalty", "frequency_penalty", "repetition_penalty",
+    "logit_bias", "logprobs", "top_logprobs",
+    "response_format", "tools", "tool_choice", "parallel_tool_calls",
+    "functions", "function_call", "prediction", "modalities", "audio",
+    "reasoning", "reasoning_effort", "verbosity", "usage",
+    # OpenRouter routing preferences (functional routing, not identity)
+    "provider", "models", "route", "transforms",
+})
+
+
 def _master() -> bytes:
     path = os.environ.get("MINT_MASTER_PATH", os.path.join(ROOT, "mint_master.hex"))
     if not os.path.exists(path):
@@ -725,6 +743,15 @@ async def chat(request: Request):
     channel_payment_body = (
         body.pop("_channel_payment", None) if isinstance(body, dict) else None
     )
+    # Privacy core: the upstream inference provider must only ever see "the
+    # router" — never who paid or which session. Forward ONLY known inference
+    # parameters (strict allowlist), dropping every client-supplied identity /
+    # session / tracking / retention field — user, metadata, store, session_id,
+    # trace, and anything we don't recognize. An allowlist (vs a denylist) means
+    # a new provider-side tracking field can't leak by default. Payment material
+    # rides in headers / the popped field above, never in the forwarded body.
+    if isinstance(body, dict):
+        body = {k: v for k, v in body.items() if k in UPSTREAM_ALLOWED_FIELDS}
     base, key, free, upstream_model = resolve_route(str(body.get("model", "")))
     body["model"] = upstream_model
     upstream_headers = {"Content-Type": "application/json"}

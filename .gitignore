@@ -28,3 +28,4 @@ state.db-wal
 state.db-*
 .watcher_credited
 .watcher_halt
+.provider-wallet.json

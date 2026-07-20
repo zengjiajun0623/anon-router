@@ -108,6 +108,19 @@ def main() -> int:
     r = sub.add_parser("redeem", help="redeem a purchased voucher code")
     r.add_argument("code")
 
+    sub.add_parser("account", help="create/show your anonymous account key (for on-chain deposits)")
+
+    d = sub.add_parser("deposit", help="deposit ETH on-chain to fund your account, then wait for credit")
+    d.add_argument("eth", type=float)
+    d.add_argument("--key", default=None,
+                   help="funding EOA key FILE (JSON with private_key); default "
+                        ".sepolia-deployer.json or $ANON_DEPOSIT_KEY. Never pass a raw key.")
+    d.add_argument("--rpc", default=None,
+                   help="EVM RPC URL (default $ANON_RPC or Sepolia public)")
+
+    cl = sub.add_parser("claim", help="convert account balance -> unlinkable ecash tokens")
+    cl.add_argument("amount", type=int)
+
     sub.add_parser("balance")
 
     c = sub.add_parser("chat")
@@ -146,6 +159,46 @@ def main() -> int:
         bal = w.redeem_voucher(args.code)
         usd = bal * w.keys()["credit_usd"]
         print(f"voucher redeemed. balance: {bal} credits (${usd:.4f})")
+    elif args.cmd == "account":
+        acct = w.account or w.new_account()
+        print(f"account key: {acct['api_key']}")
+        print(f"key hash:    {acct['key_hash']}")
+    elif args.cmd == "deposit":
+        # Funding key from a FILE or $ANON_DEPOSIT_KEY only — never a raw hex on
+        # the command line (it would leak via shell history / process listing).
+        keyfile = args.key or ".sepolia-deployer.json"
+        if os.path.isfile(keyfile):
+            key_hex = json.load(open(keyfile))["private_key"]
+        elif os.environ.get("ANON_DEPOSIT_KEY"):
+            key_hex = os.environ["ANON_DEPOSIT_KEY"]
+        else:
+            p.error(f"funding key not found: keyfile {keyfile!r} missing and "
+                    "$ANON_DEPOSIT_KEY unset (pass --key <file>, don't paste a raw key)")
+        rpc = args.rpc or os.environ.get("ANON_RPC", "https://ethereum-sepolia-rpc.publicnode.com")
+        if not w.account:
+            w.new_account()
+            print("minted a fresh anonymous account", file=sys.stderr)
+        before = w.account_status()["balance"]   # credit THIS deposit against the delta
+        print(f"depositing {args.eth} ETH on-chain…", file=sys.stderr)
+        res = w.deposit_onchain(args.eth, key_hex, rpc)
+        target = before + res["expected_credits"]
+        print(f"deposit tx {res['tx']} — waiting for watcher credit…", file=sys.stderr)
+        bal = before
+        for _ in range(60):
+            bal = w.account_status()["balance"]
+            if bal >= target:
+                break
+            time.sleep(5)
+        ok = "✓" if bal >= target else "…(still crediting)"
+        print(f"{ok} account balance: {bal} credits (+{bal - before} this deposit, "
+              f"${bal * w.keys()['credit_usd']:.4f}). Now: cli.py claim {res['expected_credits']}",
+              file=sys.stderr)
+    elif args.cmd == "claim":
+        if not w.account:
+            p.error("no account; run: cli.py deposit <eth> first")
+        bal = w.claim_from_account(w.account["api_key"], args.amount)
+        print(f"claimed {args.amount} credits to ecash. spendable wallet balance: "
+              f"{bal} credits (${bal * w.keys()['credit_usd']:.4f})")
     elif args.cmd == "balance":
         bal = w.balance()
         print(f"balance: {bal} credits (${bal * w.keys()['credit_usd']:.4f})")

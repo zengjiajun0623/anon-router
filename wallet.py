@@ -38,15 +38,72 @@ class Wallet:
 
     def _load(self) -> None:
         if os.path.exists(self.path):
-            self.tokens = json.load(open(self.path)).get("tokens", [])
+            data = json.load(open(self.path))
+            self.tokens = data.get("tokens", [])
+            self.account = data.get("account")   # {"api_key", "key_hash"} or None
         else:
             self.tokens = []
+            self.account = None
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w") as f:
-            json.dump({"mint": self.url, "tokens": self.tokens}, f, indent=1)
+            json.dump({"mint": self.url, "tokens": self.tokens,
+                       "account": self.account}, f, indent=1)
         os.chmod(self.path, 0o600)
+
+    # ---- account (on-chain-funded) lane ----
+
+    def new_account(self) -> dict:
+        """Mint an anonymous bearer key. Fund it with deposit_onchain(); the
+        router's watcher credits it, then claim_from_account() converts the
+        balance into unlinkable ecash."""
+        r = self.http.post(f"{self.url}/account/new")
+        r.raise_for_status()
+        data = r.json()
+        self.account = {"api_key": data["api_key"], "key_hash": data["key_hash"]}
+        self._save()
+        return data
+
+    def account_status(self) -> dict:
+        if not self.account:
+            raise RuntimeError("no account; run: cli.py account")
+        r = self.http.get(f"{self.url}/account/status",
+                          headers={"Authorization": f"Bearer {self.account['api_key']}"})
+        r.raise_for_status()
+        return r.json()
+
+    def deposit_onchain(self, eth: float, funding_key_hex: str, rpc: str) -> dict:
+        """Sign + broadcast CreditVault.deposit(key_hash) from a local funding
+        key and wait for the tx to mine. The watcher then credits the account;
+        poll account_status() for the balance. Deposit → spend is unlinkable:
+        the deposit funds an account, which you drain into blind-signed ecash."""
+        from web3 import Web3
+        if not self.account:
+            self.new_account()
+        cfg = self.http.get(f"{self.url}/config").json()
+        vault, cpe = cfg["vault_address"], cfg["credits_per_eth"]
+        if not vault:
+            raise RuntimeError("router has no vault_address configured")
+        w3 = Web3(Web3.HTTPProvider(rpc))
+        signer = w3.eth.account.from_key(funding_key_hex)
+        kh = self.account["key_hash"]
+        vault_c = w3.eth.contract(
+            address=Web3.to_checksum_address(vault),
+            abi=[{"inputs": [{"name": "keyHash", "type": "bytes32"}],
+                  "name": "deposit", "outputs": [], "stateMutability": "payable",
+                  "type": "function"}])
+        tx = vault_c.functions.deposit(bytes.fromhex(kh[2:])).build_transaction({
+            "from": signer.address, "value": w3.to_wei(eth, "ether"),
+            "nonce": w3.eth.get_transaction_count(signer.address, "pending"),
+            "gas": 100000, "gasPrice": w3.eth.gas_price})
+        txh = w3.eth.send_raw_transaction(signer.sign_transaction(tx).raw_transaction)
+        rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=240)
+        h = txh.hex()
+        tx_str = h if h.startswith("0x") else "0x" + h
+        if rcpt.status != 1:
+            raise RuntimeError(f"deposit tx {tx_str} reverted on-chain")
+        return {"tx": tx_str, "expected_credits": int(eth * cpe)}
 
     def keys(self) -> dict:
         if self._keys is None:
