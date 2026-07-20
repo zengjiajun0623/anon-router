@@ -1,0 +1,6 @@
+# Slim dependencies for the CLI client only (cli.py / wallet.py) — no server.
+# The router itself uses requirements.txt.
+httpx==0.28.1
+web3==7.16.0          # on-chain deposit signing (cli.py deposit)
+eth-account==0.13.7
+socksio==1.0.0        # optional: --tor over a SOCKS proxy

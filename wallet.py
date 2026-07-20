@@ -16,7 +16,10 @@ from confetti.sp1 import RealSP1Prover
 from confetti.wire import payment_to_j, sig_from_j
 from mint import blind, decompose, unblind
 
-DEFAULT_MINT = os.environ.get("ANON_ROUTER_URL", "http://127.0.0.1:8402")
+# Default to the hosted service so the CLI works out of the box; override with
+# ANON_ROUTER_URL (or --url) to point at a local/self-hosted router.
+DEFAULT_MINT = os.environ.get(
+    "ANON_ROUTER_URL", "https://anon-router-production.up.railway.app")
 WALLET_PATH = os.path.expanduser("~/.anon-router/wallet.json")
 CHANNEL_PATH = os.path.expanduser("~/.anon-router/channel.pkl")
 # A payment proved ahead of time (during the previous reply's think-time) so the
