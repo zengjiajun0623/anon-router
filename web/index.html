@@ -102,8 +102,7 @@
           <span class="muted" style="white-space:nowrap">ETH</span>
           <button id="deposit">Deposit with wallet</button>
         </div>
-        <div class="bal"><span id="balance">0</span> <small>credits</small>
-          <small id="usd"></small></div>
+        <div class="bal">$<span id="balance">0.00</span><small id="usd"></small></div>
         <div class="note" id="bal-side" style="margin-top:2px"></div>
       </div>
     </div>
@@ -223,15 +222,13 @@ function renderBalance() {
   const usd = document.getElementById('usd');
   const side = document.getElementById('bal-side');
   if (payMode() === 'ecash') {
-    bal.textContent = eb.toLocaleString();
-    usd.textContent = '· $' + (eb * cu).toFixed(2) + ' in ecash';
-    side.textContent = lastAcctBal > 0
-      ? 'On key, claiming into ecash: ' + lastAcctBal.toLocaleString() + ' credits'
-      : (eb > 0 ? 'Held as blind-signed tokens in this browser (localStorage).' : '');
+    bal.textContent = (eb * cu).toFixed(2);
+    usd.textContent = ' private ecash';
+    side.textContent = lastAcctBal > 0 ? 'Claiming your deposit into private ecash…' : '';
   } else {
-    bal.textContent = lastAcctBal.toLocaleString();
-    usd.textContent = '· $' + (lastAcctBal * cu).toFixed(2) + ' on key';
-    side.textContent = eb > 0 ? 'Ecash in this browser: ' + eb.toLocaleString() + ' credits' : '';
+    bal.textContent = (lastAcctBal * cu).toFixed(2);
+    usd.textContent = ' on key';
+    side.textContent = '';
   }
 }
 
