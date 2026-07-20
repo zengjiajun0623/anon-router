@@ -102,21 +102,9 @@
           <span class="muted" style="white-space:nowrap">ETH</span>
           <button id="deposit">Deposit with wallet</button>
         </div>
-        <div class="note" style="margin-bottom:12px">Click Deposit and confirm in your wallet.
-          You are credited in a few seconds, then it is auto-claimed into private ecash you spend
-          below. Needs Sepolia test ETH in your wallet.</div>
         <div class="bal"><span id="balance">0</span> <small>credits</small>
           <small id="usd"></small></div>
         <div class="note" id="bal-side" style="margin-top:2px"></div>
-        <details style="margin-top:12px">
-          <summary class="note" style="cursor:pointer">No wallet, or want the details?</summary>
-          <div class="kv" style="margin-top:8px"><span class="k">Vault</span>
-            <span class="v mono" id="vault"></span></div>
-          <div class="note" id="dep-note" style="margin-top:6px">The deposit references your key
-            hash so the router can credit you, then the balance is blind-signed into ecash your
-            browser holds (spends are unlinkable to the deposit). No injected wallet? Send ETH to
-            the vault above with your key hash as calldata.</div>
-        </details>
       </div>
     </div>
 
@@ -256,7 +244,6 @@ async function mint() {
   document.getElementById('baseurl').textContent = account.base_url;
   document.getElementById('deposit-locked').classList.add('hidden');
   document.getElementById('deposit-body').classList.remove('hidden');
-  document.getElementById('vault').textContent = account.vault_address || '(set VAULT_ADDRESS)';
   if (!polling) { polling = true; pollBalance(); }
 }
 
@@ -304,7 +291,7 @@ async function pollBalance() {
 
 async function deposit() {
   if (!account) return;
-  if (!window.ethereum) { alert('No injected wallet found. Send ETH to the vault manually with your key hash as calldata.'); return; }
+  if (!window.ethereum) { alert('No browser wallet found. Install one like MetaMask to deposit.'); return; }
   const eth = document.getElementById('amount').value;
   const wei = BigInt(Math.round(parseFloat(eth) * 1e18));
   const accts = await window.ethereum.request({method: 'eth_requestAccounts'});
