@@ -118,8 +118,9 @@ def main() -> int:
     d.add_argument("--rpc", default=None,
                    help="EVM RPC URL (default $ANON_RPC or Sepolia public)")
 
-    cl = sub.add_parser("claim", help="convert account balance -> unlinkable ecash tokens")
-    cl.add_argument("amount", type=int)
+    cl = sub.add_parser("claim", help="convert account balance -> unlinkable ecash tokens "
+                                      "(no amount = claim the full balance)")
+    cl.add_argument("amount", type=int, nargs="?", default=None)
 
     sub.add_parser("balance")
 
@@ -204,9 +205,18 @@ def main() -> int:
     elif args.cmd == "claim":
         if not w.account:
             p.error("no account; run: cli.py deposit <eth> first")
-        bal = w.claim_from_account(w.account["api_key"], args.amount)
-        print(f"claimed {args.amount} credits to ecash. spendable wallet balance: "
-              f"{bal} credits (${bal * w.keys()['credit_usd']:.4f})")
+        # Balance-less funding: with no amount, drain the WHOLE account balance to
+        # ecash in one claim so nothing links later spends to this account.
+        if args.amount is None:
+            before = w.balance()
+            bal = w.claim_all()
+            print(f"claimed the full account balance to ecash (+{bal - before}). "
+                  f"spendable wallet balance: {bal} credits "
+                  f"(${bal * w.keys()['credit_usd']:.4f})")
+        else:
+            bal = w.claim_from_account(w.account["api_key"], args.amount)
+            print(f"claimed {args.amount} credits to ecash. spendable wallet balance: "
+                  f"{bal} credits (${bal * w.keys()['credit_usd']:.4f})")
     elif args.cmd == "balance":
         bal = w.balance()
         print(f"balance: {bal} credits (${bal * w.keys()['credit_usd']:.4f})")

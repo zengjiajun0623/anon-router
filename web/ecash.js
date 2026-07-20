@@ -221,20 +221,50 @@ export function encodeCash(tokens) {
   return btoa(JSON.stringify(tokens.map((t) => ({ amount: t.amount, secret: t.secret, C: t.C }))));
 }
 
-/** Redeem blind change for a receipt. Polls until the receipt settles, then
- *  mints change tokens. Returns {cost, change, tokens}. */
-export async function redeemChange(base, receiptId, pubkeys, timeoutMs = 30000) {
-  const deadline = Date.now() + timeoutMs;
-  let info;
-  for (;;) {
-    info = await (await fetch(base + '/mint/change/' + receiptId)).json();
-    if (info.state !== 'pending') break;
-    if (Date.now() > deadline) throw new Error('receipt ' + receiptId + ' still pending');
-    await new Promise((res) => setTimeout(res, 500));
+/** Fixed-count blinded blank outputs to send WITH a spend (in-band change,
+ *  Cashu NUT-08 style). One per denomination so the header never encodes the
+ *  change amount. JSON-safe so a caller can persist them for crash recovery. */
+export async function prepareChangeBlanks() {
+  const blanks = [];
+  for (const denom of DENOMS) {
+    const secret = bytesToHex(randBytes(32));
+    const { B_, r } = await blind(secret);
+    blanks.push({ amount: denom, secret, r: '0x' + r.toString(16), B_ });
   }
-  let tokens = [];
-  if (info.state === 'final' && info.change > 0) {
-    tokens = await mintTokens(base, '/mint/change/' + receiptId, info.change, {}, pubkeys);
-  }
-  return { cost: info.cost || 0, change: info.change || 0, tokens };
+  return blanks;
+}
+
+/** Header value for X-Cash-Change: base64(JSON [{B_}]). */
+export function encodeChange(blanks) {
+  return btoa(JSON.stringify(blanks.map((b) => ({ B_: b.B_ }))));
+}
+
+/** Unblind the in-band change signatures (from the X-Cash-Change response header
+ *  or the trailing SSE event) into spendable tokens. `sigs` is a prefix of
+ *  `blanks`; each sig carries its assigned amount. Returns {cost, change, tokens}. */
+export function absorbChange(payload, blanks, pubkeys) {
+  const sigs = (payload && payload.signatures) || [];
+  const tokens = sigs.map((sig, i) => ({
+    amount: sig.amount,
+    secret: blanks[i].secret,
+    C: unblind(sig.C_, BigInt(blanks[i].r), pubkeys[String(sig.amount)]),
+  }));
+  return { cost: (payload && payload.cost) || 0, change: (payload && payload.change) || 0, tokens };
+}
+
+/** Redeem a voucher into ecash. The code goes in the BODY (never the URL); the
+ *  server rejects a wrong face value, so we send the standard full decomposition. */
+export async function redeemVoucher(base, code, credits, pubkeys) {
+  const blinds = await prepareMint(credits);
+  const resp = await fetch(base + '/mint/redeem', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, outputs: blinds.map((b) => ({ amount: b.amount, B_: b.B_ })) }),
+  });
+  if (!resp.ok) throw new Error('redeem -> ' + resp.status + ': ' + await resp.text());
+  const sigs = (await resp.json()).signatures;
+  return blinds.map((b, i) => ({
+    amount: b.amount, secret: b.secret,
+    C: unblind(sigs[i].C_, BigInt(b.r), pubkeys[String(b.amount)]),
+  }));
 }

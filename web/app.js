@@ -7,7 +7,8 @@ let account = null;
 let keys = null;         // /mint/keys payload (denomination pubkeys etc.)
 let claiming = false;
 let lastAcctBal = 0;
-let polling = false;
+let fundingWatch = false;
+let awaitCreditMode = false;
 let inFlight = false;    // one chat request at a time
 
 const $ = (id) => document.getElementById(id);
@@ -65,7 +66,8 @@ function unlockAfterKey() {
   $('deposit-locked').classList.add('hidden');
   $('deposit-body').classList.remove('hidden');
   renderDepositPreview();
-  if (!polling) { polling = true; pollBalance(); }
+  // Drain any balance left from a previous session once, then stop (no idle poll).
+  watchFunding();
 }
 
 async function mint() {
@@ -110,19 +112,45 @@ async function claimToEcash(balance) {
   } finally { claiming = false; }
 }
 
-async function pollBalance() {
-  if (account) {
-    try {
-      const r = await fetch('/account/status', { headers: { Authorization: 'Bearer ' + account.api_key } });
-      const d = await r.json();
-      lastAcctBal = d.balance;
-      if ((lastAcctBal > 0 || localStorage.getItem(PENDING_CLAIM_KEY)) && !claiming) {
-        await claimToEcash(lastAcctBal);
+// Balance-less funding + privacy: we do NOT poll the account with the bearer key
+// on a forever timer — those account-key requests, interleaved with ecash spends
+// over the same IP, would relink spending to the funding account. We only watch
+// the account WHILE funding is in flight (a deposit is crediting or a claim is
+// pending), draining it fully to ecash, then STOP until the next explicit fund.
+// awaitCredit=true is used right after a deposit: keep polling through the
+// initial zero balance (the tx isn't mined yet) until credit arrives and is
+// drained, then stop. awaitCredit=false (page load) just drains any leftover
+// once and stops immediately if there's nothing — no idle bearer polling.
+async function watchFunding(awaitCredit = false) {
+  // `awaitCreditMode` is a SHARED flag (not a local), so a deposit that fires
+  // while a page-load watcher is already running flips the running loop into
+  // "wait through mining" mode instead of being suppressed by the early return.
+  if (awaitCredit) awaitCreditMode = true;
+  if (fundingWatch || !account) return;
+  fundingWatch = true;
+  try {
+    let creditedOnce = false;
+    for (let i = 0; i < 160; i++) {  // ~6-7 min max, then give up until next fund
+      let bal = 0;
+      try {
+        const r = await fetch('/account/status', { headers: { Authorization: 'Bearer ' + account.api_key } });
+        bal = (await r.json()).balance;
+      } catch (e) {}
+      lastAcctBal = bal;
+      if ((bal > 0 || localStorage.getItem(PENDING_CLAIM_KEY)) && !claiming) {
+        await claimToEcash(bal);         // drain fully to ecash
+        creditedOnce = true;
       }
-    } catch (e) {}
+      renderBalance();
+      const idle = lastAcctBal === 0 && !localStorage.getItem(PENDING_CLAIM_KEY);
+      // Stop once idle — but while awaiting a deposit, not until credit actually
+      // arrived and was drained (so we don't quit before the tx mines).
+      if (idle && (!awaitCreditMode || creditedOnce)) { awaitCreditMode = false; break; }
+      await new Promise((res) => setTimeout(res, 2500));
+    }
+  } finally {
+    fundingWatch = false;
   }
-  renderBalance();
-  setTimeout(pollBalance, 2500);
 }
 
 // ---- deposit ----
@@ -151,6 +179,7 @@ async function deposit() {
     method: 'eth_sendTransaction',
     params: [{ from: accts[0], to: account.vault_address, value: '0x' + wei.toString(16), data }],
   });
+  watchFunding(true);  // wait through mining until this deposit credits + drains
 }
 
 // ---- chat ----
@@ -188,13 +217,39 @@ function friendly(status, raw, free) {
   return 'Request failed: ' + (msg || status || 'unknown error');
 }
 
+// Settle an interrupted spend (page closed before the in-band change arrived):
+// re-present the same tokens with X-Cash-Recover. 404 => never spent, restore
+// the tokens; 200 => spent, absorb the change; 409 => in flight, leave pending.
 async function redeemPendingChange() {
-  const receipt = localStorage.getItem(PENDING_CHANGE_KEY);
-  if (!receipt) return;
+  const raw = localStorage.getItem(PENDING_CHANGE_KEY);
+  if (!raw) return;
+  let p;
+  try { p = JSON.parse(raw); } catch (e) { localStorage.removeItem(PENDING_CHANGE_KEY); return; }
+  if (!p || !p.spend || !p.blanks) { localStorage.removeItem(PENDING_CHANGE_KEY); return; }
   const k = await mintKeys();
-  const settle = await ecash.redeemChange('', receipt, k.pubkeys);
-  if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
-  localStorage.removeItem(PENDING_CHANGE_KEY);
+  const r = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Cash': ecash.encodeCash(p.spend),
+      'X-Cash-Change': ecash.encodeChange(p.blanks),
+      'X-Cash-Recover': '1',
+    },
+    body: JSON.stringify({ model: 'recover', messages: [{ role: 'user', content: '.' }] }),
+  });
+  if (r.status === 404) {
+    saveWallet(loadWallet().concat(p.spend));       // never spent — tokens live
+    localStorage.removeItem(PENDING_CHANGE_KEY);
+  } else if (r.ok) {
+    const settle = ecash.absorbChange(await r.json(), p.blanks, k.pubkeys);
+    if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
+    localStorage.removeItem(PENDING_CHANGE_KEY);
+  } else {
+    // Any other status (409 still in flight, or a 5xx) leaves the spend
+    // unresolved. THROW so the caller aborts instead of starting a new spend that
+    // would overwrite this pending record and strand its change.
+    throw new Error('A previous request is still settling — try again in a moment.');
+  }
 }
 
 /** Read an SSE response body into `el`, appending content deltas as they
@@ -264,50 +319,70 @@ async function send() {
   const pending = add('assistant', '…');
   const headers = { 'Content-Type': 'application/json' };
   let spent = null;          // ecash tokens attached to this request
+  let blanks = null;         // blinded change blanks for this request
   let requestStarted = false;
+  const k0 = free ? null : await mintKeys();
   inFlight = true;
   updateSendState();
   try {
     if (!free) {
       await redeemPendingChange();
-      const k = await mintKeys();
       let sel;
       try {
-        sel = ecash.selectTokens(loadWallet(), Math.max(2000, k.min_prepay));
+        sel = ecash.selectTokens(loadWallet(), Math.max(2000, k0.min_prepay));
       } catch (e) {
         showErr(pending, 'Not enough credits for this request. Add credits to keep chatting.');
         return;
       }
       spent = sel.spend;
+      blanks = await ecash.prepareChangeBlanks();
       saveWallet(sel.keep);
+      // Persist the in-flight spend so a page close recovers the change.
+      localStorage.setItem(PENDING_CHANGE_KEY, JSON.stringify({ spend: spent, blanks }));
       renderBalance();
       headers['X-Cash'] = ecash.encodeCash(sel.spend);
+      headers['X-Cash-Change'] = ecash.encodeChange(blanks);
     }
     requestStarted = true;
+    // Paid lane is non-streaming so the in-band change rides the response header;
+    // the free lane streams (no payment, no change).
     const r = await fetch('/v1/chat/completions', {
       method: 'POST', headers,
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: text }], stream: true }),
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: text }], stream: free }),
     });
-    const receipt = r.headers.get('X-Change-Receipt');
-    if (receipt) localStorage.setItem(PENDING_CHANGE_KEY, receipt);
-    const ctype = r.headers.get('Content-Type') || '';
-    if (!r.ok || !ctype.includes('text/event-stream')) {
-      let d = null;
-      try { d = await r.json(); } catch (e) {}
+    if (free) {
+      const ctype = r.headers.get('Content-Type') || '';
+      if (!r.ok || !ctype.includes('text/event-stream')) {
+        let d = null; try { d = await r.json(); } catch (e) {}
+        showErr(pending, friendly(r.status, (d && (d.detail || d.error)) || r.statusText, free));
+      } else {
+        const err = await streamInto(pending, r.body);
+        if (err) showErr(pending, friendly(0, err, free));
+      }
+    } else {
+      const hdr = r.headers.get('X-Cash-Change');
+      if (hdr) {  // tokens were spent — absorb the change either way (success or upstream error)
+        const settle = ecash.absorbChange(JSON.parse(atob(hdr)), blanks, k0.pubkeys);
+        if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
+        localStorage.removeItem(PENDING_CHANGE_KEY);
+        spent = null;
+      } else if (r.status === 400 || r.status === 402) {
+        // PRE-spend rejection only (validation / cost bound / cap) — tokens were
+        // NOT burned, so restore them. Any other error (5xx, etc.) keeps the
+        // pending record so redeemPendingChange() can recover the change; do NOT
+        // restore tokens that may already be spent.
+        saveWallet(loadWallet().concat(spent));
+        localStorage.removeItem(PENDING_CHANGE_KEY);
+        spent = null;
+      }
+      let d = null; try { d = await r.json(); } catch (e) {}
       if (!r.ok) {
-        // No change receipt means the mint never recorded these tokens as
-        // spent (e.g. the daily cap tripped first), so they are still valid.
-        if (spent && !receipt) { saveWallet(loadWallet().concat(spent)); spent = null; }
         showErr(pending, friendly(r.status, (d && (d.detail || d.error)) || r.statusText, free));
       } else {
         pending.textContent = (d && d.choices && d.choices[0] && d.choices[0].message
           && d.choices[0].message.content) || '(no content)';
       }
-    } else {
-      const err = await streamInto(pending, r.body);
-      if (err) showErr(pending, friendly(0, err, free));
     }
-    if (receipt) await redeemPendingChange();
   } catch (e) {
     if (spent && !requestStarted) { saveWallet(loadWallet().concat(spent)); spent = null; }
     showErr(pending, friendly(0, e.message, free));

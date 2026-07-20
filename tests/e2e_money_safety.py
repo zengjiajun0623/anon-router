@@ -42,6 +42,11 @@ class Up(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         b = json.loads(self.rfile.read(n) or b"{}")
         FORWARDED.append(b)
+        if b.get("model") == "openai/gpt-4o-mini" and "MALFORMED" in json.dumps(b):
+            # A 200 with a non-JSON body, to prove the router refunds (not 500s)
+            # after the spend already committed.
+            self._send(b"this is not json <<<")
+            return
         last = next((m["content"] for m in reversed(b.get("messages", []))
                      if m.get("role") == "user"), "")
         self._send(json.dumps({
@@ -110,7 +115,10 @@ def main() -> int:
         small = [{"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
                  for t in ws._select(700)]
         sh = base64.b64encode(json.dumps(small).encode()).decode()
-        r1 = httpx.post(f"{base}/v1/chat/completions", headers={"X-Cash": sh},
+        cb = base64.b64encode(
+            json.dumps([{"B_": blind(os.urandom(16).hex())[0]} for _ in range(21)]).encode()).decode()
+        r1 = httpx.post(f"{base}/v1/chat/completions",
+                        headers={"X-Cash": sh, "X-Cash-Change": cb},
                         json={"model": "pricey/big", "messages": [{"role": "user", "content": "x"}]},
                         timeout=30)
         check("#1 under-prepaid pricey request rejected (402)", r1.status_code == 402)
@@ -129,41 +137,133 @@ def main() -> int:
         check("max_completion_tokens canonicalized away", "max_completion_tokens" not in fwd)
         check("pricey `models` fallback stripped upstream", "models" not in fwd)
 
-        # #4 — change redemption idempotency: drive a paid request at the HTTP
-        # layer, then redeem the SAME change twice and require identical sigs.
+        # #1c — multimodal INPUT (image_url) must be rejected 400 BEFORE spend
+        # (a short URL bypasses the length-based cost bound = operator over-spend).
+        mmtok = [{"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
+                 for t in w._select(2000)]
+        mmh = base64.b64encode(json.dumps(mmtok).encode()).decode()
+        mmcb = base64.b64encode(
+            json.dumps([{"B_": blind(os.urandom(16).hex())[0]} for _ in range(21)]).encode()).decode()
+        rmm = httpx.post(f"{base}/v1/chat/completions",
+                         headers={"X-Cash": mmh, "X-Cash-Change": mmcb},
+                         json={"model": "openai/gpt-4o-mini", "messages": [{"role": "user",
+                               "content": [{"type": "image_url",
+                                            "image_url": {"url": "http://x/y.png"}}]}]},
+                         timeout=30)
+        check("#1c multimodal image_url input rejected pre-spend (400)",
+              rmm.status_code == 400)
+        w.tokens.extend(mmtok)  # not spent -> return them for later checks
+
+        # #4 — in-band change + idempotent recovery: drive a paid request at the
+        # HTTP layer with blinded change blanks, read the change from the
+        # X-Cash-Change response header, then RECOVER the same spend (X-Cash-
+        # Recover) and require identical change signatures — no separate,
+        # separately-timed redeem call exists anymore.
         spend = [{"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
                  for t in w._select(2000)]
         h = base64.b64encode(json.dumps(spend).encode()).decode()
-        r = httpx.post(f"{base}/v1/chat/completions", headers={"X-Cash": h},
+        blanks = [blind(os.urandom(16).hex()) for _ in range(21)]  # (B_, r) pairs
+        change_hdr = base64.b64encode(
+            json.dumps([{"B_": b[0]} for b in blanks]).encode()).decode()
+        hdrs = {"X-Cash": h, "X-Cash-Change": change_hdr}
+        r = httpx.post(f"{base}/v1/chat/completions", headers=hdrs,
                        json={"model": "openai/gpt-4o-mini",
                              "messages": [{"role": "user", "content": "change please"}]},
                        timeout=30)
-        rcpt = r.headers.get("X-Change-Receipt")
-        info = httpx.get(f"{base}/mint/change/{rcpt}", timeout=10).json()
-        change = info["change"]
-        outs = []
-        for denom in decompose(change):
-            sec = os.urandom(16).hex()
-            bhex, _r = blind(sec)
-            outs.append({"amount": denom, "B_": bhex})
-        body = json.dumps({"outputs": outs}).encode()
-        s1 = httpx.post(f"{base}/mint/change/{rcpt}", content=body, timeout=10)
-        s2 = httpx.post(f"{base}/mint/change/{rcpt}", content=body, timeout=10)  # retry
-        check("#4 change redeem is idempotent (both 200)",
-              s1.status_code == 200 and s2.status_code == 200)
-        check("#4 retried change returns identical signatures",
-              s1.json()["signatures"] == s2.json()["signatures"] and change > 0)
+        inband = json.loads(base64.b64decode(r.headers["X-Cash-Change"]))
+        change = inband["change"]
+        check("#4 change delivered in-band on the spend response (no redeem call)",
+              r.status_code == 200 and change > 0 and inband["signatures"])
+        # Recover the identical spend: same tokens + same blanks + recover flag.
+        rec = httpx.post(f"{base}/v1/chat/completions",
+                         headers={**hdrs, "X-Cash-Recover": "1"},
+                         json={"model": "recover",
+                               "messages": [{"role": "user", "content": "."}]},
+                         timeout=30)
+        check("#4 recovery replays identical change signatures (idempotent)",
+              rec.status_code == 200
+              and rec.json()["signatures"] == inband["signatures"])
+        # A never-spent token set under recovery returns 404 (client keeps it).
+        fresh = [{"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
+                 for t in w._select(1000)]
+        fh = base64.b64encode(json.dumps(fresh).encode()).decode()
+        rec404 = httpx.post(f"{base}/v1/chat/completions",
+                            headers={"X-Cash": fh, "X-Cash-Change": change_hdr,
+                                     "X-Cash-Recover": "1"},
+                            json={"model": "recover",
+                                  "messages": [{"role": "user", "content": "."}]},
+                            timeout=30)
+        check("#4 recovery of never-spent tokens is 404 (no spend)",
+              rec404.status_code == 404)
+
+        # #5 — NO double-ISSUE of change under concurrent recovery. Seed a
+        # crash-recovered ('final', cost=0 => full refund) receipt for a spent
+        # token set. (a) Two concurrent recovers with the SAME blanks (the real
+        # idempotent-retry case) both return the SAME signatures — issued once.
+        # (b) A recover with DIFFERENT blanks is rejected 409 (change is bound to
+        # the first outputs), never a second independently-valid change set.
+        import hashlib as _hl
+        rtok = [{"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
+                for t in w._select(4000)]
+        rid = _hl.sha256(json.dumps(sorted(t["secret"] for t in rtok)).encode()).hexdigest()
+        con = sqlite3.connect(dbp)
+        for t in rtok:
+            con.execute("INSERT OR IGNORE INTO spent(secret) VALUES (?)", (t["secret"],))
+        con.execute("INSERT INTO receipts(id, prepaid, cost, state, ts) VALUES (?,?,0,'final',?)",
+                    (rid, sum(t["amount"] for t in rtok), int(time.time())))
+        con.commit(); con.close()
+        rh = base64.b64encode(json.dumps(rtok).encode()).decode()
+        cbA = base64.b64encode(json.dumps([{"B_": blind(os.urandom(16).hex())[0]} for _ in range(21)]).encode()).decode()
+        cbB = base64.b64encode(json.dumps([{"B_": blind(os.urandom(16).hex())[0]} for _ in range(21)]).encode()).decode()
+
+        def _recover(cb):
+            return httpx.post(f"{base}/v1/chat/completions",
+                              headers={"X-Cash": rh, "X-Cash-Change": cb, "X-Cash-Recover": "1"},
+                              json={"model": "recover", "messages": [{"role": "user", "content": "."}]},
+                              timeout=30)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fa, fb = ex.submit(_recover, cbA), ex.submit(_recover, cbA)  # SAME blanks
+            ra, rb = fa.result(), fb.result()
+        check("#5a concurrent recover, same blanks: both 200, identical sigs (issued once)",
+              ra.status_code == 200 and rb.status_code == 200
+              and ra.json()["signatures"] == rb.json()["signatures"]
+              and len(ra.json()["signatures"]) > 0)
+        rdiff = _recover(cbB)  # different blanks -> bound to the first outputs
+        check("#5b recover with DIFFERENT blanks rejected 409 (no second issuance)",
+              rdiff.status_code == 409)
+
+        # #6 — a malformed 200 upstream body AFTER the spend must FULL-REFUND
+        # in-band (never a bare 500 that strands the burned tokens).
+        mtok = [{"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
+                for t in w._select(3000)]
+        mh = base64.b64encode(json.dumps(mtok).encode()).decode()
+        mprepaid = sum(t["amount"] for t in mtok)
+        mcb = base64.b64encode(
+            json.dumps([{"B_": blind(os.urandom(16).hex())[0]} for _ in range(21)]).encode()).decode()
+        rm = httpx.post(f"{base}/v1/chat/completions",
+                        headers={"X-Cash": mh, "X-Cash-Change": mcb},
+                        json={"model": "openai/gpt-4o-mini",
+                              "messages": [{"role": "user", "content": "MALFORMED please"}]},
+                        timeout=30)
+        minband = json.loads(base64.b64decode(rm.headers["X-Cash-Change"]))
+        check("#6 malformed upstream 200 -> full refund in-band (not a 500)",
+              rm.status_code == 502 and minband["change"] == mprepaid
+              and minband["cost"] == 0 and minband["signatures"])
 
         # #3 — crash recovery: seed a 'pending' receipt (as a crash would leave),
         # restart the router, and confirm it is finalized to a full refund.
         proc.terminate(); proc.wait()
         con = sqlite3.connect(dbp)
-        con.execute("INSERT INTO receipts(id, prepaid, cost, state) VALUES ('crashed', 1234, 0, 'pending')")
+        con.execute("INSERT INTO receipts(id, prepaid, cost, state, ts) "
+                    "VALUES ('crashed', 1234, 0, 'pending', 0)")
         con.commit(); con.close()
         proc = boot()
-        info = httpx.get(f"{base}/mint/change/crashed", timeout=10).json()
-        check("#3 crashed pending receipt recovered to full refund",
-              info["state"] == "final" and info["change"] == 1234)
+        con = sqlite3.connect(dbp)
+        row = con.execute("SELECT state, cost FROM receipts WHERE id='crashed'").fetchone()
+        con.close()
+        check("#3 crashed pending receipt recovered to full refund (cost=0, final)",
+              row is not None and row[0] == "final" and row[1] == 0)
 
         print(f"\nMONEY-SAFETY E2E: {'PASS' if ok else 'FAIL'}")
         return 0 if ok else 1

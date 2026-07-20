@@ -8,6 +8,7 @@ Run: uvicorn server:app --host 127.0.0.1 --port 8402
 """
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import math
@@ -23,7 +24,8 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from mint import DENOMS, Mint
+import ec
+from mint import DENOMS, Mint, decompose
 from confetti.chain import ChannelRecord
 from confetti.channel import Contract, Recipient
 from confetti.relation import ClearWitnessProver
@@ -71,10 +73,18 @@ MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "2000000"))
 # A 'pending' receipt older than this was left by a crash (real requests finish
 # within the ~300s upstream timeout); only such receipts are auto-refunded, so
 # recovery never touches another worker's in-flight request.
-RECEIPT_STALE_SEC = int(os.environ.get("RECEIPT_STALE_SEC", "900"))
 # Bound streaming upstream calls: a stream idle this long (no new tokens) is cut,
 # so a hung/malicious upstream can't hold a router connection open forever.
 STREAM_READ_TIMEOUT_S = float(os.environ.get("STREAM_READ_TIMEOUT_S", "120"))
+# Hard ceiling on total streaming wall-clock (checked between chunks).
+MAX_STREAM_TOTAL_SEC = max(60, int(os.environ.get("MAX_STREAM_TOTAL_SEC", "600")))
+# A pending receipt older than this is treated as crash-abandoned and refunded.
+# It is DERIVED to always exceed the longest a live stream can run — the total
+# ceiling plus one more idle read (the deadline is checked between chunks) plus a
+# margin — so the sweep can NEVER race a live stream regardless of env overrides.
+RECEIPT_STALE_SEC = max(
+    int(os.environ.get("RECEIPT_STALE_SEC", "900")),
+    MAX_STREAM_TOTAL_SEC + int(STREAM_READ_TIMEOUT_S) + 120)
 
 if DEV_FAUCET and urlparse(UPSTREAM).hostname not in {"localhost", "127.0.0.1"}:
     message = "REFUSING TO START: DEV_FAUCET requires a localhost upstream"
@@ -112,8 +122,12 @@ UPSTREAM_ALLOWED_FIELDS = frozenset({
     "presence_penalty", "frequency_penalty", "repetition_penalty",
     "logit_bias", "logprobs", "top_logprobs",
     "response_format", "tools", "tool_choice", "parallel_tool_calls",
-    "functions", "function_call", "prediction", "modalities", "audio",
+    "functions", "function_call", "prediction",
     "reasoning", "reasoning_effort", "verbosity", "usage",
+    # NOTE: "modalities"/"audio" are deliberately NOT forwarded. This is a TEXT
+    # MVP: audio output isn't detected by the streaming produced-scan (=> would be
+    # free) and isn't covered by _bound_cost's token pricing. Dropping them makes
+    # every request text, so produced-detection and the cost bound stay sound.
     # OpenRouter provider prefs (same model, so cost-neutral) + prompt transforms.
     # NOT "models"/"route": those let a request fall back to a DIFFERENT (possibly
     # pricier) model than the one we priced, bypassing the cost bound.
@@ -177,8 +191,12 @@ db.execute(
     "CREATE TABLE IF NOT EXISTS receipts("
     "id TEXT PRIMARY KEY, prepaid INT, cost INT, state TEXT, change_sigs TEXT, ts INTEGER)"
 )
-# Migrate older DBs (change_sigs = idempotent redemption; ts = crash-recovery age).
-for _col, _type in (("change_sigs", "TEXT"), ("ts", "INTEGER")):
+# Migrate older DBs (change_sigs = idempotent redemption; ts = crash-recovery
+# age; res_day/res_usd = the daily-cap reservation to RELEASE if this receipt is
+# crash-recovered, so a crash mid-request doesn't leak the reservation).
+for _col, _type in (("change_sigs", "TEXT"), ("ts", "INTEGER"),
+                    ("res_day", "TEXT"), ("res_usd", "REAL"),
+                    ("change_key", "TEXT")):
     try:
         db.execute(f"ALTER TABLE receipts ADD COLUMN {_col} {_type}")
     except sqlite3.OperationalError:
@@ -186,18 +204,41 @@ for _col, _type in (("change_sigs", "TEXT"), ("ts", "INTEGER")):
 db.execute(
     "CREATE TABLE IF NOT EXISTS vouchers(code TEXT PRIMARY KEY, credits INT, state TEXT)"
 )
-db.execute(
-    "CREATE TABLE IF NOT EXISTS accounts("
-    "api_key TEXT PRIMARY KEY, key_hash TEXT UNIQUE, balance INT)"
-)
+# sigs/redeem_key = idempotent redemption: if a redeemed voucher's response is
+# lost, the SAME blinded outputs (matched by redeem_key) get the cached sigs back
+# instead of losing the voucher value; different outputs get a uniform 400 (so it
+# is still not a probing oracle).
+for _col in ("sigs", "redeem_key"):
+    try:
+        db.execute(f"ALTER TABLE vouchers ADD COLUMN {_col} TEXT")
+    except sqlite3.OperationalError:
+        pass
+# Accounts store ONLY the key_hash, never the raw bearer key: a DB dump can't be
+# used to spend or to link, and the account is a short-lived funding rendezvous
+# (drained to ecash immediately), not a persistent identity. Migrate any older
+# schema that kept the plaintext api_key column by rebuilding key_hash-only.
+_acct_cols = [r[1] for r in db.execute("PRAGMA table_info(accounts)").fetchall()]
+if _acct_cols and "api_key" in _acct_cols:
+    db.execute("ALTER TABLE accounts RENAME TO _accounts_old")
+    db.execute("CREATE TABLE accounts(key_hash TEXT PRIMARY KEY, balance INT)")
+    db.execute("INSERT OR IGNORE INTO accounts(key_hash, balance) "
+               "SELECT key_hash, balance FROM _accounts_old WHERE key_hash IS NOT NULL")
+    db.execute("DROP TABLE _accounts_old")
+else:
+    db.execute("CREATE TABLE IF NOT EXISTS accounts(key_hash TEXT PRIMARY KEY, balance INT)")
 db.execute(
     "CREATE TABLE IF NOT EXISTS seen_deposits(txhash TEXT PRIMARY KEY)"
 )
 # Idempotent claim records: a lost/retried claim returns the cached signatures
-# instead of debiting the account a second time.
+# instead of debiting the account a second time. `ts` lets a janitor expire them
+# so the correlation surface (which account claimed when) does not persist.
 db.execute(
-    "CREATE TABLE IF NOT EXISTS claims(idem_key TEXT PRIMARY KEY, response TEXT)"
+    "CREATE TABLE IF NOT EXISTS claims(idem_key TEXT PRIMARY KEY, response TEXT, ts INTEGER)"
 )
+try:
+    db.execute("ALTER TABLE claims ADD COLUMN ts INTEGER")
+except sqlite3.OperationalError:
+    pass
 db.execute("CREATE TABLE IF NOT EXISTS spend_ledger(day TEXT PRIMARY KEY, usd REAL)")
 db.commit()
 db_write_lock = asyncio.Lock()
@@ -390,16 +431,20 @@ def _verify_tokens(tokens: list[dict]) -> int:
 
 
 async def _spend_and_open_receipt(tokens: list[dict], receipt_id: str,
-                                  prepaid: int) -> None:
+                                  prepaid: int, res_day: str = None,
+                                  res_usd: float = 0.0) -> None:
     """Burn the tokens AND open the pending receipt in ONE transaction, so a
-    crash can never take payment without leaving a redeemable receipt."""
+    crash can never take payment without leaving a redeemable receipt. The
+    daily-cap reservation (res_day/res_usd) is stored so crash recovery can
+    release it."""
     async with db_write_lock:
         try:
             for t in tokens:
                 db.execute("INSERT INTO spent(secret) VALUES (?)", (t["secret"],))
             db.execute(
-                "INSERT INTO receipts(id, prepaid, cost, state, ts) VALUES (?, ?, 0, 'pending', ?)",
-                (receipt_id, prepaid, int(time.time())),
+                "INSERT INTO receipts(id, prepaid, cost, state, ts, res_day, res_usd) "
+                "VALUES (?, ?, 0, 'pending', ?, ?, ?)",
+                (receipt_id, prepaid, int(time.time()), res_day, res_usd),
             )
             db.commit()
         except sqlite3.IntegrityError:
@@ -416,6 +461,192 @@ async def _finalize(receipt_id: str, cost: int) -> None:
         db.commit()
 
 
+def _receipt_id(tokens: list[dict]) -> str:
+    """Deterministic receipt id = hash of the spent token secrets. Lets a client
+    that lost the response recover its change in-band by re-presenting the same
+    tokens — no separate, separately-timed redemption call to correlate. Uses a
+    canonical JSON encoding of the sorted secrets (not a delimiter join) so a
+    client can't craft secrets containing the delimiter to collide two different
+    token sets onto one receipt id."""
+    secrets_sorted = sorted(str(t.get("secret", "")) for t in tokens)
+    return hashlib.sha256(json.dumps(secrets_sorted).encode()).hexdigest()
+
+
+def _reject_non_text_content(body: dict) -> None:
+    """Text-only MVP guard: a message `content` may be a string or a list of
+    TEXT parts ({"type":"text",...}); any other part type (image_url, input_audio,
+    file, ...) is rejected 400. This keeps `_bound_cost`'s length-based estimate a
+    true upper bound on upstream cost (image/audio input costs are unrelated to
+    the short reference length). Runs BEFORE any reserve/spend."""
+    if not isinstance(body, dict):
+        return
+    for m in body.get("messages") or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        if content is None or isinstance(content, str):
+            continue
+        if not isinstance(content, list):
+            raise HTTPException(400, "unsupported message content (text only)")
+        for part in content:
+            if isinstance(part, str):
+                continue
+            if not isinstance(part, dict) or part.get("type") != "text":
+                raise HTTPException(
+                    400, "this router accepts text only; non-text content "
+                    "(images/audio/files) is not supported")
+
+
+def _blanks_key(blanks: list[dict]) -> str:
+    """Fingerprint of the change blanks. The receipt binds to the FIRST blanks it
+    settled; a recovery that presents DIFFERENT blanks (it can't unblind the
+    already-issued change anyway) gets a clean 409 instead of usable-looking sigs
+    it can't use. A legitimate client persists and re-sends identical blanks."""
+    return hashlib.sha256(
+        json.dumps([b.get("B_") for b in blanks]).encode()).hexdigest()
+
+
+def _parse_change_blanks(request: Request) -> list[dict]:
+    """Blinded 'blank' change outputs the client sends WITH the spend (Cashu
+    NUT-08 style). Fixed count from the client, so the header size doesn't encode
+    the change amount; the mint signs only the decompose(change) prefix."""
+    hdr = request.headers.get("X-Cash-Change")
+    if not hdr:
+        raise HTTPException(400, "attach blinded change outputs in X-Cash-Change")
+    if len(hdr) > 8192:  # bound decode work; 21 compressed points is ~1.5 KB b64
+        raise HTTPException(400, "X-Cash-Change too large")
+    try:
+        blanks = json.loads(base64.b64decode(hdr))
+    except Exception:
+        raise HTTPException(400, "X-Cash-Change must be base64 JSON list of {B_}")
+    # EXACTLY one blank per denomination: a fixed count so the header size never
+    # encodes the change amount, and enough to cover any change of a spend capped
+    # below 2^len (so _sign_change can never fail AFTER tokens are burned). Each
+    # B_ must be a 33-byte compressed point in hex; validated here, before spend.
+    if not isinstance(blanks, list) or len(blanks) != len(DENOMS):
+        raise HTTPException(400, f"send exactly {len(DENOMS)} blinded change outputs")
+    for b in blanks:
+        if not isinstance(b, dict):
+            raise HTTPException(400, "each change output must be an object")
+        bp = b.get("B_")
+        if not isinstance(bp, str) or len(bp) != 66 or bp[:2] not in ("02", "03"):
+            raise HTTPException(400, "each B_ must be a 33-byte compressed point (hex)")
+        # Curve-membership check NOW, before any spend: an off-curve point passes
+        # the format check but makes mint.sign_blinded (-> ec.decompress) raise
+        # LATER, after tokens are burned, leaving a pending receipt the sweep
+        # would refund => free inference. Reject it here instead.
+        try:
+            ec.decompress(bytes.fromhex(bp))
+        except ValueError:
+            raise HTTPException(400, "each B_ must be a valid curve point")
+    return blanks
+
+
+def _sign_change(blanks: list[dict], change: int) -> list[dict]:
+    """Sign the client's blank outputs for exactly `change` credits, assigning
+    power-of-two denominations to the first blanks. In-band: the signatures ride
+    back on the SAME response as the spend, so there is no separate change event."""
+    denoms = decompose(change)
+    if len(denoms) > len(blanks):
+        raise HTTPException(400, f"need {len(denoms)} change outputs, got {len(blanks)}")
+    return [{"amount": d, "C_": mint.sign_blinded(d, blanks[i]["B_"])}
+            for i, d in enumerate(denoms)]
+
+
+def _b64_change(change: int, cost: int, sigs: list[dict]) -> str:
+    return base64.b64encode(
+        json.dumps({"change": change, "cost": cost, "signatures": sigs}).encode()
+    ).decode()
+
+
+async def _settle_receipt(receipt_id: str, billed_cost: int, blanks: list[dict],
+                          res_day: str = None, reserved_usd: float = 0.0,
+                          actual_usd: float = 0.0) -> tuple[int, int, list[dict]]:
+    """The SINGLE authoritative settlement + change-issuance point. Under one
+    write lock, reads the receipt's current state and issues change EXACTLY once,
+    always returning VALID signatures over the caller's `blanks`:
+
+      pending  -> bill `billed_cost`, sign change, reconcile the daily-cap
+                  reservation (winner only), cache + return.
+      final    -> the stale-recovery sweep already refunded this to cost 0; sign
+                  the FULL refund over these blanks and cache (the sweep already
+                  released the reservation, so we don't). This is why a request
+                  that raced the sweep still returns valid change, never the
+                  empty sigs the sweep left.
+      redeemed -> already settled; return the cached signatures (idempotent).
+
+    Returns (change, cost, sigs). Every state transition is a GUARDED CAS
+    (WHERE state='<expected>') and issuance/reconcile happen ONLY on rowcount==1,
+    so change is issued once and the cap adjusted once even across MULTIPLE worker
+    processes (SQLite serializes the conditional UPDATE; the in-process lock alone
+    would not). On a lost CAS we re-read and return the winner's canonical sigs."""
+    bk = _blanks_key(blanks)
+    async with db_write_lock:
+        row = db.execute(
+            "SELECT prepaid, cost, state, change_sigs, change_key FROM receipts WHERE id=?",
+            (receipt_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "not spent")
+        prepaid, rcost, state, cached, ckey = row
+        if state == "pending":
+            billed = min(prepaid, billed_cost)
+            change = prepaid - billed
+            sigs = _sign_change(blanks, change) if change else []
+            cur = db.execute(
+                "UPDATE receipts SET cost=?, state='redeemed', change_sigs=?, change_key=? "
+                "WHERE id=? AND state='pending'",
+                (billed, json.dumps(sigs), bk, receipt_id))
+            if cur.rowcount == 1:
+                if res_day is not None:  # winner ALSO reconciles the cap, atomically
+                    delta = float(actual_usd) - float(reserved_usd)
+                    led = db.execute(
+                        "UPDATE spend_ledger SET usd=MAX(0, usd+?) WHERE day=?",
+                        (delta, res_day))
+                    if led.rowcount == 0:
+                        db.execute("INSERT INTO spend_ledger(day, usd) VALUES (?, ?)",
+                                   (res_day, max(0.0, delta)))
+                db.commit()
+                return change, billed, sigs
+            db.commit()  # lost CAS: fall through to return the winner's canonical
+        elif state == "final":
+            change = prepaid  # sweep refunded to cost 0 (reservation already released)
+            sigs = _sign_change(blanks, change) if change else []
+            cur = db.execute(
+                "UPDATE receipts SET state='redeemed', change_sigs=?, change_key=? "
+                "WHERE id=? AND state='final'",
+                (json.dumps(sigs), bk, receipt_id))
+            if cur.rowcount == 1:
+                db.commit()
+                return change, 0, sigs
+            db.commit()  # lost CAS: fall through to canonical
+        # Already 'redeemed' (or we lost a CAS): the change was issued ONCE, bound
+        # to the first caller's blanks. Re-read and, if THIS caller's blanks don't
+        # match, 409 rather than hand back signatures it cannot unblind (which the
+        # client would otherwise absorb as unusable tokens).
+        r2 = db.execute(
+            "SELECT prepaid, cost, change_sigs, change_key FROM receipts WHERE id=?",
+            (receipt_id,),
+        ).fetchone()
+        p2, c2, s2, k2 = r2
+        if k2 is not None and k2 != bk:
+            raise HTTPException(
+                409, "change already issued to the original request's outputs")
+        return max(0, p2 - (c2 or 0)), (c2 or 0), (json.loads(s2) if s2 else [])
+
+
+async def _replay_change(receipt_id: str, blanks: list[dict]) -> JSONResponse:
+    """Recovery entry point: return the change for an already-spent receipt
+    in-band. 409 while the request is still in flight; otherwise delegate to the
+    single settlement function, which issues change at most once and always over
+    these blanks (final -> full refund, redeemed -> cached)."""
+    row = db.execute("SELECT state FROM receipts WHERE id=?", (receipt_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "not spent")
+    if row[0] == "pending":
+        raise HTTPException(409, "request still in flight, retry shortly")
+    change, cost, sigs = await _settle_receipt(receipt_id, 0, blanks)
+    return JSONResponse({"change": change, "cost": cost, "signatures": sigs})
+
+
 async def _recover_stale_receipts() -> int:
     """Finalize receipts left 'pending' by a crash (older than RECEIPT_STALE_SEC)
     to cost=0 so the payer redeems a full refund. The age guard means a live
@@ -423,13 +654,32 @@ async def _recover_stale_receipts() -> int:
     a rolling restart. NULL ts (pre-migration receipts) are treated as stale."""
     async with db_write_lock:
         cutoff = int(time.time()) - RECEIPT_STALE_SEC
-        cur = db.execute(
-            "UPDATE receipts SET cost=0, state='final' "
+        stale = db.execute(
+            "SELECT id, res_day, res_usd FROM receipts "
             "WHERE state='pending' AND (ts IS NULL OR ts < ?)",
             (cutoff,),
-        )
+        ).fetchall()
+        n = 0
+        for _id, day, usd in stale:
+            # Flip this receipt AND release its daily-cap reservation in the SAME
+            # transaction, guarded by the CAS: only the worker that actually
+            # transitions the receipt releases its reservation, so there is no
+            # double-release across workers and no leak on a crash between the
+            # two writes (they commit together). Inlined (not _reconcile_spend) to
+            # avoid re-entering db_write_lock.
+            cur = db.execute(
+                "UPDATE receipts SET cost=0, state='final' "
+                "WHERE id=? AND state='pending'",
+                (_id,),
+            )
+            if cur.rowcount == 1:
+                n += 1
+                if day and usd:
+                    db.execute(
+                        "UPDATE spend_ledger SET usd=MAX(0, usd-?) WHERE day=?",
+                        (float(usd), day),
+                    )
         db.commit()
-        n = cur.rowcount
     if n:
         print(f"anon-router: recovered {n} stale receipt(s) -> full refund")
     return n
@@ -471,14 +721,33 @@ async def _reconcile_spend(day: str, reserved_usd: float, actual_usd: float) -> 
         db.commit()
 
 
-def _billed_usd(cost_usd: float | None, credits: int) -> float:
-    return credits * CREDIT_USD if cost_usd is None else float(cost_usd)
+def _num(x):
+    """Coerce an upstream-supplied cost to a FINITE float, or None otherwise.
+    A malformed `usage.cost` must NOT crash the billing path AFTER the spend
+    (that would strand the receipt and free-ride the inference). Rejects non-
+    numbers AND NaN/Infinity — `math.ceil(NaN)` raises and `float('inf')` would
+    blow past the cap, both post-spend."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        f = float(x)  # a huge JSON int (e.g. 10**400) raises OverflowError here
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(f) or f < 0:
+        return None  # NaN/inf, or a NEGATIVE cost (nonsensical) => treat as missing
+    return f
 
 
-def _usd_to_credits(cost_usd: float | None) -> int:
-    if cost_usd is None:
-        return 1  # upstream gave no usage; charge the floor, log for investigation
-    return max(1, math.ceil(cost_usd * MARKUP / CREDIT_USD))
+def _billed_usd(cost_usd, credits: int) -> float:
+    c = _num(cost_usd)
+    return credits * CREDIT_USD if c is None else c
+
+
+def _usd_to_credits(cost_usd) -> int:
+    c = _num(cost_usd)
+    if c is None:
+        return 1  # missing/malformed usage; charge the floor, log for investigation
+    return max(1, math.ceil(c * MARKUP / CREDIT_USD))
 
 
 _pricing = {"data": {}, "ts": 0.0}
@@ -516,17 +785,15 @@ def _safe_int(v, default: int) -> int:
 
 
 def _est_input_tokens(body: dict) -> int:
-    """Conservative UPPER bound on billable input tokens across EVERY forwarded
-    input-bearing field (not just messages), so a big tools/functions/prediction
-    payload can't slip past the cost bound. Rejects oversized input (413).
-    Note: text/JSON only — image/audio token cost is not modeled (text-chat MVP);
-    the daily cap is the backstop for multimodal until per-modality pricing lands.
-    """
-    parts = {k: body.get(k) for k in
-             ("messages", "prompt", "tools", "functions", "prediction", "tool_choice")
-             if k in body}
+    """Conservative UPPER bound on billable input tokens. Estimates over the
+    ENTIRE forwarded body (already allowlist-filtered), not a hand-picked subset,
+    so no client-controlled input-bearing field — messages, tools, functions,
+    prediction, response_format's json_schema, stop, logit_bias, or any field
+    added to the allowlist later — can slip past the cost bound. Rejects oversized
+    input (413). Text/JSON only: image/audio token cost isn't modeled (text-chat
+    MVP; non-text content parts are already rejected before this runs)."""
     try:
-        blob = json.dumps(parts)
+        blob = json.dumps(body)
     except Exception:
         blob = ""
     if len(blob) > MAX_INPUT_CHARS:
@@ -622,8 +889,7 @@ async def account_new(request: Request):
     kh = _key_hash(api_key)
     async with db_write_lock:
         db.execute(
-            "INSERT INTO accounts(api_key, key_hash, balance) VALUES (?, ?, 0)",
-            (api_key, kh),
+            "INSERT INTO accounts(key_hash, balance) VALUES (?, 0)", (kh,),
         )
         db.commit()
     from web3 import Web3
@@ -650,7 +916,11 @@ async def account_new(request: Request):
 
 
 def _account_balance(api_key: str):
-    row = db.execute("SELECT balance FROM accounts WHERE api_key=?", (api_key,)).fetchone()
+    if not api_key:
+        return None
+    row = db.execute(
+        "SELECT balance FROM accounts WHERE key_hash=?", (_key_hash(api_key),)
+    ).fetchone()
     return None if row is None else row[0]
 
 
@@ -736,11 +1006,15 @@ async def mint_claim(request: Request):
     total = sum(int(o["amount"]) for o in outputs)
     signatures = _sign_outputs(outputs)
 
-    # Idempotency: a client retrying a claim (lost response, timeout) sends the
-    # same Idempotency-Key and gets the cached signatures back, never a second
-    # debit. Keyed under the account so one key can't replay another's claim.
+    # Idempotency is MANDATORY: a claim debits the account, so a lost-response
+    # retry MUST carry the same Idempotency-Key to get the cached signatures back
+    # instead of debiting a second time. Reject a claim without one rather than
+    # allow a silent double-debit. Keyed under the account so one key can't replay
+    # another's claim.
     idem = request.headers.get("Idempotency-Key")
-    idem_key = f"{_key_hash(key)}:{idem}" if idem else None
+    if not idem:
+        raise HTTPException(400, "Idempotency-Key header required for /mint/claim")
+    idem_key = f"{_key_hash(key)}:{idem}"
     async with db_write_lock:
         try:
             if idem_key:
@@ -754,8 +1028,8 @@ async def mint_claim(request: Request):
                         409, "claim with this Idempotency-Key is in progress"
                     )
                 db.execute(
-                    "INSERT INTO claims(idem_key, response) VALUES (?, '')",
-                    (idem_key,),
+                    "INSERT INTO claims(idem_key, response, ts) VALUES (?, '', ?)",
+                    (idem_key, int(time.time())),
                 )
             bal = _account_balance(key)
             if bal is None:
@@ -766,8 +1040,8 @@ async def mint_claim(request: Request):
             # Signing is pure, so failures happen before the debit. The debit and
             # completed idempotency response are then committed atomically.
             cur = db.execute(
-                "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
-                (total, key, total),
+                "UPDATE accounts SET balance=balance-? WHERE key_hash=? AND balance>=?",
+                (total, _key_hash(key), total),
             )
             if cur.rowcount == 0:
                 raise HTTPException(409, "balance changed, retry")
@@ -827,91 +1101,56 @@ async def channel_open(request: Request):
     }
 
 
-@app.get("/mint/voucher/{code}")
-def voucher_info(code: str):
-    row = db.execute(
-        "SELECT credits, state FROM vouchers WHERE code=?", (code,)
-    ).fetchone()
-    if not row:
-        raise HTTPException(404, "unknown voucher")
-    return {"credits": row[0], "state": row[1]}
-
-
-@app.post("/mint/voucher/{code}")
-async def redeem_voucher(code: str, request: Request):
-    outputs = _parse_outputs(await request.json())
+@app.post("/mint/redeem")
+async def redeem_voucher(request: Request):
+    """Redeem a voucher into ecash. The code travels in the REQUEST BODY (never
+    the URL, so it can't leak via logs/history/referer) and there is no
+    voucher-status GET endpoint (an unauthenticated status oracle would let
+    anyone probe a code's existence/value/redemption state). A wrong code and an
+    already-redeemed code return the same 400 so the endpoint isn't an oracle."""
+    body = await request.json()
+    code = body.get("code")
+    if not isinstance(code, str) or not code:
+        raise HTTPException(400, "code required in body")
+    outputs = _parse_outputs(body)
     if any(int(o["amount"]) not in DENOMS for o in outputs):
         raise HTTPException(400, "output amounts must be valid denominations")
-    signatures = _sign_outputs(outputs)
+    # Fingerprint of the exact blinded outputs: gates idempotent recovery to the
+    # original client (same blinds) without becoming a code-probing oracle.
+    rk = hashlib.sha256(json.dumps(
+        sorted((int(o["amount"]), o["B_"]) for o in outputs)).encode()).hexdigest()
     async with db_write_lock:
         row = db.execute(
-            "SELECT credits, state FROM vouchers WHERE code=?", (code,)
+            "SELECT credits, state, sigs, redeem_key FROM vouchers WHERE code=?", (code,)
         ).fetchone()
-        if not row:
-            raise HTTPException(404, "unknown voucher")
-        credits = row[0]
-        if sum(int(o["amount"]) for o in outputs) != credits:
-            raise HTTPException(400, f"outputs must sum to {credits} credits")
-        # Mark redeemed atomically so a concurrent redeem can't double-issue.
+        credits = row[0] if row else None
+        if not row or sum(int(o["amount"]) for o in outputs) != credits:
+            raise HTTPException(400, "invalid or already-redeemed voucher")
+        if row[1] == "redeemed":
+            # Idempotent replay ONLY for the identical blinds; anything else 400s.
+            if row[3] == rk:
+                return {"credits": credits,
+                        "signatures": json.loads(row[2]) if row[2] else []}
+            raise HTTPException(400, "invalid or already-redeemed voucher")
+        # Sign FIRST (pure, may raise 400 on a bad blinded point) so a signing
+        # failure can't burn the voucher; then CAS to redeemed, caching sigs +
+        # blinds fingerprint so a lost response is recoverable.
+        signatures = _sign_outputs(outputs)
         cur = db.execute(
-            "UPDATE vouchers SET state='redeemed' WHERE code=? AND state='issued'",
-            (code,),
+            "UPDATE vouchers SET state='redeemed', sigs=?, redeem_key=? "
+            "WHERE code=? AND state='issued'",
+            (json.dumps(signatures), rk, code),
         )
         db.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(400, "voucher already redeemed")
+        if cur.rowcount != 1:  # lost the race: return the winner's cached sigs
+            won = db.execute(
+                "SELECT sigs, redeem_key FROM vouchers WHERE code=?", (code,)
+            ).fetchone()
+            if won and won[1] == rk:
+                return {"credits": credits,
+                        "signatures": json.loads(won[0]) if won[0] else []}
+            raise HTTPException(400, "invalid or already-redeemed voucher")
     return {"credits": credits, "signatures": signatures}
-
-
-@app.get("/mint/change/{receipt_id}")
-def change_info(receipt_id: str):
-    row = db.execute(
-        "SELECT prepaid, cost, state FROM receipts WHERE id=?", (receipt_id,)
-    ).fetchone()
-    if not row:
-        raise HTTPException(404, "unknown receipt")
-    prepaid, cost, state = row
-    change = max(0, prepaid - (cost or 0)) if state != "pending" else None
-    return {"state": state, "prepaid": prepaid, "cost": cost, "change": change}
-
-
-@app.post("/mint/change/{receipt_id}")
-async def redeem_change(receipt_id: str, request: Request):
-    raw_body = await request.body()
-    async with db_write_lock:
-        row = db.execute(
-            "SELECT prepaid, cost, state, change_sigs FROM receipts WHERE id=?",
-            (receipt_id,),
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "unknown receipt")
-        prepaid, cost, state, cached = row
-        change = max(0, prepaid - (cost or 0))
-        if state == "pending":
-            raise HTTPException(409, "request still in flight, retry shortly")
-        if state == "redeemed":
-            # Idempotent replay: a lost response is safe to retry — return the
-            # SAME signed change instead of losing it. (The client's built-in
-            # retry re-sends the same blinded outputs, so these signatures fit.)
-            return {"change": change, "cost": cost,
-                    "signatures": json.loads(cached) if cached else []}
-        if state != "final":
-            raise HTTPException(409, "not final")
-        if change:
-            outputs = _parse_outputs(json.loads(raw_body))
-            if sum(int(o["amount"]) for o in outputs) != change:
-                raise HTTPException(400, f"outputs must sum to change of {change} credits")
-            signatures = _sign_outputs(outputs)
-        else:
-            signatures = []
-        cur = db.execute(
-            "UPDATE receipts SET state='redeemed', change_sigs=? WHERE id=? AND state='final'",
-            (json.dumps(signatures), receipt_id),
-        )
-        db.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(409, "already redeemed or not final")
-    return {"change": change, "cost": cost, "signatures": signatures}
 
 
 @app.get("/v1/models")
@@ -938,6 +1177,23 @@ async def chat(request: Request):
     channel_payment_body = (
         body.pop("_channel_payment", None) if isinstance(body, dict) else None
     )
+    # Recovery FIRST, before any lane routing: an X-Cash-Recover request only
+    # reclaims change for already-spent tokens. Handling it here guarantees it can
+    # never run inference — not the free (local/*) lane, not the channel lane, not
+    # the paid lane — regardless of the model or any payment header it carries.
+    if request.headers.get("X-Cash-Recover"):
+        cash_header = request.headers.get("X-Cash")
+        if not cash_header:
+            raise HTTPException(400, "X-Cash-Recover requires X-Cash")
+        try:
+            tokens = json.loads(base64.b64decode(cash_header))
+        except Exception:
+            raise HTTPException(400, "X-Cash must be base64 JSON token list")
+        blanks = _parse_change_blanks(request)
+        rid = _receipt_id(tokens)
+        if db.execute("SELECT 1 FROM receipts WHERE id=?", (rid,)).fetchone() is None:
+            raise HTTPException(404, "not spent")
+        return await _replay_change(rid, blanks)
     # Privacy core: the upstream inference provider must only ever see "the
     # router" — never who paid or which session. Forward ONLY known inference
     # parameters (strict allowlist), dropping every client-supplied identity /
@@ -947,6 +1203,12 @@ async def chat(request: Request):
     # rides in headers / the popped field above, never in the forwarded body.
     if isinstance(body, dict):
         body = {k: v for k, v in body.items() if k in UPSTREAM_ALLOWED_FIELDS}
+    # Text-MVP cost-bound integrity: `_bound_cost` prices input by serialized
+    # length, which is NOT a conservative bound for multimodal parts (a short
+    # `image_url` can trigger large upstream image-processing cost). Reject any
+    # non-text content part BEFORE reserving/spending, so worst-case pricing is
+    # always an upper bound. (Removing modalities/audio only covered the output.)
+    _reject_non_text_content(body)
     base, key, free, upstream_model = resolve_route(str(body.get("model", "")))
     body["model"] = upstream_model
     upstream_headers = {"Content-Type": "application/json"}
@@ -977,74 +1239,12 @@ async def chat(request: Request):
             r.json(), status_code=r.status_code, headers={"X-Cost-Credits": "0"}
         )
 
-    # Bearer-key account lane: works with any OpenAI-compatible client.
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer sk-anon-"):
-        key = auth[len("Bearer "):]
-        bal = _account_balance(key)
-        if bal is None:
-            raise HTTPException(401, "unknown API key")
-        if bal <= 0:
-            raise HTTPException(402, "insufficient credits; deposit ETH to top up")
-        # Reserve only the bounded worst-case for THIS request (not the whole
-        # balance): a crash then loses at most `hold`, and billing can never
-        # exceed what was held.
-        worst_usd, hold = await _bound_cost(body, upstream_model)
-        if bal < hold:
-            raise HTTPException(402, f"insufficient credits: need {hold} for this "
-                                f"request's max cost, have {bal}")
-        reservation_day, reserved_usd = await _reserve_daily_cap(worst_usd)
-        async with db_write_lock:
-            cur = db.execute(
-                "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
-                (hold, key, hold),
-            )
-            db.commit()
-        if cur.rowcount == 0:
-            await _reconcile_spend(reservation_day, reserved_usd, 0.0)
-            raise HTTPException(402, "insufficient credits; deposit ETH to top up")
-        body["usage"] = {"include": True}
-        try:
-            async with httpx.AsyncClient(timeout=300) as client:
-                r = await client.post(url, json=body, headers=upstream_headers)
-        except Exception:
-            async with db_write_lock:
-                db.execute(
-                    "UPDATE accounts SET balance=balance+? WHERE api_key=?", (hold, key)
-                )
-                db.commit()
-            await _reconcile_spend(reservation_day, reserved_usd, 0.0)
-            raise
-        if r.status_code != 200:
-            async with db_write_lock:
-                db.execute(
-                    "UPDATE accounts SET balance=balance+? WHERE api_key=?", (hold, key)
-                )
-                db.commit()
-            await _reconcile_spend(reservation_day, reserved_usd, 0.0)
-            return JSONResponse(
-                r.json()
-                if r.headers.get("content-type", "").startswith("application/json")
-                else {"error": r.text},
-                status_code=r.status_code,
-            )
-        data = r.json()
-        cost_usd = (data.get("usage") or {}).get("cost")
-        cost = min(hold, _usd_to_credits(cost_usd))
-        async with db_write_lock:
-            db.execute(
-                "UPDATE accounts SET balance=balance+? WHERE api_key=?", (hold - cost, key)
-            )
-            db.commit()
-        actual_usd = _billed_usd(cost_usd, cost)
-        if cost_usd is None:
-            actual_usd = max(actual_usd, reserved_usd)
-        await _reconcile_spend(reservation_day, reserved_usd, actual_usd)
-        return JSONResponse(
-            data,
-            headers={"X-Cost-Credits": str(cost), "X-Balance": str(max(0, bal - cost))},
-        )
-
+    # NOTE: there is deliberately NO "pay for inference with the account key"
+    # lane. The bearer account is a funding rendezvous only — deposit/voucher ->
+    # /mint/claim -> unlinkable ecash. Paying inference directly from the account
+    # would tie every request to one persistent, re-linkable identifier, which is
+    # exactly the property this product exists to avoid. Inference is paid ONLY
+    # with blind-signed ecash (X-Cash) or a confetti channel.
     channel_header = request.headers.get("X-Channel-Payment")
     if channel_header or channel_payment_body is not None:
         if not CHANNEL_LANE_ENABLED:
@@ -1088,8 +1288,15 @@ async def chat(request: Request):
                 max(_billed_usd(None, CHANNEL_PRICE), reserved_usd),
             )
             raise
-        data = r.json()
-        cost_usd = (data.get("usage") or {}).get("cost") if r.status_code == 200 else None
+        try:
+            data = r.json()
+            usage = data.get("usage") if isinstance(data, dict) else None
+        except Exception:
+            # Malformed body: don't 500 (which would skip the reconcile and leak
+            # the reservation). Reconcile conservatively and return the raw text.
+            data, usage = {"error": "malformed upstream response"}, None
+        cost_usd = (usage.get("cost") if isinstance(usage, dict) else None) \
+            if r.status_code == 200 else None
         await _reconcile_spend(
             reservation_day,
             reserved_usd,
@@ -1111,21 +1318,44 @@ async def chat(request: Request):
         tokens = json.loads(base64.b64decode(cash_header))
     except Exception:
         raise HTTPException(400, "X-Cash must be base64 JSON token list")
+    change_blanks = _parse_change_blanks(request)
+    receipt_id = _receipt_id(tokens)
+
+    # A genuine retry of a real request (same tokens, no recover header) replays
+    # the change instead of re-running (and double-charging) the inference.
+    # (Explicit X-Cash-Recover is handled earlier, before any lane routing.)
+    existing = db.execute(
+        "SELECT 1 FROM receipts WHERE id=?", (receipt_id,)
+    ).fetchone()
+    if existing is not None:
+        return await _replay_change(receipt_id, change_blanks)
 
     # Bound the worst-case upstream cost and require the prepay covers it BEFORE
     # burning anything — so the router can never be billed more than was paid.
     prepaid = _verify_tokens(tokens)
+    # Cap the prepay so change always decomposes into <= len(DENOMS) outputs (the
+    # fixed blank count). A legitimate client over-selects by at most one token
+    # (< 2^(len-1)); this only rejects absurd over-prepay, and does so before any
+    # spend, so change signing can never fail after tokens are burned.
+    if prepaid >= (1 << len(DENOMS)):
+        raise HTTPException(402, "prepay too large; attach fewer/smaller tokens")
     worst_usd, worst_credits = await _bound_cost(body, upstream_model)
     if prepaid < worst_credits:
         raise HTTPException(402, f"prepay {prepaid} < {worst_credits} credits needed to "
                             "cover this request's maximum cost; attach more tokens")
 
     reservation_day, reserved_usd = await _reserve_daily_cap(worst_usd)
-    receipt_id = secrets.token_hex(16)
     try:
-        await _spend_and_open_receipt(tokens, receipt_id, prepaid)
-    except Exception:
+        await _spend_and_open_receipt(tokens, receipt_id, prepaid,
+                                      reservation_day, reserved_usd)
+    except HTTPException:
+        # Tokens spent between our check and now: fall back to the replay path.
         await _reconcile_spend(reservation_day, reserved_usd, 0.0)
+        row = db.execute(
+            "SELECT 1 FROM receipts WHERE id=?", (receipt_id,)
+        ).fetchone()
+        if row is not None:
+            return await _replay_change(receipt_id, change_blanks)
         raise
 
     body["usage"] = {"include": True}  # OpenRouter returns exact USD cost
@@ -1133,82 +1363,203 @@ async def chat(request: Request):
     if body.get("stream"):
 
         async def gen():
-            cost_usd = None
-            produced_output = False
+            state = {"cost_usd": None, "produced": False, "done": False,
+                     "upstream_failed": False}
+
+            async def _settle():
+                # MUST run even on a mid-stream client disconnect (GeneratorExit /
+                # CancelledError are BaseException, so callers put this in
+                # `finally`). `done` is set only AFTER the settle COMMITS, so a
+                # cancellation mid-commit still lets the `finally` reschedule it —
+                # otherwise the receipt could stay pending and be stale-refunded
+                # (free inference). Idempotent via _settle_receipt's state read.
+                if state["done"]:
+                    return None
+                if state["upstream_failed"] or not state["produced"]:
+                    cost = 0  # upstream error / no output delivered: full refund
+                elif _num(state["cost_usd"]) is not None:
+                    cost = _usd_to_credits(state["cost_usd"])
+                else:
+                    # Output WAS delivered but the upstream gave no usable cost:
+                    # charge the pre-reserved BOUNDED WORST case (never the 1-credit
+                    # floor, which would be near-free inference), refund the rest.
+                    cost = worst_credits
+                billed = min(prepaid, cost)
+                actual_usd = (max(_billed_usd(state["cost_usd"], billed), reserved_usd)
+                              if state["cost_usd"] is None
+                              else _billed_usd(state["cost_usd"], billed))
+                change, fcost, sigs = await _settle_receipt(
+                    receipt_id, billed, change_blanks,
+                    reservation_day, reserved_usd, actual_usd)
+                state["done"] = True
+                return {"change": change, "cost": fcost, "signatures": sigs}
+
+            settled = None
+            stream_start = time.monotonic()
             try:
                 async with httpx.AsyncClient(
                     timeout=httpx.Timeout(STREAM_READ_TIMEOUT_S, connect=15.0)) as client:
-                    async with client.stream(
-                        "POST", url, json=body, headers=upstream_headers
-                    ) as r:
-                        async for line in r.aiter_lines():
-                            if line.startswith("data: ") and line[6:] != "[DONE]":
+                    # Bound the header/connect phase by the total budget too: a
+                    # trickling-headers upstream must not outlive the stale sweep.
+                    _req = client.build_request(
+                        "POST", url, json=body, headers=upstream_headers)
+                    try:
+                        r = await asyncio.wait_for(
+                            client.send(_req, stream=True), timeout=MAX_STREAM_TOTAL_SEC)
+                    except Exception:
+                        state["upstream_failed"] = True
+                        r = None
+                    if r is None:
+                        yield "data: " + json.dumps({"error": "upstream unavailable"}) + "\n\n"
+                    else:
+                      try:
+                        if r.status_code != 200:
+                            # Upstream error: full refund (not a min-charge), and
+                            # surface the error to the client as one SSE frame.
+                            # Bound the body read by the remaining total budget so a
+                            # trickling error body can't outlive the stale sweep.
+                            state["upstream_failed"] = True
+                            try:
+                                remaining = max(1.0, MAX_STREAM_TOTAL_SEC
+                                                - (time.monotonic() - stream_start))
+                                err = await asyncio.wait_for(r.aread(), timeout=remaining)
+                            except Exception:
+                                err = b""
+                            try:
+                                emsg = json.loads(err)
+                            except Exception:
+                                emsg = {"error": err.decode("utf-8", "ignore") or "upstream error"}
+                            yield "data: " + json.dumps(emsg) + "\n\n"
+                        else:
+                          _it = r.aiter_lines()
+                          while True:
+                            remaining = MAX_STREAM_TOTAL_SEC - (time.monotonic() - stream_start)
+                            if remaining <= 0:
+                                break  # total ceiling: never outlast the stale sweep
+                            try:
+                                # Per-read wait bounds a trickling upstream that never
+                                # emits a newline (which would else defeat both the
+                                # read timeout and the total-age check).
+                                line = await asyncio.wait_for(
+                                    _it.__anext__(),
+                                    timeout=min(remaining, STREAM_READ_TIMEOUT_S))
+                            except (StopAsyncIteration, asyncio.TimeoutError):
+                                break
+                            if line.startswith("data: "):
+                                if line[6:] == "[DONE]":
+                                    continue  # suppress upstream DONE; we send our
+                                    # own AFTER the change event so clients that
+                                    # stop at [DONE] don't miss the change
                                 try:
                                     chunk = json.loads(line[6:])
+                                except json.JSONDecodeError:
+                                    chunk = None
+                                if isinstance(chunk, dict):
+                                    # Cost extraction and the content scan are
+                                    # INDEPENDENT: a malformed `usage` must never
+                                    # suppress detecting that paid output was
+                                    # delivered (else we'd bill the 1-credit floor
+                                    # for a full response = near-free inference).
                                     usage = chunk.get("usage")
-                                    if usage and usage.get("cost") is not None:
-                                        cost_usd = usage["cost"]
+                                    if isinstance(usage, dict):
+                                        # Normalize at store: a malformed/non-finite
+                                        # cost becomes semantically "missing" (None)
+                                        # so settlement's produced-output branch
+                                        # charges the bounded worst case, never the
+                                        # 1-credit floor (near-free inference).
+                                        _c = _num(usage.get("cost"))
+                                        if _c is not None:
+                                            state["cost_usd"] = _c
                                     for choice in chunk.get("choices") or []:
-                                        delta = choice.get("delta") or {}
+                                        delta = (choice.get("delta")
+                                                 if isinstance(choice, dict) else None) or {}
                                         if (
                                             delta.get("content")
                                             or delta.get("reasoning")
                                             or delta.get("tool_calls")
                                             or delta.get("function_call")
-                                            or choice.get("text")
+                                            or delta.get("audio")  # defense: audio
+                                            or (isinstance(choice, dict) and choice.get("text"))
                                         ):
-                                            produced_output = True
-                                except (json.JSONDecodeError, AttributeError):
-                                    pass
-                            yield line + "\n"
+                                            state["produced"] = True
+                                yield line + "\n"
+                            elif line.startswith("event:"):
+                                continue  # never relay upstream SSE event lines
+                                # (defends against a spoofed x-cash-change event)
+                            else:
+                                yield line + "\n"  # keep-alive comments / blanks
+                      finally:
+                        await r.aclose()
+                # Clean completion: settle, deliver change as the final event,
+                # THEN emit our own [DONE] so a client that stops at [DONE] has
+                # already seen the change.
+                settled = await _settle()
+                if settled:
+                    yield ("event: x-cash-change\ndata: "
+                           + json.dumps(settled) + "\n\n")
+                yield "data: [DONE]\n\n"
             finally:
-                cost = (
-                    prepaid
-                    if cost_usd is None and produced_output
-                    else _usd_to_credits(cost_usd)
-                )
-                billed = min(prepaid, cost)
-                # A disconnect after output keeps the full prepay; this can
-                # over-charge on a network flake, but avoids free inference.
-                await _finalize(receipt_id, billed)
-                await _reconcile_spend(
-                    reservation_day,
-                    reserved_usd,
-                    max(_billed_usd(cost_usd, billed), reserved_usd)
-                    if cost_usd is None
-                    else _billed_usd(cost_usd, billed),
-                )
+                # Covers disconnect/cancel/upstream-error: always finalize the
+                # spend (billed), so no path leaves a burned token unfinalized
+                # (which the stale sweep would later refund => free inference).
+                # Run detached so it completes even though THIS task is being
+                # cancelled; _settle is idempotent via state["done"]. The client
+                # recovers the cached change via X-Cash-Recover.
+                if not state["done"]:
+                    asyncio.ensure_future(_settle())
 
-        return StreamingResponse(
-            gen(),
-            media_type="text/event-stream",
-            headers={"X-Change-Receipt": receipt_id},
-        )
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    async def _refund(status: int, body_obj: dict):
+        # Any failure AFTER the spend -> full refund, delivered in-band on the
+        # same response (never a bare error, which would strand the tokens).
+        change, cost, sigs = await _settle_receipt(
+            receipt_id, 0, change_blanks, reservation_day, reserved_usd, 0.0)
+        return JSONResponse(body_obj, status_code=status,
+                            headers={"X-Cash-Change": _b64_change(change, cost, sigs)})
 
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            r = await client.post(url, json=body, headers=upstream_headers)
+        # Total wall-clock ceiling (not just httpx's per-read inactivity timeout):
+        # a trickling upstream must not outlive RECEIPT_STALE_SEC, or the sweep
+        # would finalize this receipt and the settle below would race it.
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+            r = await asyncio.wait_for(
+                client.post(url, json=body, headers=upstream_headers),
+                timeout=MAX_STREAM_TOTAL_SEC)
     except Exception:
-        await _finalize(receipt_id, 0)
-        await _reconcile_spend(reservation_day, reserved_usd, 0.0)
-        raise
+        return await _refund(502, {"error": "upstream request failed or timed out"})
     if r.status_code != 200:
-        await _finalize(receipt_id, 0)  # upstream failed: full refund via change
-        await _reconcile_spend(reservation_day, reserved_usd, 0.0)
-        return JSONResponse(
-            r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": r.text},
-            status_code=r.status_code,
-            headers={"X-Change-Receipt": receipt_id},
-        )
-    data = r.json()
-    cost_usd = (data.get("usage") or {}).get("cost")
-    cost = min(prepaid, _usd_to_credits(cost_usd))
-    await _finalize(receipt_id, cost)
-    actual_usd = _billed_usd(cost_usd, cost)
-    if cost_usd is None:
-        actual_usd = max(actual_usd, reserved_usd)
-    await _reconcile_spend(reservation_day, reserved_usd, actual_usd)
+        try:
+            body_obj = (r.json() if r.headers.get("content-type", "").startswith("application/json")
+                        else {"error": r.text})
+        except Exception:
+            body_obj = {"error": "upstream error"}
+        return await _refund(r.status_code, body_obj)
+    try:
+        data = r.json()
+        if not isinstance(data, dict):
+            raise ValueError("upstream body is not an object")
+        usage = data.get("usage")
+        cost_usd = usage.get("cost") if isinstance(usage, dict) else None
+    except Exception:
+        # Malformed 200 body AFTER the spend (non-JSON, non-object, or a
+        # wrong-typed `usage`): refund rather than 500 (a bare 500 here would
+        # leave the receipt pending and strand the client's tokens).
+        return await _refund(502, {"error": "malformed upstream response"})
+    if _num(cost_usd) is not None:
+        cost = min(prepaid, _usd_to_credits(cost_usd))
+        actual_usd = _billed_usd(cost_usd, cost)
+    else:
+        # A 200 delivered output but the cost is unknown/malformed: charge the
+        # pre-reserved BOUNDED WORST case (never the 1-credit floor => near-free),
+        # refund the over-prepay. `worst_credits` is the up-front cost bound.
+        cost = min(prepaid, worst_credits)
+        actual_usd = max(_billed_usd(None, cost), reserved_usd)
+    change, fcost, sigs = await _settle_receipt(
+        receipt_id, cost, change_blanks, reservation_day, reserved_usd, actual_usd)
     return JSONResponse(
         data,
-        headers={"X-Change-Receipt": receipt_id, "X-Cost-Credits": str(cost)},
+        headers={"X-Cost-Credits": str(fcost),
+                 "X-Cash-Change": _b64_change(change, fcost, sigs)},
     )

@@ -48,19 +48,16 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
               default_model: str = "openai/gpt-4o-mini") -> None:
     import os
     lock = threading.Lock()
-    # Auto-refill so an agent never stalls: when spendable ecash drops below the
-    # low-water mark, silently claim more from the deposited account balance.
-    refill_low = int(os.environ.get("ANON_REFILL_LOW", "4000"))
-    refill_amt = int(os.environ.get("ANON_REFILL_AMOUNT", "100000"))
-
-    def _refill_if_low():
+    # Balance-less funding (privacy): we do NOT claim ecash on-demand right before
+    # a spend — that just-in-time claim is a deterministic claim->spend marker the
+    # router can use to re-link usage to the funded account. Instead we drain the
+    # ENTIRE account balance into ecash ONCE, here at startup, decoupled from any
+    # individual request. When ecash runs out the user funds + claims again (a
+    # deliberate event, not one triggered by a spend).
+    def _claim_all_at_startup():
         try:
-            if wallet.balance() >= refill_low or not wallet.account:
-                return
-            acct_bal = wallet.account_status().get("balance", 0)
-            if acct_bal > 0:
-                wallet.claim_from_account(wallet.account["api_key"],
-                                          min(acct_bal, refill_amt))
+            if wallet.account and wallet.account_status().get("balance", 0) > 0:
+                wallet.claim_all()
         except Exception:
             pass  # best-effort; a truly empty wallet still returns a clear 402
 
@@ -83,6 +80,8 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
             wallet.new_account()
         except Exception:
             pass
+    # Drain any already-funded account balance into ecash once, up front.
+    _claim_all_at_startup()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -141,7 +140,6 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                       if k in ("temperature", "top_p", "max_tokens", "stop", "n")}
             try:
                 with lock:  # serialize ecash spends (wallet mutates on spend)
-                    _refill_if_low()  # keep the agent from stalling
                     reply, _settle = wallet.chat(messages, model=model, stream=False, **kwargs)
             except RuntimeError as e:
                 # insufficient ecash — tell the user how to top up
@@ -168,7 +166,6 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
                 msgs, model = oreq.pop("messages"), oreq.pop("model")
                 try:
                     with lock:
-                        _refill_if_low()
                         reply, _ = wallet.chat(msgs, model=model, stream=False, **oreq)
                 except RuntimeError as e:
                     return self._json(402, {"type": "error", "error": {
@@ -188,7 +185,6 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
             oreq["stream_options"] = {"include_usage": True}
             try:
                 with lock:
-                    _refill_if_low()
                     resp = wallet.open_stream(oreq)
             except RuntimeError as e:
                 return self._json(402, {"type": "error", "error": {
@@ -201,19 +197,36 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
+            # Peel the trailing in-band change event out of the upstream SSE so it
+            # never reaches the Anthropic client, then settle the ecash change.
+            change_holder = {}
+
+            def _lines():
+                for line in resp.iter_lines():
+                    s = line.strip() if isinstance(line, str) else line.decode(errors="ignore").strip()
+                    if s == "event: x-cash-change":
+                        change_holder["seen"] = True
+                        continue
+                    if change_holder.get("seen") and s.startswith("data: "):
+                        try:
+                            change_holder["payload"] = json.loads(s[6:])
+                        except Exception:
+                            pass
+                        change_holder["seen"] = False
+                        continue
+                    yield line
+
             try:
-                for sse in ap.stream_anthropic(resp.iter_lines(), model_out):
+                for sse in ap.stream_anthropic(_lines(), model_out):
                     self.wfile.write(sse.encode())
                     self.wfile.flush()
             finally:
-                receipt = resp.headers.get("X-Change-Receipt")
                 resp.close()
-                if receipt:
-                    with lock:
-                        try:
-                            wallet.redeem_change(receipt)
-                        except Exception:
-                            pass
+                with lock:
+                    try:
+                        wallet.finish_stream(change_holder.get("payload"))
+                    except Exception:
+                        pass
 
         def _stream(self, reply: dict):
             """Emit the completion as OpenAI-compatible SSE (one content chunk +
@@ -252,11 +265,11 @@ def run_proxy(wallet, host: str, port: int, daemon_key: str = "",
     print(f"      export ANTHROPIC_BASE_URL={base}", flush=True)
     print("      export ANTHROPIC_API_KEY=anon-router      # any non-empty value", flush=True)
     print("      claude              # every request now pays private ecash", flush=True)
-    print(f"  spendable ecash: {bal}   ·   account (auto-claimed as needed): {acct_bal}",
-          flush=True)
-    if bal + acct_bal < refill_low:
-        print("  low/empty balance — fund it once, then it auto-tops-up:", flush=True)
-        print("      anon-router deposit 0.001 --key <yourkey.json>", flush=True)
+    print(f"  spendable ecash: {bal}   (drained from the account at startup)", flush=True)
+    if bal == 0:
+        print("  empty wallet — fund once, then it's all claimed to ecash up front:", flush=True)
+        print("      anon-router redeem <voucher>      # or: deposit 0.001 --key <key.json>",
+              flush=True)
     print("  the provider sees only the router — never who paid. Ctrl-C to stop.\n", flush=True)
     try:
         srv.serve_forever()
