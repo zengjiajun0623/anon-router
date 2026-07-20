@@ -93,12 +93,16 @@ class Wallet:
             abi=[{"inputs": [{"name": "keyHash", "type": "bytes32"}],
                   "name": "deposit", "outputs": [], "stateMutability": "payable",
                   "type": "function"}])
+        # Bump gas above the current estimate with a floor so the tx gets mined
+        # promptly even when the RPC reports a very low quiet-period gas price
+        # (a too-low price can leave the tx pending indefinitely on Sepolia).
+        gas_price = max(int(w3.eth.gas_price * 1.5), w3.to_wei(2, "gwei"))
         tx = vault_c.functions.deposit(bytes.fromhex(kh[2:])).build_transaction({
             "from": signer.address, "value": w3.to_wei(eth, "ether"),
             "nonce": w3.eth.get_transaction_count(signer.address, "pending"),
-            "gas": 100000, "gasPrice": w3.eth.gas_price})
+            "gas": 100000, "gasPrice": gas_price})
         txh = w3.eth.send_raw_transaction(signer.sign_transaction(tx).raw_transaction)
-        rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=240)
+        rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=420)
         h = txh.hex()
         tx_str = h if h.startswith("0x") else "0x" + h
         if rcpt.status != 1:
