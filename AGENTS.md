@@ -5,8 +5,15 @@ no card, unlinkable) via anon-router, run these steps. Everything is
 non-interactive and safe to script.
 
 ## 1. Install
+Needs Python 3.10+. A virtualenv is the always-works path (macOS often has no bare `pip`):
 ```bash
+python3 -m venv anon-router-env && source anon-router-env/bin/activate
 pip install git+https://github.com/zengjiajun0623/anon-router.git   # PyPI package coming
+```
+Or one global command with pipx/uv (no venv to activate):
+```bash
+uv tool install git+https://github.com/zengjiajun0623/anon-router.git
+# or: pipx install git+https://github.com/zengjiajun0623/anon-router.git
 ```
 This adds an `anon-router` command. It targets the hosted router by default — no
 config needed. (Override with `ANON_ROUTER_URL` only for a self-hosted router.)

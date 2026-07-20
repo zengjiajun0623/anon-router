@@ -58,9 +58,18 @@
     server would see the link, which is exactly what we remove. So there's a thin local relay.</p>
 
   <h2>1 · Install</h2>
-  <pre>pip install git+https://github.com/zengjiajun0623/anon-router.git</pre>
-  <p class="note">Installs the <code class="inl">anon-router</code> CLI from source. (A published
-    <code class="inl">pip install anon-router</code> is coming.)</p>
+  <p>Needs Python 3.10+. Installs the <code class="inl">anon-router</code> CLI from source
+    (a published <code class="inl">pip install anon-router</code> is coming). A virtualenv is the
+    always-works path — macOS often has no bare <code class="inl">pip</code>:</p>
+  <pre>python3 -m venv anon-router-env
+source anon-router-env/bin/activate
+pip install git+https://github.com/zengjiajun0623/anon-router.git</pre>
+  <p class="note">Prefer one global command instead? With
+    <a href="https://pipx.pypa.io" target="_blank" rel="noopener">pipx</a> or
+    <a href="https://docs.astral.sh/uv" target="_blank" rel="noopener">uv</a>:
+    <code class="inl">pipx install git+https://github.com/zengjiajun0623/anon-router.git</code>
+    or <code class="inl">uv tool install git+https://github.com/zengjiajun0623/anon-router.git</code> —
+    both put <code class="inl">anon-router</code> on your PATH with no venv to activate.</p>
 
   <h2>2 · Get credits</h2>
   <p><strong>Option A — voucher</strong> (no crypto). Redeeming mints ecash straight into your wallet,
