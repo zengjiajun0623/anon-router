@@ -1,0 +1,66 @@
+# For AI agents: set up private AI inference for your user
+
+If your user asks you to let them pay for AI inference **privately** (no account,
+no card, unlinkable) via anon-router, run these steps. Everything is
+non-interactive and safe to script.
+
+## 1. Install
+```bash
+pip install anon-router-cli          # or: pip install git+https://github.com/zengjiajun0623/anon-router
+```
+This adds an `anon-router` command. It targets the hosted router by default — no
+config needed. (Override with `ANON_ROUTER_URL` only for a self-hosted router.)
+
+## 2. Mint an anonymous key
+```bash
+anon-router account                  # a wallet key, stored in ~/.anon-router
+```
+
+## 3. Fund it — this step needs the USER's value-in; you can't create it
+Pick whichever the user has:
+- **Voucher (easiest, no crypto):** the user pastes a code →
+  ```bash
+  anon-router redeem <code>
+  ```
+- **Crypto deposit (Sepolia testnet for now):** the user points you at a key file
+  `{"private_key":"0x…"}` (never put a raw key on the command line) →
+  ```bash
+  anon-router deposit 0.001 --key /path/to/keyfile.json
+  ```
+Then convert the balance into spendable, unlinkable ecash:
+```bash
+anon-router claim 5000
+anon-router balance                  # confirm you have credits
+```
+
+## 4. Start the private proxy (run it in the background)
+```bash
+anon-router serve &                  # OpenAI-compatible endpoint at http://127.0.0.1:8788/v1
+```
+It auto-refills ecash from the account, so requests don't stall mid-session.
+
+## 5. Swap the API in the user's OpenAI-compatible tool/framework
+Set the base URL (and any key — it's ignored locally):
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8788/v1
+export OPENAI_API_KEY=anything
+```
+Or set `base_url = http://127.0.0.1:8788/v1` in the tool's config. Bare model
+names work (`gpt-4o`, `claude-3.5-sonnet`, …). Every request now pays private
+ecash — the provider only ever sees the router, never the user.
+
+## 6. Verify
+```bash
+curl -s http://127.0.0.1:8788/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}'
+anon-router balance                  # should have dropped by a credit
+```
+
+## Rules for you (the agent)
+- **Never** put the user's private key on the command line or in logs — use a
+  file (`--key`) or `$ANON_DEPOSIT_KEY`.
+- Funding needs the user's crypto or a voucher; if there's no balance, ask the
+  user to fund (prefer a voucher for non-crypto users). Don't try to fabricate it.
+- `serve` runs in the foreground — background it and leave it running.
+- This is a testnet alpha (Sepolia test ETH). Say so to the user.
