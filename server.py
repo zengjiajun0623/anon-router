@@ -316,6 +316,33 @@ def config():
     }
 
 
+@app.post("/mint/claim")
+async def mint_claim(request: Request):
+    """Convert a deposited account balance into unlinkable ecash. The depositor
+    proves ownership with the api_key (its keyHash was named in the deposit),
+    submits blinded outputs, and the mint blind-signs them. Spending those
+    tokens (X-Cash lane) is cryptographically unlinkable to this deposit — this
+    is the payment-private path (funding is linkable; use is not)."""
+    auth = request.headers.get("Authorization", "")
+    key = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+    bal = _account_balance(key)
+    if bal is None:
+        raise HTTPException(401, "unknown API key")
+    outputs = _parse_outputs(await request.json())
+    total = sum(int(o["amount"]) for o in outputs)
+    if total > bal:
+        raise HTTPException(402, f"claim {total} exceeds balance {bal}")
+    # debit first, then sign (so a crash can't double-issue)
+    cur = db.execute(
+        "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
+        (total, key, total),
+    )
+    db.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(409, "balance changed, retry")
+    return {"signatures": _sign_outputs(outputs)}
+
+
 @app.get("/channel/params")
 def channel_params():
     """Everything a client needs to open a confetti channel."""

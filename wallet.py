@@ -45,7 +45,8 @@ class Wallet:
     def balance(self) -> int:
         return sum(t["amount"] for t in self.tokens)
 
-    def _request_signatures(self, endpoint: str, amount: int) -> list[dict]:
+    def _request_signatures(self, endpoint: str, amount: int,
+                            headers: dict | None = None) -> list[dict]:
         """Blind fresh secrets for `amount`, post to endpoint, unblind, store."""
         blinds = []
         for denom in decompose(amount):
@@ -55,6 +56,7 @@ class Wallet:
         resp = self.http.post(
             f"{self.url}{endpoint}",
             json={"outputs": [{"amount": b["amount"], "B_": b["B_"]} for b in blinds]},
+            headers=headers or {},
         )
         resp.raise_for_status()
         pubkeys = self.keys()["pubkeys"]
@@ -68,6 +70,14 @@ class Wallet:
 
     def topup(self, credits: int) -> int:
         self._request_signatures("/mint/topup", credits)
+        return self.balance()
+
+    def claim_from_account(self, api_key: str, amount: int) -> int:
+        """Convert `amount` of a deposited account balance into unlinkable ecash
+        tokens held in this wallet. Spending them later is unlinkable to the
+        on-chain deposit that funded the account."""
+        self._request_signatures("/mint/claim", amount,
+                                  headers={"Authorization": f"Bearer {api_key}"})
         return self.balance()
 
     def redeem_voucher(self, code: str) -> int:

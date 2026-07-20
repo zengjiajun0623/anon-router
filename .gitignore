@@ -14,3 +14,4 @@ verity/
 contracts/lib/sp1-contracts/
 research/m4b-groth16/target/
 research/phase0-bench/
+.sepolia-deployer.json
