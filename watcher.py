@@ -56,15 +56,23 @@ _FINALITY_DEPTH_ENV = os.environ.get("FINALITY_DEPTH")
 # Persist the scan cursor so a restart resumes and never misses a deposit.
 CURSOR = os.environ.get("WATCHER_CURSOR", os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".watcher_cursor"))
+# ALL watcher state must share the cursor's (persistent) directory — on a hosted
+# deploy that is the mounted volume. The reorg ledger and halt flag previously
+# defaulted to the ephemeral app dir and vanished on redeploy, losing deep-reorg
+# safety state; deriving them from the cursor keeps everything durable together.
+_DATA_DIR = os.path.dirname(os.path.abspath(CURSOR)) or "."
 # Local ledger of credited-but-not-yet-final deposits, used for deep-reorg
 # reconciliation. JSONL of {event_id, key_hash, credits, block_number,
 # block_hash, ts}; pruned once a deposit is FINALITY_DEPTH deep.
-CREDITED_LEDGER = os.environ.get("WATCHER_CREDITED", os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".watcher_credited"))
+CREDITED_LEDGER = os.environ.get("WATCHER_CREDITED",
+                                 os.path.join(_DATA_DIR, ".watcher_credited"))
 # Presence of this file means an orphaned credit was detected: the watcher will
 # not credit or scan until an operator reconciles and removes the file.
-HALT_FILE = os.environ.get("WATCHER_HALT", os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".watcher_halt"))
+HALT_FILE = os.environ.get("WATCHER_HALT", os.path.join(_DATA_DIR, ".watcher_halt"))
+# Liveness heartbeat: rewritten every successful poll so the router's /healthz
+# can tell whether the watcher is alive and how far behind the chain head it is.
+HEARTBEAT = os.environ.get("WATCHER_HEARTBEAT",
+                           os.path.join(_DATA_DIR, ".watcher_heartbeat"))
 
 
 def _chain_defaults(chain_id):
@@ -101,6 +109,18 @@ def _load_cursor(default):
         return int(open(CURSOR).read().strip())
     except (FileNotFoundError, ValueError):
         return default
+
+
+def _write_heartbeat(head, from_block):
+    """Record that the watcher just polled successfully: {ts, head, from_block,
+    lag}. Best-effort — a heartbeat write failure must never stop crediting."""
+    try:
+        _atomic_write(HEARTBEAT, json.dumps({
+            "ts": int(time.time()), "head": int(head),
+            "from_block": int(from_block), "lag": int(head) - int(from_block),
+        }))
+    except Exception:
+        pass
 
 
 def _save_cursor(block):
@@ -253,6 +273,7 @@ def main():
             halted_logged = False
 
             head = w3.eth.block_number
+            _write_heartbeat(head, from_block)  # liveness for /healthz
             # 1. reconcile already-credited deposits against the canonical chain.
             orphans, verified, pruned = _reconcile(
                 w3, credited, head, finality_depth)

@@ -72,6 +72,9 @@ MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "2000000"))
 # within the ~300s upstream timeout); only such receipts are auto-refunded, so
 # recovery never touches another worker's in-flight request.
 RECEIPT_STALE_SEC = int(os.environ.get("RECEIPT_STALE_SEC", "900"))
+# Bound streaming upstream calls: a stream idle this long (no new tokens) is cut,
+# so a hung/malicious upstream can't hold a router connection open forever.
+STREAM_READ_TIMEOUT_S = float(os.environ.get("STREAM_READ_TIMEOUT_S", "120"))
 
 if DEV_FAUCET and urlparse(UPSTREAM).hostname not in {"localhost", "127.0.0.1"}:
     message = "REFUSING TO START: DEV_FAUCET requires a localhost upstream"
@@ -209,6 +212,32 @@ CREDITS_PER_ETH = int(os.environ.get("CREDITS_PER_ETH", "10000000"))  # 1 ETH ->
 VAULT_ADDRESS = os.environ.get("VAULT_ADDRESS", "")
 CONFETTI_ADDRESS = os.environ.get("CONFETTI_ADDRESS", "")  # on-chain escrow (M4b)
 CHAIN_RPC = os.environ.get("CHAIN_RPC", "http://127.0.0.1:8545")
+# Deposit-watcher supervision: the watcher writes a heartbeat every poll; a stale
+# one means deposits are silently NOT being credited. /healthz surfaces this.
+WATCHER_HEARTBEAT = os.environ.get("WATCHER_HEARTBEAT", "")
+WATCHER_HALT = os.environ.get("WATCHER_HALT", "")
+WATCHER_MAX_LAG_S = int(os.environ.get("WATCHER_MAX_LAG_S", "120"))
+
+
+def _watcher_status():
+    """Liveness of the deposit watcher for /healthz, or None if no on-chain
+    deposit lane is configured. `ok` is False when the heartbeat is stale (dead/
+    lagging watcher) or a reorg halt is latched — both mean deposits aren't being
+    credited and need operator attention."""
+    if not VAULT_ADDRESS:
+        return None
+    halted = bool(WATCHER_HALT and os.path.exists(WATCHER_HALT))
+    s = {"configured": True, "alive": False, "halted": halted, "age_s": None}
+    try:
+        hb = json.load(open(WATCHER_HEARTBEAT))
+        s["age_s"] = int(time.time()) - int(hb.get("ts", 0))
+        s["head"], s["lag"] = hb.get("head"), hb.get("lag")
+        s["alive"] = s["age_s"] <= WATCHER_MAX_LAG_S
+    except Exception:
+        pass  # no/unreadable heartbeat -> not alive
+    s["ok"] = s["alive"] and not halted
+    return s
+
 
 app = FastAPI(title="anon-router")
 
@@ -545,12 +574,20 @@ def keys():
 
 @app.get("/healthz")
 def healthz():
-    return {
+    out = {
         "status": "ok",
         "faucet": DEV_FAUCET,
         "channel_lane": CHANNEL_LANE_ENABLED,
         "daily_cap_usd": DAILY_USD_CAP,
     }
+    watcher = _watcher_status()
+    if watcher is not None:
+        out["watcher"] = watcher
+        # Router itself is serving (existing balances + ecash still work), but
+        # flag deposit-crediting as degraded so monitoring can alert.
+        if not watcher["ok"]:
+            out["degraded"] = "deposit watcher stale or halted"
+    return out
 
 
 @app.post("/mint/topup")
@@ -920,7 +957,8 @@ async def chat(request: Request):
         if body.get("stream"):
 
             async def gen_free():
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(STREAM_READ_TIMEOUT_S, connect=15.0)) as client:
                     async with client.stream(
                         "POST", url, json=body, headers=upstream_headers
                     ) as r:
@@ -1097,7 +1135,8 @@ async def chat(request: Request):
             cost_usd = None
             produced_output = False
             try:
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(STREAM_READ_TIMEOUT_S, connect=15.0)) as client:
                     async with client.stream(
                         "POST", url, json=body, headers=upstream_headers
                     ) as r:

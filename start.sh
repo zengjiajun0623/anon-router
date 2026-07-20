@@ -20,11 +20,18 @@ if [ "${TOR_ONION:-0}" = "1" ] && command -v tor >/dev/null 2>&1; then
   ( sleep 15; [ -f /data/tor_hs/hostname ] && echo "start: ONION ADDRESS = $(cat /data/tor_hs/hostname)" ) &
 fi
 
+# All watcher state (cursor, reorg ledger, halt flag, heartbeat) lives on the
+# persistent /data volume; the router reads the heartbeat + halt flag to report
+# deposit-watcher liveness in /healthz.
+export WATCHER_CURSOR="${WATCHER_CURSOR:-/data/.watcher_cursor}"
+export WATCHER_HEARTBEAT="${WATCHER_HEARTBEAT:-/data/.watcher_heartbeat}"
+export WATCHER_HALT="${WATCHER_HALT:-/data/.watcher_halt}"
+
 if [ -n "$VAULT_ADDRESS" ] && [ -n "$CHAIN_RPC" ] && [ -n "$CREDIT_SECRET" ]; then
   echo "start: launching deposit watcher (vault=$VAULT_ADDRESS)"
   RPC="$CHAIN_RPC" VAULT="$VAULT_ADDRESS" ROUTER="http://127.0.0.1:$PORT" \
     CREDIT_SECRET="$CREDIT_SECRET" CREDITS_PER_ETH="${CREDITS_PER_ETH:-10000000}" \
-    CONFIRMATIONS="${CONFIRMATIONS:-3}" WATCHER_CURSOR="${WATCHER_CURSOR:-/data/.watcher_cursor}" \
+    CONFIRMATIONS="${CONFIRMATIONS:-3}" \
     python watcher.py &
 else
   echo "start: no vault/rpc/credit-secret configured — watcher disabled (ecash claim + free lane only)"
