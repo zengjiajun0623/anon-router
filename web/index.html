@@ -116,13 +116,9 @@
           <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
           <option value="local/qwen3:8b">local/qwen3:8b (free)</option>
         </select>
-        <select id="paymode">
-          <option value="ecash" selected>Pay: private ecash</option>
-          <option value="bearer">Pay: bearer key</option>
-        </select>
       </div>
-      <div class="note" style="margin:0 0 12px">Ecash spends can't be linked to your deposit.
-        Bearer-key spends are all tied to one key.</div>
+      <div class="note" style="margin:0 0 12px">Private by default: your spends can't be linked to
+        your deposit.</div>
       <div class="chat">
         <div class="log" id="log"></div>
         <div class="composer">
@@ -213,7 +209,7 @@ async function mintKeys() {
   return keys;
 }
 
-const payMode = () => document.getElementById('paymode').value;
+const payMode = () => 'ecash';  // in-browser chat is always private ecash
 
 function renderBalance() {
   const eb = ecashBalance();
@@ -458,7 +454,6 @@ document.getElementById('rotate').onclick = rotate;
 document.getElementById('deposit').onclick = deposit;
 document.getElementById('send').onclick = send;
 document.getElementById('prompt').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
-document.getElementById('paymode').addEventListener('change', renderBalance);
 document.getElementById('ch-open').onclick = channelOpen;
 document.getElementById('ch-close').onclick = channelClose;
 document.getElementById('ch-finalize').onclick = channelFinalize;
