@@ -167,18 +167,79 @@ function renderDepositPreview() {
   el.textContent = raw + ' ETH ≈ $' + usd.toFixed(2) + ' credit';
 }
 
+// The testnet the vault lives on. The router tells us which chain (account.chain_id);
+// default Sepolia. A deposit sent on any other network (e.g. the wallet's default
+// mainnet) never reaches the vault and never credits, so we switch the wallet first.
+const SEPOLIA_ADD_PARAMS = {
+  chainId: '0xaa36a7',  // 11155111
+  chainName: 'Sepolia',
+  nativeCurrency: { name: 'Sepolia Ether', symbol: 'ETH', decimals: 18 },
+  rpcUrls: ['https://ethereum-sepolia-rpc.publicnode.com', 'https://rpc.sepolia.org'],
+  blockExplorerUrls: ['https://sepolia.etherscan.io'],
+};
+
+function wantChainHex() {
+  const id = (account && account.chain_id) || 11155111;
+  return '0x' + Number(id).toString(16);
+}
+
+// Convert an ETH decimal string to a wei BigInt WITHOUT floating point (parseFloat
+// * 1e18 overflows JS's 2^53 safe-integer range for amounts >= ~0.009 ETH, sending
+// a wrong value). Returns null on invalid input.
+function ethToWei(s) {
+  s = String(s == null ? '' : s).trim();
+  if (!/^\d*\.?\d*$/.test(s) || s === '' || s === '.') return null;
+  const [whole, frac = ''] = s.split('.');
+  const fracPadded = (frac + '0'.repeat(18)).slice(0, 18);
+  const wei = BigInt(whole || '0') * (10n ** 18n) + BigInt(fracPadded || '0');
+  return wei > 0n ? wei : null;
+}
+
+// Make the wallet point at the vault's chain (Sepolia), adding it if the wallet
+// doesn't know it yet. Runs on the deposit click (a user gesture), so the wallet
+// is allowed to prompt.
+async function ensureChain() {
+  const want = wantChainHex();
+  let current;
+  try { current = await window.ethereum.request({ method: 'eth_chainId' }); } catch (e) { /* older wallets */ }
+  if (current && String(current).toLowerCase() === want.toLowerCase()) return;
+  try {
+    await window.ethereum.request({
+      method: 'wallet_switchEthereumChain', params: [{ chainId: want }],
+    });
+  } catch (err) {
+    // 4902 = the wallet doesn't have this chain yet; add it, which also switches.
+    const code = err && (err.code != null ? err.code
+      : (err.data && err.data.originalError && err.data.originalError.code));
+    if (code === 4902 && want.toLowerCase() === SEPOLIA_ADD_PARAMS.chainId) {
+      await window.ethereum.request({
+        method: 'wallet_addEthereumChain', params: [SEPOLIA_ADD_PARAMS],
+      });
+    } else {
+      throw err;
+    }
+  }
+}
+
 async function deposit() {
   if (!account) return;
   if (!window.ethereum) { alert('No browser wallet found. Install one like MetaMask to deposit.'); return; }
-  const eth = $('amount').value;
-  const wei = BigInt(Math.round(parseFloat(eth) * 1e18));
-  const accts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-  const data = account.deposit_selector + account.key_hash.replace(/^0x/, '');
-  await window.ethereum.request({
-    method: 'eth_sendTransaction',
-    params: [{ from: accts[0], to: account.vault_address, value: '0x' + wei.toString(16), data }],
-  });
-  watchFunding(true);  // wait through mining until this deposit credits + drains
+  const wei = ethToWei($('amount').value);
+  if (wei == null) { alert('Enter a valid ETH amount above 0.'); return; }
+  try {
+    const accts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    await ensureChain();  // switch the wallet to Sepolia BEFORE sending the deposit
+    const data = account.deposit_selector + account.key_hash.replace(/^0x/, '');
+    await window.ethereum.request({
+      method: 'eth_sendTransaction',
+      params: [{ from: accts[0], to: account.vault_address, value: '0x' + wei.toString(16), data }],
+    });
+    watchFunding(true);  // wait through mining until this deposit credits + drains
+  } catch (err) {
+    // user rejected the connect / network switch / tx, or the switch failed
+    const msg = (err && err.message) ? err.message : 'cancelled';
+    alert('Deposit not sent: ' + msg);
+  }
 }
 
 // ---- chat ----

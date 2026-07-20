@@ -253,6 +253,9 @@ CREDITS_PER_ETH = int(os.environ.get("CREDITS_PER_ETH", "10000000"))  # 1 ETH ->
 VAULT_ADDRESS = os.environ.get("VAULT_ADDRESS", "")
 CONFETTI_ADDRESS = os.environ.get("CONFETTI_ADDRESS", "")  # on-chain escrow (M4b)
 CHAIN_RPC = os.environ.get("CHAIN_RPC", "http://127.0.0.1:8545")
+# The chain the vault lives on + the browser wallet must switch to before depositing.
+# Default Sepolia (11155111); override for other testnets/mainnet.
+CHAIN_ID = int(os.environ.get("CHAIN_ID", "11155111"))
 # Deposit-watcher supervision: the watcher writes a heartbeat every poll; a stale
 # one means deposits are silently NOT being credited. /healthz surfaces this.
 WATCHER_HEARTBEAT = os.environ.get("WATCHER_HEARTBEAT", "")
@@ -921,6 +924,7 @@ async def account_new(request: Request):
         "api_key": api_key,
         "key_hash": kh,
         "vault_address": VAULT_ADDRESS,
+        "chain_id": CHAIN_ID,
         "deposit_selector": "0x" + Web3.keccak(text="deposit(bytes32)").hex()[:8],
         "credits_per_eth": CREDITS_PER_ETH,
         "credit_usd": CREDIT_USD,
@@ -989,6 +993,7 @@ def config():
 
     return {
         "vault_address": VAULT_ADDRESS,
+        "chain_id": CHAIN_ID,
         "confetti_address": CONFETTI_ADDRESS,
         "router_pk_B": bob.pk_B.hex(),
         "credits_per_eth": CREDITS_PER_ETH,
