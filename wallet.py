@@ -1,4 +1,6 @@
 """Client wallet: holds blind-signed tokens, pays per request, redeems change."""
+from __future__ import annotations  # PEP 563: keep `X | None` hints lazy so the
+# client runs on Python 3.9 (older laptops), not just 3.10+.
 import base64
 import json
 import os

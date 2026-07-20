@@ -8,6 +8,7 @@
 """
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -124,6 +125,11 @@ def main() -> int:
     cho.add_argument("credits", type=int)
     chs.add_parser("status")
 
+    sv = sub.add_parser("serve", help="run a thin OpenAI-compatible prover daemon "
+                        "(point any app at http://host:port/v1)")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8788)
+
     m = sub.add_parser("models")
     m.add_argument("--search", default=None)
 
@@ -177,6 +183,12 @@ def main() -> int:
             s = w.channel_status()
             print(f"deposit {s['deposit']} · spent {s['spent']} · "
                   f"remaining {s['remaining']} · payments {s['payments']}")
+    elif args.cmd == "serve":
+        import uvicorn
+        os.environ.setdefault("ANON_ROUTER_URL", w.url)
+        print(f"prover daemon → router {w.url}\n"
+              f"point any OpenAI app at http://{args.host}:{args.port}/v1", file=sys.stderr)
+        uvicorn.run("serve:app", host=args.host, port=args.port, log_level="warning")
     elif args.cmd == "models":
         data = w.http.get(f"{w.url}/v1/models").json()["data"]
         for entry in data:
