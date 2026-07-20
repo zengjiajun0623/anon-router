@@ -217,15 +217,9 @@ function renderBalance() {
   const bal = document.getElementById('balance');
   const usd = document.getElementById('usd');
   const side = document.getElementById('bal-side');
-  if (payMode() === 'ecash') {
-    bal.textContent = (eb * cu).toFixed(2);
-    usd.textContent = ' private ecash';
-    side.textContent = lastAcctBal > 0 ? 'Claiming your deposit into private ecash…' : '';
-  } else {
-    bal.textContent = (lastAcctBal * cu).toFixed(2);
-    usd.textContent = ' on key';
-    side.textContent = '';
-  }
+  bal.textContent = (eb * cu).toFixed(2);
+  usd.textContent = '';
+  side.textContent = lastAcctBal > 0 ? 'Claiming your deposit…' : '';
 }
 
 async function mint() {

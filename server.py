@@ -169,7 +169,7 @@ async def privacy_headers(request: Request, call_next):
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
         "style-src 'self' 'unsafe-inline'; script-src 'self' "
-        "'sha256-gl0NN/sDIVdygHTkcwDmIGiVuwTSkoDH1J+S//kilyA='"
+        "'sha256-gkyHUsRdzdPu6KtWzlGmD+4VazcOqAZeFwmXlLvwU9A='"
     )
     return response  # Server header suppressed via uvicorn --no-server-header
 
