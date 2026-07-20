@@ -1,0 +1,16 @@
+{
+  "_comment": "M4b R_pay genesis-branch program fixture. The vkey and publicValues below are REAL, computed on this machine: the guest was executed over the reference-generated witness (fixture.json), accepted it (106,110 cycles), and committed exactly these 128 bytes; `client.setup(ELF)` produced this program vkey. The Groth16 `proof` field is null because the final gnark wrap step OOM-killed inside the 11.65GiB colima VM on this 16GB Mac (see research/m4b-real-groth16.md, blocker). Generating the real proof needs a >=32GB host or the Succinct prover network. The on-chain verification path (SP1VerifierGroth16 + SP1PayVerifier forwarding) is proven separately in contracts/test/SP1PayVerifier.t.sol against SP1's real published Groth16 proof (contracts/test/fixtures/sp1-canonical-groth16.json).",
+  "program": "confetti-rpay-program (R_pay, genesis branch)",
+  "vkey": "0x000be6d3dd1da7bbf5f2884fe2ce6d76a4d579877e8a958dad915c4381ec2cc6",
+  "publicValuesSchema": "abi.encode(uint256 delta, bytes32 N_i, bytes32 C_i, bytes32 root)",
+  "publicValues": "0x00000000000000000000000000000000000000000000000000000000000003e819b4c0bd0770d9a37b35018c9ba54e4a8553ebdfba0357c1bce21849842d06a83f311d313e14afbc2efd21030dfe4627c30e7576df7452f0d44140a2b8c015466088f461c4f8c507608b6a40487efdaac8d2f4f124d3571690e287de647ead1f",
+  "publicValuesDecoded": {
+    "delta": 1000,
+    "N_i": "0x19b4c0bd0770d9a37b35018c9ba54e4a8553ebdfba0357c1bce21849842d06a8",
+    "C_i": "0x3f311d313e14afbc2efd21030dfe4627c30e7576df7452f0d44140a2b8c01546",
+    "root": "0x6088f461c4f8c507608b6a40487efdaac8d2f4f124d3571690e287de647ead1f"
+  },
+  "guestCycles": 106110,
+  "proof": null,
+  "proofBlocker": "gnark Groth16 wrap OOM in colima VM (11.65GiB) on 16GB host; see research/m4b-real-groth16.md"
+}
