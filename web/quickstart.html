@@ -78,6 +78,10 @@ pip install git+https://github.com/zengjiajun0623/anon-router.git</pre>
   <p><strong>Option B — deposit</strong> Sepolia test ETH from a funding key file (never paste a raw key
     on the command line):</p>
   <pre>anon-router deposit 0.05 --key wallet.json</pre>
+  <p class="note">Need Sepolia test ETH? Get it free from a faucet
+    (<a href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia" target="_blank" rel="noopener">Google Cloud</a>
+    or <a href="https://sepolia-faucet.pk910.de" target="_blank" rel="noopener">pk910 PoW faucet</a>),
+    sent to your funding wallet's address.</p>
 
   <h2>3 · Claim to ecash <span class="muted">(deposit only)</span></h2>
   <p>If you deposited, drain your whole balance into ecash tokens in one step. <span class="muted">Voucher
@@ -128,6 +132,8 @@ claude              <span class="c"># every request now pays private ecash</span
   <p>Use provider-prefixed IDs like <code class="inl">openai/gpt-4o-mini</code> or
     <code class="inl">anthropic/claude-3.5-sonnet</code>. Bare names (<code class="inl">gpt-4o-mini</code>)
     are mapped for you. <code class="inl">local/*</code> models are free.</p>
+  <p class="note">Billing is 1 credit = $0.0001, with a 1-credit minimum per request, so very cheap
+    calls (tiny models) round up. Fine for a testnet; real per-token pricing is a mainnet concern.</p>
 
   <h2>What's private, honestly</h2>
   <p class="note">Spends are cryptographically unlinkable to your deposit (blind signatures), and the model

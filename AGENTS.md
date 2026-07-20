@@ -25,18 +25,19 @@ anon-router account                  # a wallet key, stored in ~/.anon-router
 
 ## 3. Fund it — this step needs the USER's value-in; you can't create it
 Pick whichever the user has:
-- **Voucher (easiest, no crypto):** the user pastes a code →
+- **Voucher (easiest, no crypto):** the user pastes a code. This mints spendable
+  ecash DIRECTLY — no `account`, no `claim`, go straight to step 4:
   ```bash
   anon-router redeem <code>
   ```
 - **Crypto deposit (Sepolia testnet for now):** the user points you at a key file
-  `{"private_key":"0x…"}` (never put a raw key on the command line) →
+  `{"private_key":"0x…"}` (never put a raw key on the command line), then drains
+  the whole credited balance into unlinkable ecash in one step:
   ```bash
   anon-router deposit 0.001 --key /path/to/keyfile.json
+  anon-router claim                  # deposit path only; no amount = full balance
   ```
-Then convert the balance into spendable, unlinkable ecash:
 ```bash
-anon-router claim 5000
 anon-router balance                  # confirm you have credits
 ```
 
@@ -44,7 +45,9 @@ anon-router balance                  # confirm you have credits
 ```bash
 anon-router serve &                  # OpenAI-compatible endpoint at http://127.0.0.1:8788/v1
 ```
-It auto-refills ecash from the account, so requests don't stall mid-session.
+It claims ecash once at startup. If the wallet runs out mid-session, fund again
+(redeem/deposit+claim) and RESTART the proxy — it does not refill on its own (a
+per-request claim would let the router re-link your usage).
 
 ## 5. Swap the API in the user's OpenAI-compatible tool/framework
 Set the base URL (and any key — it's ignored locally):

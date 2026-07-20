@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 
+import httpx
+
 from wallet import Wallet
 
 
@@ -95,7 +97,7 @@ def channel_repl(w: Wallet, model: str) -> int:
     return 0
 
 
-def main() -> int:
+def _run() -> int:
     p = argparse.ArgumentParser(prog="anon-router")
     p.add_argument("--url", default=None, help="router URL (default env/localhost)")
     p.add_argument("--tor", action="store_true",
@@ -316,6 +318,22 @@ def main() -> int:
                 continue
             print(entry["id"])
     return 0
+
+
+def main() -> int:
+    """Entry point: run a command, turning expected failures into clean one-line
+    messages instead of dumping a Python traceback at a first-time user."""
+    try:
+        return _run()
+    except KeyboardInterrupt:
+        return 130
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except (httpx.HTTPError, httpx.TransportError) as e:
+        print(f"error: could not reach the router ({e.__class__.__name__}). "
+              f"Check your connection, or pass --url <router>.", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
