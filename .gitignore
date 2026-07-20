@@ -15,3 +15,11 @@ contracts/lib/sp1-contracts/
 research/m4b-groth16/target/
 research/phase0-bench/
 .sepolia-deployer.json
+.watcher_cursor
+state.db.anvil.bak
+
+# build artifacts — never commit (purged from history 2026-07-19)
+**/target/
+**/.lake/
+*.rlib
+*.rmeta

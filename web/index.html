@@ -104,10 +104,12 @@
         </div>
         <div class="bal"><span id="balance">0</span> <small>credits</small>
           <small id="usd"></small></div>
+        <div class="note" id="bal-side" style="margin-top:2px"></div>
         <div class="kv" style="margin-top:12px"><span class="k">Vault</span>
           <span class="v mono" id="vault"></span></div>
         <div class="note" id="dep-note">Sends ETH to the vault referencing your key hash;
-          the router credits you within a couple of seconds. No wallet? Send ETH to the vault
+          the router credits you within a couple of seconds. Credited deposits are auto-claimed
+          into private ecash held by this browser. No wallet? Send ETH to the vault
           with your key hash as calldata.</div>
       </div>
     </div>
@@ -121,7 +123,13 @@
           <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
           <option value="local/qwen3:8b">local/qwen3:8b (free)</option>
         </select>
+        <select id="paymode">
+          <option value="ecash" selected>Pay: private ecash</option>
+          <option value="bearer">Pay: bearer key</option>
+        </select>
       </div>
+      <div class="note" style="margin:0 0 12px">Ecash spends can't be linked to your deposit.
+        Bearer-key spends are all tied to one key.</div>
       <div class="chat">
         <div class="log" id="log"></div>
         <div class="composer">
@@ -175,7 +183,7 @@
       <h2>What's private, honestly</h2>
       <div class="kv"><span class="k">No account, no card, no cookies</span><span class="v">✓ today</span></div>
       <div class="kv"><span class="k">The model provider can't see who you are</span><span class="v">✓ it only sees the router</span></div>
-      <div class="kv"><span class="k">Your payments can't be linked to each other</span><span class="v">✓ channel &amp; ecash lanes</span></div>
+      <div class="kv"><span class="k">Your payments can't be linked to each other</span><span class="v">✓ ecash in this page, channel via CLI</span></div>
       <div class="kv"><span class="k">The router still sees your IP &amp; prompt</span><span class="v muted">use Tor/proxy; onion service planned</span></div>
       <div class="kv"><span class="k">Deposit funding origin</span><span class="v muted">pseudonymous; shielded funding planned</span></div>
       <div class="note">MVP posture: removing the account/card is the biggest privacy gain, and it's
@@ -190,8 +198,48 @@
   </div>
 </div>
 
-<script>
+<script type="module">
+import * as ecash from '/ecash.js';
+
 let account = null;
+let keys = null;         // /mint/keys payload (denomination pubkeys etc.)
+let claiming = false;
+let lastAcctBal = 0;
+let polling = false;
+
+// ---- ecash wallet: blind-signed tokens held in this browser ----
+const WALLET_KEY = 'anon-router-ecash-v1';
+const PENDING_CLAIM_KEY = 'anon-router-pending-claim-v1';
+const PENDING_CHANGE_KEY = 'anon-router-pending-change-v1';
+const loadWallet = () => { try { return JSON.parse(localStorage.getItem(WALLET_KEY)) || []; } catch (e) { return []; } };
+const saveWallet = t => localStorage.setItem(WALLET_KEY, JSON.stringify(t));
+const ecashBalance = () => loadWallet().reduce((s, t) => s + t.amount, 0);
+
+async function mintKeys() {
+  if (!keys) keys = await (await fetch('/mint/keys')).json();
+  return keys;
+}
+
+const payMode = () => document.getElementById('paymode').value;
+
+function renderBalance() {
+  const eb = ecashBalance();
+  const cu = keys ? keys.credit_usd : 0.0001;
+  const bal = document.getElementById('balance');
+  const usd = document.getElementById('usd');
+  const side = document.getElementById('bal-side');
+  if (payMode() === 'ecash') {
+    bal.textContent = eb.toLocaleString();
+    usd.textContent = '· $' + (eb * cu).toFixed(2) + ' in ecash';
+    side.textContent = lastAcctBal > 0
+      ? 'On key, claiming into ecash: ' + lastAcctBal.toLocaleString() + ' credits'
+      : (eb > 0 ? 'Held as blind-signed tokens in this browser (localStorage).' : '');
+  } else {
+    bal.textContent = lastAcctBal.toLocaleString();
+    usd.textContent = '· $' + (lastAcctBal * cu).toFixed(2) + ' on key';
+    side.textContent = eb > 0 ? 'Ecash in this browser: ' + eb.toLocaleString() + ' credits' : '';
+  }
+}
 
 async function mint() {
   const r = await fetch('/account/new', {method: 'POST'});
@@ -203,17 +251,48 @@ async function mint() {
   document.getElementById('deposit-locked').classList.add('hidden');
   document.getElementById('deposit-body').classList.remove('hidden');
   document.getElementById('vault').textContent = account.vault_address || '(set VAULT_ADDRESS)';
-  pollBalance();
+  if (!polling) { polling = true; pollBalance(); }
+}
+
+async function claimToEcash(balance) {
+  claiming = true;
+  try {
+    const k = await mintKeys();
+    let pending = null;
+    try { pending = JSON.parse(localStorage.getItem(PENDING_CLAIM_KEY)); } catch (e) {}
+    if (pending && pending.keyHash !== account.key_hash) {
+      throw new Error('a pending ecash claim belongs to a different session key');
+    }
+    if (!pending) {
+      pending = {
+        idempotencyKey: crypto.randomUUID(),
+        keyHash: account.key_hash,
+        blinds: await ecash.prepareMint(balance),
+      };
+      localStorage.setItem(PENDING_CLAIM_KEY, JSON.stringify(pending));
+    }
+    const minted = await ecash.submitMint('', '/mint/claim', pending.blinds, {
+      Authorization: 'Bearer ' + account.api_key,
+      'Idempotency-Key': pending.idempotencyKey,
+    }, k.pubkeys);
+    saveWallet(loadWallet().concat(minted));
+    localStorage.removeItem(PENDING_CLAIM_KEY);
+    lastAcctBal = 0;
+  } finally { claiming = false; }
 }
 
 async function pollBalance() {
-  if (!account) return;
-  try {
-    const r = await fetch('/account/status', {headers: {Authorization: 'Bearer ' + account.api_key}});
-    const d = await r.json();
-    document.getElementById('balance').textContent = d.balance.toLocaleString();
-    document.getElementById('usd').textContent = '· $' + (d.usd).toFixed(2);
-  } catch (e) {}
+  if (account) {
+    try {
+      const r = await fetch('/account/status', {headers: {Authorization: 'Bearer ' + account.api_key}});
+      const d = await r.json();
+      lastAcctBal = d.balance;
+      if (payMode() === 'ecash' && (lastAcctBal > 0 || localStorage.getItem(PENDING_CLAIM_KEY)) && !claiming) {
+        await claimToEcash(lastAcctBal);
+      }
+    } catch (e) {}
+  }
+  renderBalance();
   setTimeout(pollBalance, 2500);
 }
 
@@ -239,25 +318,62 @@ function add(role, text) {
   return el;
 }
 
+async function redeemPendingChange() {
+  const receipt = localStorage.getItem(PENDING_CHANGE_KEY);
+  if (!receipt) return;
+  const k = await mintKeys();
+  const settle = await ecash.redeemChange('', receipt, k.pubkeys);
+  if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
+  localStorage.removeItem(PENDING_CHANGE_KEY);
+}
+
 async function send() {
   const input = document.getElementById('prompt');
   const text = input.value.trim();
   if (!text) return;
-  if (!account) { alert('Get a key first.'); return; }
+  const model = document.getElementById('model').value;
+  const free = model.startsWith('local/');   // local lane is free, no payment
+  const mode = payMode();
+  if (!free && mode === 'bearer' && !account) { alert('Get a key first.'); return; }
   input.value = '';
   add('user', text);
   const pending = add('assistant', '…');
+  const headers = {'Content-Type': 'application/json'};
+  let spent = null;   // ecash tokens attached to this request
+  let r = null;
+  let requestStarted = false;
   try {
-    const r = await fetch('/v1/chat/completions', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + account.api_key},
-      body: JSON.stringify({model: document.getElementById('model').value,
-        messages: [{role: 'user', content: text}]}),
+    if (!free) {
+      if (mode === 'ecash') {
+        await redeemPendingChange();
+        const k = await mintKeys();
+        const sel = ecash.selectTokens(loadWallet(), Math.max(2000, k.min_prepay));
+        spent = sel.spend;
+        saveWallet(sel.keep);
+        renderBalance();
+        headers['X-Cash'] = ecash.encodeCash(sel.spend);
+      } else {
+        headers['Authorization'] = 'Bearer ' + account.api_key;
+      }
+    }
+    requestStarted = true;
+    r = await fetch('/v1/chat/completions', {
+      method: 'POST', headers,
+      body: JSON.stringify({model, messages: [{role: 'user', content: text}]}),
     });
+    const receipt = r.headers.get('X-Change-Receipt');
+    if (receipt) localStorage.setItem(PENDING_CHANGE_KEY, receipt);
     const d = await r.json();
-    if (!r.ok) { pending.textContent = '⚠ ' + (d.detail || JSON.stringify(d)); return; }
-    pending.textContent = d.choices?.[0]?.message?.content || '(no content)';
-  } catch (e) { pending.textContent = '⚠ ' + e.message; }
+    if (!r.ok) pending.textContent = '⚠ ' + (d.detail || JSON.stringify(d));
+    else pending.textContent = d.choices?.[0]?.message?.content || '(no content)';
+    if (receipt) {
+      await redeemPendingChange();
+    }
+  } catch (e) {
+    if (spent && !requestStarted) saveWallet(loadWallet().concat(spent));
+    pending.textContent = '⚠ ' + e.message;
+  }
+  renderBalance();
 }
 
 // ---- trust-minimized lane (on-chain escrow) ----
@@ -343,8 +459,8 @@ async function rotate() {
   const r = await fetch('/account/new', {method: 'POST'});
   account = await r.json();
   document.getElementById('apikey').textContent = account.api_key;
-  document.getElementById('ch-note') && null;
-  document.getElementById('balance').textContent = '0';
+  lastAcctBal = 0;
+  renderBalance();   // ecash carries over: tokens are the browser's, not the key's
 }
 
 document.getElementById('mint').onclick = mint;
@@ -352,11 +468,13 @@ document.getElementById('rotate').onclick = rotate;
 document.getElementById('deposit').onclick = deposit;
 document.getElementById('send').onclick = send;
 document.getElementById('prompt').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+document.getElementById('paymode').addEventListener('change', renderBalance);
 document.getElementById('ch-open').onclick = channelOpen;
 document.getElementById('ch-close').onclick = channelClose;
 document.getElementById('ch-finalize').onclick = channelFinalize;
 document.getElementById('ch-withdraw').onclick = channelWithdraw;
 loadConfig();
+mintKeys().then(redeemPendingChange).then(renderBalance).catch(() => renderBalance());
 </script>
 </body>
 </html>

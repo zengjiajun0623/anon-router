@@ -6,7 +6,6 @@ Polls `Deposited(keyHash, amount, from)` events and calls the router's internal
   RPC=http://127.0.0.1:8545 VAULT=0x... ROUTER=http://127.0.0.1:8402 \
   CREDIT_SECRET=... CREDITS_PER_ETH=10000000 python watcher.py
 """
-import json
 import os
 import time
 
@@ -19,7 +18,10 @@ ROUTER = os.environ.get("ROUTER", "http://127.0.0.1:8402").rstrip("/")
 CREDIT_SECRET = os.environ["CREDIT_SECRET"]
 CREDITS_PER_ETH = int(os.environ.get("CREDITS_PER_ETH", "10000000"))
 POLL = float(os.environ.get("POLL_SECONDS", "2"))
-CONFIRMATIONS = int(os.environ.get("CONFIRMATIONS", "2"))  # blocks to wait (reorg safety)
+CONFIRMATIONS = int(os.environ.get("CONFIRMATIONS", "3"))  # blocks to wait (reorg safety)
+# NOTE: a reorg deeper than CONFIRMATIONS that orphans an already-credited
+# deposit is not reconciled (the credit is not reversed). Acceptable for
+# testnet; mainnet should raise CONFIRMATIONS and/or add orphan reconciliation.
 # Persist the scan cursor so a restart resumes and never misses a deposit.
 CURSOR = os.environ.get("WATCHER_CURSOR", os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".watcher_cursor"))
@@ -33,8 +35,14 @@ def _load_cursor(default):
 
 
 def _save_cursor(block):
-    with open(CURSOR, "w") as f:
+    # atomic: write a temp file then rename, so a crash mid-write can't leave a
+    # truncated cursor that would reset the scan to chain head (losing deposits).
+    tmp = CURSOR + ".tmp"
+    with open(tmp, "w") as f:
         f.write(str(block))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CURSOR)
 
 ABI = [{
     "anonymous": False,
@@ -61,18 +69,33 @@ def main():
             if safe >= from_block:
                 logs = vault.events.Deposited().get_logs(
                     from_block=from_block, to_block=safe)
+                # Only advance the cursor if EVERY credit in this range is
+                # durably handled. A transient failure must NOT advance the
+                # cursor (else the deposit is skipped forever). Credits are
+                # idempotent (seen keyed on txhash+logIndex), so replay is safe.
+                advanced = True
                 for ev in logs:
                     kh = "0x" + ev["args"]["keyHash"].hex()
                     credits = ev["args"]["amount"] * CREDITS_PER_ETH // 10**18
                     txhash = ev["transactionHash"].hex()
-                    resp = http.post(
-                        f"{ROUTER}/account/credit",
-                        headers={"X-Credit-Secret": CREDIT_SECRET},
-                        json={"key_hash": kh, "credits": credits, "txhash": txhash},
-                    )
-                    print(f"  credited {credits} to {kh[:14]}.. ({resp.json().get('status')})")
-                from_block = safe + 1
-                _save_cursor(from_block)
+                    try:
+                        resp = http.post(
+                            f"{ROUTER}/account/credit",
+                            headers={"X-Credit-Secret": CREDIT_SECRET},
+                            json={"key_hash": kh, "credits": credits,
+                                  "txhash": txhash, "log_index": ev["logIndex"]},
+                        )
+                        resp.raise_for_status()
+                        status = resp.json().get("status")
+                    except Exception as e:
+                        # transient (network/5xx): stop, retry this range next poll
+                        print(f"  credit failed ({e}); will retry range from {from_block}")
+                        advanced = False
+                        break
+                    print(f"  credited {credits} to {kh[:14]}.. ({status})")
+                if advanced:
+                    from_block = safe + 1
+                    _save_cursor(from_block)
         except Exception as e:  # keep the watcher alive across transient RPC errors
             print(f"  watcher error: {e}")
         time.sleep(POLL)

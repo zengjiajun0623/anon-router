@@ -13,14 +13,14 @@ Trust properties this delivers off-chain already:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from .chain import (ChannelRecord, new_cid, new_rand, new_secret, null_first,
                     null_next, open_commit, state_commit)
 from .merkle import Registry
 from .relation import (ClearWitnessProver, GenesisBranch, SignedBranch,
-                       Statement, Witness, check_R_pay)
+                       Statement, Witness)
 from .wots import Xmss, XmssSignature, xmss_verify
 
 

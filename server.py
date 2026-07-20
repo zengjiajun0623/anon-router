@@ -7,6 +7,7 @@ change via a one-time receipt.
 Run: uvicorn server:app --host 127.0.0.1 --port 8402
 """
 import base64
+import hmac
 import json
 import math
 import os
@@ -101,6 +102,11 @@ db.execute(
 db.execute(
     "CREATE TABLE IF NOT EXISTS seen_deposits(txhash TEXT PRIMARY KEY)"
 )
+# Idempotent claim records: a lost/retried claim returns the cached signatures
+# instead of debiting the account a second time.
+db.execute(
+    "CREATE TABLE IF NOT EXISTS claims(idem_key TEXT PRIMARY KEY, response TEXT)"
+)
 db.commit()
 
 # Simple custodial lane: deposit ETH -> credits on a bearer API key. This is the
@@ -124,6 +130,11 @@ async def privacy_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' "
+        "'sha256-SrteR7B7LoW9Ra6HFR0AkZ3kOrmm+3KwEQ68++w9B2M='"
+    )
     return response  # Server header suppressed via uvicorn --no-server-header
 
 
@@ -131,6 +142,15 @@ async def privacy_headers(request: Request, call_next):
 def index():
     from fastapi.responses import FileResponse
     return FileResponse(os.path.join(ROOT, "web", "index.html"))
+
+
+@app.get("/ecash.js")
+def ecash_js():
+    """In-browser BDHKE wallet module (same-origin; no CDN loads)."""
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        os.path.join(ROOT, "web", "ecash.js"), media_type="text/javascript"
+    )
 
 
 @app.get("/privacy")
@@ -270,21 +290,26 @@ async def account_credit(request: Request):
     """Internal: the deposit watcher credits an account for an on-chain deposit.
     Guarded by CREDIT_SECRET so only the watcher can call it."""
     secret = os.environ.get("CREDIT_SECRET", "")
-    if not secret or request.headers.get("X-Credit-Secret") != secret:
+    if not secret or not hmac.compare_digest(
+        request.headers.get("X-Credit-Secret", ""), secret
+    ):
         raise HTTPException(403, "forbidden")
     body = await request.json()
     kh, credits, txhash = body["key_hash"], int(body["credits"]), body["txhash"]
+    # dedup per LOG, not per tx: one tx can emit several Deposited events
+    event_id = f"{txhash}:{body.get('log_index', 0)}"
     cur = db.cursor()
-    try:
-        cur.execute("INSERT INTO seen_deposits(txhash) VALUES (?)", (txhash,))
-    except sqlite3.IntegrityError:
-        return {"status": "already_credited"}  # idempotent per tx
+    if cur.execute("SELECT 1 FROM seen_deposits WHERE txhash=?", (event_id,)).fetchone():
+        return {"status": "already_credited"}  # idempotent per deposit event
     cur.execute(
         "UPDATE accounts SET balance=balance+? WHERE key_hash=?", (credits, kh)
     )
-    db.commit()
     if cur.rowcount == 0:
+        db.rollback()
+        # do NOT mark seen: the account may be created later and re-scanned
         return {"status": "no_such_account"}
+    cur.execute("INSERT INTO seen_deposits(txhash) VALUES (?)", (event_id,))
+    db.commit()
     return {"status": "credited", "credits": credits}
 
 
@@ -298,7 +323,6 @@ def config():
         return "0x" + Web3.keccak(text=sig).hex()[:8]
 
     return {
-        "rpc": CHAIN_RPC,
         "vault_address": VAULT_ADDRESS,
         "confetti_address": CONFETTI_ADDRESS,
         "router_pk_B": bob.pk_B.hex(),
@@ -328,19 +352,59 @@ async def mint_claim(request: Request):
     bal = _account_balance(key)
     if bal is None:
         raise HTTPException(401, "unknown API key")
-    outputs = _parse_outputs(await request.json())
-    total = sum(int(o["amount"]) for o in outputs)
-    if total > bal:
-        raise HTTPException(402, f"claim {total} exceeds balance {bal}")
-    # debit first, then sign (so a crash can't double-issue)
-    cur = db.execute(
-        "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
-        (total, key, total),
-    )
-    db.commit()
-    if cur.rowcount == 0:
-        raise HTTPException(409, "balance changed, retry")
-    return {"signatures": _sign_outputs(outputs)}
+
+    # Idempotency: a client retrying a claim (lost response, timeout) sends the
+    # same Idempotency-Key and gets the cached signatures back, never a second
+    # debit. Keyed under the account so one key can't replay another's claim.
+    idem = request.headers.get("Idempotency-Key")
+    idem_key = f"{_key_hash(key)}:{idem}" if idem else None
+    if idem_key:
+        try:
+            db.execute(
+                "INSERT INTO claims(idem_key, response) VALUES (?, '')", (idem_key,)
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            db.rollback()
+            row = db.execute(
+                "SELECT response FROM claims WHERE idem_key=?", (idem_key,)
+            ).fetchone()
+            if row and row[0]:
+                return json.loads(row[0])
+            raise HTTPException(409, "claim with this Idempotency-Key is in progress")
+
+    try:
+        outputs = _parse_outputs(await request.json())
+        total = sum(int(o["amount"]) for o in outputs)
+        if total > bal:
+            raise HTTPException(402, f"claim {total} exceeds balance {bal}")
+
+        # Signing is pure, so failures happen before the debit. The debit and
+        # completed idempotency response are then committed atomically.
+        signatures = _sign_outputs(outputs)
+        cur = db.execute(
+            "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
+            (total, key, total),
+        )
+        if cur.rowcount == 0:
+            db.rollback()
+            raise HTTPException(409, "balance changed, retry")
+        response = {"signatures": signatures}
+        if idem_key:
+            db.execute(
+                "UPDATE claims SET response=? WHERE idem_key=?",
+                (json.dumps(response), idem_key),
+            )
+        db.commit()
+        return response
+    except Exception:
+        db.rollback()
+        if idem_key:
+            db.execute(
+                "DELETE FROM claims WHERE idem_key=? AND response=''", (idem_key,)
+            )
+            db.commit()
+        raise
 
 
 @app.get("/channel/params")
@@ -431,20 +495,29 @@ async def redeem_change(receipt_id: str, request: Request):
     prepaid, cost, state = row
     if state == "pending":
         raise HTTPException(409, "request still in flight, retry shortly")
-    if state == "redeemed":
-        raise HTTPException(400, "receipt already redeemed")
+    if state != "final":
+        raise HTTPException(409, "already redeemed or not final")
     change = max(0, prepaid - cost)
     if change == 0:
-        db.execute("UPDATE receipts SET state='redeemed' WHERE id=?", (receipt_id,))
+        cur = db.execute(
+            "UPDATE receipts SET state='redeemed' WHERE id=? AND state='final'",
+            (receipt_id,),
+        )
         db.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(409, "already redeemed or not final")
         return {"change": 0, "cost": cost, "signatures": []}
     outputs = _parse_outputs(await request.json())
     if sum(int(o["amount"]) for o in outputs) != change:
         raise HTTPException(400, f"outputs must sum to change of {change} credits")
-    signatures = _sign_outputs(outputs)
-    db.execute("UPDATE receipts SET state='redeemed' WHERE id=?", (receipt_id,))
+    cur = db.execute(
+        "UPDATE receipts SET state='redeemed' WHERE id=? AND state='final'",
+        (receipt_id,),
+    )
     db.commit()
-    return {"change": change, "cost": cost, "signatures": signatures}
+    if cur.rowcount == 0:
+        raise HTTPException(409, "already redeemed or not final")
+    return {"change": change, "cost": cost, "signatures": _sign_outputs(outputs)}
 
 
 @app.get("/v1/models")

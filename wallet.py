@@ -53,11 +53,18 @@ class Wallet:
             secret = secrets.token_hex(32)
             blinded_hex, r = blind(secret)
             blinds.append({"amount": denom, "secret": secret, "r": r, "B_": blinded_hex})
-        resp = self.http.post(
-            f"{self.url}{endpoint}",
-            json={"outputs": [{"amount": b["amount"], "B_": b["B_"]} for b in blinds]},
-            headers=headers or {},
-        )
+        body = {"outputs": [{"amount": b["amount"], "B_": b["B_"]} for b in blinds]}
+        # Stable idempotency key + one retry: if the response is lost in transit,
+        # the retry returns the same signatures rather than debiting twice.
+        hdrs = dict(headers or {})
+        hdrs.setdefault("Idempotency-Key", secrets.token_hex(16))
+        for attempt in range(2):
+            try:
+                resp = self.http.post(f"{self.url}{endpoint}", json=body, headers=hdrs)
+                break
+            except httpx.TransportError:
+                if attempt == 1:
+                    raise
         resp.raise_for_status()
         pubkeys = self.keys()["pubkeys"]
         minted = []
