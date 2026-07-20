@@ -109,6 +109,37 @@ def test_honest_close_cannot_be_challenged():
     assert c.settle(alice.cid, now=20) == (300, 700)
 
 
+def test_unsigned_close_balance_bound_to_proof():
+    # Review BUG 1: an unsigned close must settle on the proof-bound balance and
+    # exhibit set, not caller-chosen values. Alice pays 300 honestly, then does
+    # an unsigned close on that state; the referee must record bal=300 and the
+    # real exhibit nullifiers (so Bob's later challenge evidence still collides).
+    c, bob, alice = setup()
+    alice.pay(c, bob, 300)
+    m, pending = alice.build_payment(0)   # extend the tip with a 0-delta payment
+    st = Statement(m.delta, m.N_i, m.C_i, c.root())
+    c.close_unsigned(alice.cid, st, m.pi, now=10)
+    cr = c.closes[alice.cid]
+    assert cr.bal == 300, "settled balance must be the proof-bound balance"
+    assert st.N_i in cr.exhibit and pending.N_next in cr.exhibit
+    assert c.settle(alice.cid, now=20) == (300, 700)
+
+
+def test_signed_branch_requires_correct_chain_secret():
+    # Review BUG 3: a payment whose c doesn't open C_open must be rejected in the
+    # signed branch too (not just genesis).
+    c, bob, alice = setup()
+    alice.pay(c, bob, 100)                 # establishes a signed tip
+    m, pending = alice.build_payment(50)
+    # Corrupt the witness c inside the proof; verification must now fail.
+    import json
+    from confetti.chain import new_secret
+    payload = json.loads(m.pi.decode())
+    payload["c"] = new_secret().hex()
+    st = Statement(m.delta, m.N_i, m.C_i, c.root())
+    assert not alice.prover.verify(st, json.dumps(payload).encode())
+
+
 def test_challenge_after_window_rejected():
     c, bob, alice = setup()
     s1 = _clone(alice.pay(c, bob, 100))

@@ -79,6 +79,8 @@ class Contract:
 
     # open ---------------------------------------------------------------
     def open(self, rec: ChannelRecord) -> int:
+        if rec.cid in self.channels:
+            raise ValueError("cid already opened")  # registry cid-uniqueness (BUG 5)
         self.channels[rec.cid] = rec
         idx = self.registry.add(rec.leaf())
         self._roots.add(self.registry.root())
@@ -99,10 +101,13 @@ class Contract:
         assert state.bal <= rec.D
         self._record_close(cid, "signed", state.bal, {state.N_next}, None, now)
 
-    def close_unsigned(self, cid: bytes, st: Statement, pi: bytes,
-                       bal_x: int, N_next: bytes, N_reveal: bytes, now: int) -> None:
+    def close_unsigned(self, cid: bytes, st: Statement, pi: bytes, now: int) -> None:
         assert self.prover.verify(st, pi), "unsigned close proof invalid"
-        self._record_close(cid, "unsigned", bal_x, {N_reveal, N_next}, st.C_i, now)
+        # The payout balance and exhibit nullifiers are derived from the proof,
+        # never taken from the caller (review BUG 1). N_x is the revealed public
+        # input st.N_i; bal_x and N_{x+1} are bound to C_x by the relation.
+        v = self.prover.close_values(st, pi)
+        self._record_close(cid, "unsigned", v["bal"], {st.N_i, v["n_next"]}, st.C_i, now)
 
     def _record_close(self, cid, mode, bal, exhibit, C_x, now):
         assert cid not in self.closes, "channel already closed"

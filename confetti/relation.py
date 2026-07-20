@@ -78,13 +78,17 @@ def check_R_pay(st: Statement, w: Witness) -> Optional[str]:
     first violated constraint (as a string, for test diagnostics)."""
     leaf = _record_leaf(w.cid, w.D, w.pk_B, w.C_open)
 
+    # Chain-secret binding (Spec §3 constraint 2): the `c` used in the chain
+    # equation must be the one committed at open. Guards BOTH branches — the
+    # signed branch previously left `c` a free witness (review BUG 3).
+    if open_commit(w.c, w.r_open) != w.C_open:
+        return "C_open does not open to committed c"
+
     # 1. Parent branch (flat disjunction, hidden in ZK).
     if isinstance(w.branch, GenesisBranch):
         b = w.branch
         if not verify_membership(st.root, leaf, b.rec_index, b.rec_path):
             return "genesis: channel record not in root"
-        if open_commit(w.c, w.r_open) != w.C_open:
-            return "genesis: C_open does not open to c"
         if w.bal_prev != 0:
             return "genesis: bal_prev != 0"
         if null_first(w.cid, w.c) != st.N_i:
@@ -192,3 +196,15 @@ class ClearWitnessProver:
         except Exception:
             return False
         return check_R_pay(st, w) is None
+
+    def close_values(self, st: Statement, pi: bytes) -> dict:
+        """The proof-bound (bal, N_next) an unsigned close settles on.
+
+        These are what a real R_closeUnsigned circuit would expose as public
+        inputs, constrained to C_x. Deriving them from the verified proof (not
+        from caller arguments) is the fix for the unsigned-close theft (review
+        BUG 1): both are bound to C_i via the output-binding constraint, so a
+        caller cannot claim a lower balance or a bogus exhibit set.
+        """
+        w = _witness_from_j(json.loads(pi.decode()))
+        return {"bal": w.bal_i, "n_next": null_next(st.N_i, w.c)}

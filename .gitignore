@@ -6,3 +6,7 @@ mint_master.hex
 server.log
 .env
 research/phase0-bench/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+anvil.log
