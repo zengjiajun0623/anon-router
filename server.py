@@ -13,6 +13,10 @@ import math
 import os
 import secrets
 import sqlite3
+import threading
+import time
+from collections import deque
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -38,13 +42,23 @@ def _load_env() -> None:
 
 _load_env()
 
-OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+if not OPENROUTER_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY must be set")
 UPSTREAM = os.environ.get("UPSTREAM", "https://openrouter.ai/api/v1")
 CREDIT_USD = float(os.environ.get("CREDIT_USD", "0.0001"))  # 1 credit = $0.0001
 MARKUP = float(os.environ.get("MARKUP", "1.0"))
 MIN_PREPAY = int(os.environ.get("MIN_PREPAY", "500"))  # credits required up front
-DEV_FAUCET = os.environ.get("DEV_FAUCET", "1") == "1"
+DEV_FAUCET = os.environ.get("DEV_FAUCET", "0") == "1"
 FAUCET_MAX = int(os.environ.get("FAUCET_MAX", "500000"))  # per topup call, dev only
+CHANNEL_LANE_ENABLED = os.environ.get("CHANNEL_LANE_ENABLED", "0") == "1"
+DAILY_USD_CAP = float(os.environ.get("DAILY_USD_CAP", "0"))
+ACCOUNT_RATE_PER_MIN = int(os.environ.get("ACCOUNT_RATE_PER_MIN", "120"))
+
+if DEV_FAUCET and urlparse(UPSTREAM).hostname not in {"localhost", "127.0.0.1"}:
+    message = "REFUSING TO START: DEV_FAUCET requires a localhost upstream"
+    print(message)
+    raise RuntimeError(message)
 
 # Model-prefix routing. "local/<model>" strips the prefix and goes to the free
 # lane (3080 Ollama via ssh tunnel); anything else goes to the paid default.
@@ -67,7 +81,7 @@ def resolve_route(model: str) -> tuple[str, str | None, bool, str]:
 
 
 def _master() -> bytes:
-    path = os.path.join(ROOT, "mint_master.hex")
+    path = os.environ.get("MINT_MASTER_PATH", os.path.join(ROOT, "mint_master.hex"))
     if not os.path.exists(path):
         with open(path, "w") as f:
             f.write(secrets.token_bytes(32).hex())
@@ -86,7 +100,10 @@ CHANNEL_PRICE = int(os.environ.get("CHANNEL_PRICE", "50"))
 channel_contract = Contract(tau=int(os.environ.get("CHANNEL_TAU", "7")))
 bob = Recipient(height=int(os.environ.get("CHANNEL_HEIGHT", "12")))
 
-db = sqlite3.connect(os.path.join(ROOT, "state.db"), check_same_thread=False)
+db = sqlite3.connect(
+    os.environ.get("STATE_DB_PATH", os.path.join(ROOT, "state.db")),
+    check_same_thread=False,
+)
 db.execute("CREATE TABLE IF NOT EXISTS spent(secret TEXT PRIMARY KEY)")
 db.execute(
     "CREATE TABLE IF NOT EXISTS receipts("
@@ -107,7 +124,11 @@ db.execute(
 db.execute(
     "CREATE TABLE IF NOT EXISTS claims(idem_key TEXT PRIMARY KEY, response TEXT)"
 )
+db.execute("CREATE TABLE IF NOT EXISTS spend_ledger(day TEXT PRIMARY KEY, usd REAL)")
 db.commit()
+
+account_creations = deque()
+account_rate_lock = threading.Lock()
 
 # Simple custodial lane: deposit ETH -> credits on a bearer API key. This is the
 # "simpler than OpenRouter" front door; the anonymous ecash/channel lanes are
@@ -118,6 +139,16 @@ CONFETTI_ADDRESS = os.environ.get("CONFETTI_ADDRESS", "")  # on-chain escrow (M4
 CHAIN_RPC = os.environ.get("CHAIN_RPC", "http://127.0.0.1:8545")
 
 app = FastAPI(title="anon-router")
+
+
+@app.on_event("startup")
+def log_safety_config():
+    print(
+        "anon-router SAFE config: "
+        f"faucet={'on' if DEV_FAUCET else 'off'} "
+        f"channel_lane={'on' if CHANNEL_LANE_ENABLED else 'off'} "
+        f"daily_cap_usd={DAILY_USD_CAP}"
+    )
 
 
 @app.middleware("http")
@@ -214,6 +245,27 @@ def _finalize(receipt_id: str, cost: int) -> None:
     db.commit()
 
 
+def _check_daily_cap() -> None:
+    if DAILY_USD_CAP <= 0:
+        return
+    row = db.execute(
+        "SELECT usd FROM spend_ledger WHERE day=date('now')"
+    ).fetchone()
+    if row and row[0] >= DAILY_USD_CAP:
+        raise HTTPException(402, "daily budget reached, try later")
+
+
+def _record_spend(cost_usd: float | None) -> None:
+    if cost_usd is None:
+        return
+    db.execute(
+        "INSERT INTO spend_ledger(day, usd) VALUES (date('now'), ?) "
+        "ON CONFLICT(day) DO UPDATE SET usd=usd+excluded.usd",
+        (float(cost_usd),),
+    )
+    db.commit()
+
+
 def _usd_to_credits(cost_usd: float | None) -> int:
     if cost_usd is None:
         return 1  # upstream gave no usage; charge the floor, log for investigation
@@ -227,6 +279,16 @@ def keys():
         "credit_usd": CREDIT_USD,
         "min_prepay": MIN_PREPAY,
         "markup": MARKUP,
+    }
+
+
+@app.get("/healthz")
+def healthz():
+    return {
+        "status": "ok",
+        "faucet": DEV_FAUCET,
+        "channel_lane": CHANNEL_LANE_ENABLED,
+        "daily_cap_usd": DAILY_USD_CAP,
     }
 
 
@@ -251,6 +313,13 @@ def _key_hash(api_key: str) -> str:
 def account_new():
     """Mint a fresh bearer API key. Fund it by depositing ETH to the vault
     referencing its key_hash; the watcher credits it."""
+    now = time.monotonic()
+    with account_rate_lock:
+        while account_creations and account_creations[0] <= now - 60:
+            account_creations.popleft()
+        if len(account_creations) >= ACCOUNT_RATE_PER_MIN:
+            raise HTTPException(429, "account creation rate limit reached")
+        account_creations.append(now)
     api_key = "sk-anon-" + secrets.token_urlsafe(24)
     kh = _key_hash(api_key)
     db.execute(
@@ -421,6 +490,8 @@ def channel_params():
 
 @app.post("/channel/open")
 async def channel_open(request: Request):
+    if not CHANNEL_LANE_ENABLED:
+        raise HTTPException(503, "channel lane disabled (no on-chain escrow wired)")
     body = await request.json()
     try:
         cid = bytes.fromhex(body["cid"])
@@ -576,15 +647,18 @@ async def chat(request: Request):
             raise HTTPException(401, "unknown API key")
         if bal <= 0:
             raise HTTPException(402, "insufficient credits; deposit ETH to top up")
+        _check_daily_cap()
         body["usage"] = {"include": True}
         async with httpx.AsyncClient(timeout=300) as client:
             r = await client.post(url, json=body, headers=upstream_headers)
         if r.status_code != 200:
             return JSONResponse(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": r.text}, status_code=r.status_code)
         data = r.json()
-        cost = _usd_to_credits((data.get("usage") or {}).get("cost"))
+        cost_usd = (data.get("usage") or {}).get("cost")
+        cost = _usd_to_credits(cost_usd)
         db.execute("UPDATE accounts SET balance=balance-? WHERE api_key=?", (cost, key))
         db.commit()
+        _record_spend(cost_usd)
         return JSONResponse(
             data,
             headers={"X-Cost-Credits": str(cost), "X-Balance": str(max(0, bal - cost))},
@@ -592,6 +666,9 @@ async def chat(request: Request):
 
     channel_header = request.headers.get("X-Channel-Payment")
     if channel_header:
+        if not CHANNEL_LANE_ENABLED:
+            raise HTTPException(503, "channel lane disabled (no on-chain escrow wired)")
+        _check_daily_cap()
         try:
             m = payment_from_j(json.loads(base64.b64decode(channel_header)))
         except Exception:
@@ -601,10 +678,14 @@ async def chat(request: Request):
         except ValueError as e:
             raise HTTPException(402, f"channel payment rejected: {e}")
         countersign = base64.b64encode(json.dumps(sig_to_j(sigma)).encode()).decode()
+        body["usage"] = {"include": True}
         async with httpx.AsyncClient(timeout=300) as client:
             r = await client.post(url, json=body, headers=upstream_headers)
+        data = r.json()
+        if r.status_code == 200:
+            _record_spend((data.get("usage") or {}).get("cost"))
         return JSONResponse(
-            r.json(),
+            data,
             status_code=r.status_code,
             headers={"X-Channel-Countersign": countersign,
                      "X-Cost-Credits": str(CHANNEL_PRICE)},
@@ -618,6 +699,7 @@ async def chat(request: Request):
     except Exception:
         raise HTTPException(400, "X-Cash must be base64 JSON token list")
 
+    _check_daily_cap()
     prepaid = _spend(tokens)
     receipt_id = secrets.token_hex(16)
     db.execute(
@@ -632,6 +714,7 @@ async def chat(request: Request):
 
         async def gen():
             cost_usd = None
+            produced_output = False
             try:
                 async with httpx.AsyncClient(timeout=None) as client:
                     async with client.stream(
@@ -640,14 +723,31 @@ async def chat(request: Request):
                         async for line in r.aiter_lines():
                             if line.startswith("data: ") and line[6:] != "[DONE]":
                                 try:
-                                    usage = json.loads(line[6:]).get("usage")
+                                    chunk = json.loads(line[6:])
+                                    usage = chunk.get("usage")
                                     if usage and usage.get("cost") is not None:
                                         cost_usd = usage["cost"]
+                                    for choice in chunk.get("choices") or []:
+                                        delta = choice.get("delta") or {}
+                                        if (
+                                            delta.get("content")
+                                            or delta.get("reasoning")
+                                            or delta.get("tool_calls")
+                                            or delta.get("function_call")
+                                            or choice.get("text")
+                                        ):
+                                            produced_output = True
                                 except (json.JSONDecodeError, AttributeError):
                                     pass
                             yield line + "\n"
             finally:
-                _finalize(receipt_id, min(prepaid, _usd_to_credits(cost_usd)))
+                cost = (
+                    prepaid
+                    if cost_usd is None and produced_output
+                    else _usd_to_credits(cost_usd)
+                )
+                _finalize(receipt_id, min(prepaid, cost))
+                _record_spend(cost_usd)
 
         return StreamingResponse(
             gen(),
@@ -668,6 +768,7 @@ async def chat(request: Request):
     cost_usd = (data.get("usage") or {}).get("cost")
     cost = min(prepaid, _usd_to_credits(cost_usd))
     _finalize(receipt_id, cost)
+    _record_spend(cost_usd)
     return JSONResponse(
         data,
         headers={"X-Change-Receipt": receipt_id, "X-Cost-Credits": str(cost)},
