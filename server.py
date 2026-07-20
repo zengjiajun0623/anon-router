@@ -108,6 +108,8 @@ db.commit()
 # the trust-minimized alternative. CREDITS_PER_ETH sets the exchange rate.
 CREDITS_PER_ETH = int(os.environ.get("CREDITS_PER_ETH", "10000000"))  # 1 ETH -> 10M credits
 VAULT_ADDRESS = os.environ.get("VAULT_ADDRESS", "")
+CONFETTI_ADDRESS = os.environ.get("CONFETTI_ADDRESS", "")  # on-chain escrow (M4b)
+CHAIN_RPC = os.environ.get("CHAIN_RPC", "http://127.0.0.1:8545")
 
 app = FastAPI(title="anon-router")
 
@@ -256,6 +258,34 @@ async def account_credit(request: Request):
     if cur.rowcount == 0:
         return {"status": "no_such_account"}
     return {"status": "credited", "credits": credits}
+
+
+@app.get("/config")
+def config():
+    """Frontend config: on-chain addresses + function selectors (computed
+    server-side so the browser needs no keccak/ABI library)."""
+    from web3 import Web3
+
+    def sel(sig):
+        return "0x" + Web3.keccak(text=sig).hex()[:8]
+
+    return {
+        "rpc": CHAIN_RPC,
+        "vault_address": VAULT_ADDRESS,
+        "confetti_address": CONFETTI_ADDRESS,
+        "router_pk_B": bob.pk_B.hex(),
+        "credits_per_eth": CREDITS_PER_ETH,
+        "channel_price": CHANNEL_PRICE,
+        "selectors": {
+            "vaultDeposit": sel("deposit(bytes32)"),
+            "open": sel("open(bytes16,address,bytes32,bytes32)"),
+            "closeGenesis": sel("closeGenesis(bytes16,bytes32,bytes)"),
+            "finalize": sel("finalize(bytes16)"),
+            "withdraw": sel("withdraw()"),
+            "channels": sel("channels(bytes16)"),
+            "withdrawable": sel("withdrawable(address)"),
+        },
+    }
 
 
 @app.get("/channel/params")

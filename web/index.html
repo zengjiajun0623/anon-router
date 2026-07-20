@@ -129,9 +129,47 @@
     </div>
   </div>
 
+    <!-- TRUST-MINIMIZED LANE -->
+    <div class="card">
+      <h2>Trust-minimized lane <span class="pill">on-chain escrow</span></h2>
+      <p class="muted" style="margin-top:0;font-size:14px">
+        The simple lane above is custodial — we hold your float. This lane doesn't.
+        Your deposit is escrowed in a contract we cannot touch; you can reclaim it
+        unilaterally at any time. A stale/rolled-back close is provably challengeable.
+      </p>
+      <div id="ch-locked" class="muted">No on-chain escrow configured (set CONFETTI_ADDRESS).</div>
+      <div id="ch-body" class="hidden">
+        <div class="row" style="margin-bottom:12px">
+          <input id="ch-amount" type="number" step="0.001" value="0.1" min="0" />
+          <span class="muted" style="white-space:nowrap">ETH</span>
+          <button id="ch-open">Open escrow channel</button>
+        </div>
+        <div id="ch-status" class="hidden">
+          <div class="kv"><span class="k">Escrowed in contract</span>
+            <span class="v mono"><span id="ch-deposit">0</span> ETH</span></div>
+          <div class="kv"><span class="k">Held by</span>
+            <span class="v mono" id="ch-contract"></span></div>
+          <div class="kv"><span class="k">Recipient (router)</span>
+            <span class="v mono" id="ch-recipient"></span></div>
+          <div class="kv"><span class="k">Your exit</span>
+            <span class="v">unilateral — close & withdraw below</span></div>
+          <div class="row" style="margin-top:14px">
+            <button id="ch-close" class="ghost">Close (refund)</button>
+            <button id="ch-finalize" class="ghost" disabled>Finalize</button>
+            <button id="ch-withdraw" class="ghost" disabled>Withdraw</button>
+          </div>
+          <div class="note" id="ch-note">Per-request payments over the channel are unlinkable ZK
+            proofs. In-browser proving is the remaining piece; today the CLI does it
+            (<code>cli.py chat --channel</code>). The escrow + exit shown here are real on-chain
+            transactions you sign.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="foot">
-    Custodial simple lane shown here. The trust-minimized lane (ZK payment channels, deposits
-    escrowed on-chain, unlinkable per-request payments) is the same endpoint with a channel wallet.
+    Testnet demo (local Anvil). The contract's safety core is machine-checked (Lean) and reviewed
+    by three independent models. Nothing is deployed to a public chain.
   </div>
 </div>
 
@@ -205,10 +243,92 @@ async function send() {
   } catch (e) { pending.textContent = '⚠ ' + e.message; }
 }
 
+// ---- trust-minimized lane (on-chain escrow) ----
+let cfg = null, channelCid = null;
+
+const pad32 = h => h.replace(/^0x/, '').padStart(64, '0');           // left-pad (address/uint)
+const padR32 = h => h.replace(/^0x/, '').padEnd(64, '0');            // right-pad (bytesN)
+const rndHex = n => { const a = new Uint8Array(n); crypto.getRandomValues(a);
+  return [...a].map(b => b.toString(16).padStart(2, '0')).join(''); };
+
+async function ethCall(to, data) {
+  return window.ethereum.request({method: 'eth_call', params: [{to, data}, 'latest']});
+}
+async function ethSend(to, data, valueWei) {
+  const accts = await window.ethereum.request({method: 'eth_requestAccounts'});
+  const p = {from: accts[0], to, data};
+  if (valueWei !== undefined) p.value = '0x' + valueWei.toString(16);
+  return window.ethereum.request({method: 'eth_sendTransaction', params: [p]});
+}
+
+async function loadConfig() {
+  cfg = await (await fetch('/config')).json();
+  if (cfg.confetti_address) {
+    document.getElementById('ch-locked').classList.add('hidden');
+    document.getElementById('ch-body').classList.remove('hidden');
+    document.getElementById('ch-contract').textContent = cfg.confetti_address;
+    document.getElementById('ch-recipient').textContent = 'router (' + cfg.router_pk_B.slice(0, 14) + '…)';
+  }
+}
+
+async function channelOpen() {
+  if (!window.ethereum) { alert('No injected wallet found.'); return; }
+  const eth = document.getElementById('ch-amount').value;
+  const wei = BigInt(Math.round(parseFloat(eth) * 1e18));
+  channelCid = '0x' + rndHex(16);                                    // bytes16
+  const pkB = '0x' + cfg.router_pk_B.replace(/^0x/, '');
+  const cOpen = '0x' + rndHex(32);
+  const accts = await window.ethereum.request({method: 'eth_requestAccounts'});
+  // open(bytes16 cid, address bob, bytes32 pkB, bytes32 cOpen)
+  const data = cfg.selectors.open + padR32(channelCid) + pad32(accts[0]) + pad32(pkB) + pad32(cOpen);
+  await ethSend(cfg.confetti_address, data, wei);
+  document.getElementById('ch-status').classList.remove('hidden');
+  document.getElementById('ch-close').disabled = false;
+  pollChannel();
+}
+
+async function pollChannel() {
+  if (!channelCid) return;
+  try {
+    // channels(bytes16) -> (uint256 deposit, ...)
+    const out = await ethCall(cfg.confetti_address, cfg.selectors.channels + padR32(channelCid));
+    const deposit = BigInt('0x' + out.replace(/^0x/, '').slice(0, 64));
+    document.getElementById('ch-deposit').textContent = (Number(deposit) / 1e18).toFixed(4);
+  } catch (e) {}
+  setTimeout(pollChannel, 3000);
+}
+
+async function channelClose() {
+  // closeGenesis(bytes16 cid, bytes32 n1, bytes proof) — full refund path
+  const n1 = '0x' + rndHex(32);
+  const data = cfg.selectors.closeGenesis + padR32(channelCid) + pad32(n1)
+    + pad32('0x60') + pad32('0x0');            // empty bytes proof (offset 0x60, len 0)
+  await ethSend(cfg.confetti_address, data);
+  document.getElementById('ch-note').textContent =
+    'Close submitted. After the challenge window (60s on this testnet), Finalize then Withdraw.';
+  setTimeout(() => { document.getElementById('ch-finalize').disabled = false; }, 62000);
+}
+
+async function channelFinalize() {
+  await ethSend(cfg.confetti_address, cfg.selectors.finalize + padR32(channelCid));
+  document.getElementById('ch-withdraw').disabled = false;
+}
+
+async function channelWithdraw() {
+  await ethSend(cfg.confetti_address, cfg.selectors.withdraw);
+  document.getElementById('ch-note').textContent =
+    'Withdrawn. Your deposit was escrowed on-chain the whole time and returned to you unilaterally.';
+}
+
 document.getElementById('mint').onclick = mint;
 document.getElementById('deposit').onclick = deposit;
 document.getElementById('send').onclick = send;
 document.getElementById('prompt').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+document.getElementById('ch-open').onclick = channelOpen;
+document.getElementById('ch-close').onclick = channelClose;
+document.getElementById('ch-finalize').onclick = channelFinalize;
+document.getElementById('ch-withdraw').onclick = channelWithdraw;
+loadConfig();
 </script>
 </body>
 </html>
