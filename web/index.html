@@ -97,20 +97,26 @@
       <h2>2 · Deposit for credits</h2>
       <div id="deposit-locked" class="muted">Get a key first.</div>
       <div id="deposit-body" class="hidden">
-        <div class="row" style="margin-bottom:12px">
+        <div class="row" style="margin-bottom:8px">
           <input id="amount" type="number" step="0.001" value="0.05" min="0" />
           <span class="muted" style="white-space:nowrap">ETH</span>
           <button id="deposit">Deposit with wallet</button>
         </div>
+        <div class="note" style="margin-bottom:12px">Click Deposit and confirm in your wallet.
+          You are credited in a few seconds, then it is auto-claimed into private ecash you spend
+          below. Needs Sepolia test ETH in your wallet.</div>
         <div class="bal"><span id="balance">0</span> <small>credits</small>
           <small id="usd"></small></div>
         <div class="note" id="bal-side" style="margin-top:2px"></div>
-        <div class="kv" style="margin-top:12px"><span class="k">Vault</span>
-          <span class="v mono" id="vault"></span></div>
-        <div class="note" id="dep-note">Sends ETH to the vault referencing your key hash;
-          the router credits you within a couple of seconds. Credited deposits are auto-claimed
-          into private ecash held by this browser. No wallet? Send ETH to the vault
-          with your key hash as calldata.</div>
+        <details style="margin-top:12px">
+          <summary class="note" style="cursor:pointer">No wallet, or want the details?</summary>
+          <div class="kv" style="margin-top:8px"><span class="k">Vault</span>
+            <span class="v mono" id="vault"></span></div>
+          <div class="note" id="dep-note" style="margin-top:6px">The deposit references your key
+            hash so the router can credit you, then the balance is blind-signed into ecash your
+            browser holds (spends are unlinkable to the deposit). No injected wallet? Send ETH to
+            the vault above with your key hash as calldata.</div>
+        </details>
       </div>
     </div>
 

@@ -252,33 +252,39 @@ async def _finalize(receipt_id: str, cost: int) -> None:
         db.commit()
 
 
-async def _reserve_daily_cap() -> float:
-    if DAILY_USD_CAP <= 0:
-        return 0.0
+async def _reserve_daily_cap() -> tuple[str, float]:
     estimate = max(0.0, MAX_REQUEST_USD)
     async with db_write_lock:
+        day = db.execute("SELECT date('now')").fetchone()[0]
+        if DAILY_USD_CAP <= 0:
+            return day, 0.0
         row = db.execute(
-            "SELECT usd FROM spend_ledger WHERE day=date('now')"
+            "SELECT usd FROM spend_ledger WHERE day=?", (day,)
         ).fetchone()
         today_usd = float(row[0]) if row else 0.0
         if today_usd + estimate > DAILY_USD_CAP:
             raise HTTPException(402, "daily budget reached, try later")
         db.execute(
-            "INSERT INTO spend_ledger(day, usd) VALUES (date('now'), ?) "
+            "INSERT INTO spend_ledger(day, usd) VALUES (?, ?) "
             "ON CONFLICT(day) DO UPDATE SET usd=usd+excluded.usd",
-            (estimate,),
+            (day, estimate),
         )
         db.commit()
-    return estimate
+    return day, estimate
 
 
-async def _reconcile_spend(reserved_usd: float, actual_usd: float) -> None:
+async def _reconcile_spend(day: str, reserved_usd: float, actual_usd: float) -> None:
+    delta = float(actual_usd) - reserved_usd
     async with db_write_lock:
-        db.execute(
-            "INSERT INTO spend_ledger(day, usd) VALUES (date('now'), ?) "
-            "ON CONFLICT(day) DO UPDATE SET usd=usd+excluded.usd",
-            (float(actual_usd) - reserved_usd,),
+        cur = db.execute(
+            "UPDATE spend_ledger SET usd=MAX(0, usd+?) WHERE day=?",
+            (delta, day),
         )
+        if cur.rowcount == 0:
+            db.execute(
+                "INSERT INTO spend_ledger(day, usd) VALUES (?, ?)",
+                (day, max(0.0, delta)),
+            )
         db.commit()
 
 
@@ -330,7 +336,7 @@ def _key_hash(api_key: str) -> str:
 
 
 @app.post("/account/new")
-async def account_new():
+async def account_new(request: Request):
     """Mint a fresh bearer API key. Fund it by depositing ETH to the vault
     referencing its key_hash; the watcher credits it."""
     now = time.monotonic()
@@ -349,6 +355,17 @@ async def account_new():
         )
         db.commit()
     from web3 import Web3
+    public_base_url = os.environ.get("PUBLIC_BASE_URL")
+    if not public_base_url:
+        host = request.headers.get("Host", "127.0.0.1:8402")
+        forwarded_proto = request.headers.get("X-Forwarded-Proto")
+        hostname = urlparse(f"//{host}").hostname
+        scheme = (
+            forwarded_proto.split(",", 1)[0].strip()
+            if forwarded_proto
+            else "http" if hostname in {"localhost", "127.0.0.1", "::1"} else "https"
+        )
+        public_base_url = f"{scheme}://{host}"
     return {
         "api_key": api_key,
         "key_hash": kh,
@@ -356,7 +373,7 @@ async def account_new():
         "deposit_selector": "0x" + Web3.keccak(text="deposit(bytes32)").hex()[:8],
         "credits_per_eth": CREDITS_PER_ETH,
         "credit_usd": CREDIT_USD,
-        "base_url": os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8402") + "/v1",
+        "base_url": public_base_url + "/v1",
     }
 
 
@@ -665,16 +682,35 @@ async def chat(request: Request):
             raise HTTPException(401, "unknown API key")
         if bal <= 0:
             raise HTTPException(402, "insufficient credits; deposit ETH to top up")
-        reserved_usd = await _reserve_daily_cap()
+        reservation_day, reserved_usd = await _reserve_daily_cap()
+        async with db_write_lock:
+            cur = db.execute(
+                "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
+                (bal, key, bal),
+            )
+            db.commit()
+        if cur.rowcount == 0:
+            await _reconcile_spend(reservation_day, reserved_usd, 0.0)
+            raise HTTPException(402, "insufficient credits; deposit ETH to top up")
         body["usage"] = {"include": True}
         try:
             async with httpx.AsyncClient(timeout=300) as client:
                 r = await client.post(url, json=body, headers=upstream_headers)
         except Exception:
-            await _reconcile_spend(reserved_usd, 0.0)
+            async with db_write_lock:
+                db.execute(
+                    "UPDATE accounts SET balance=balance+? WHERE api_key=?", (bal, key)
+                )
+                db.commit()
+            await _reconcile_spend(reservation_day, reserved_usd, 0.0)
             raise
         if r.status_code != 200:
-            await _reconcile_spend(reserved_usd, 0.0)
+            async with db_write_lock:
+                db.execute(
+                    "UPDATE accounts SET balance=balance+? WHERE api_key=?", (bal, key)
+                )
+                db.commit()
+            await _reconcile_spend(reservation_day, reserved_usd, 0.0)
             return JSONResponse(
                 r.json()
                 if r.headers.get("content-type", "").startswith("application/json")
@@ -683,13 +719,16 @@ async def chat(request: Request):
             )
         data = r.json()
         cost_usd = (data.get("usage") or {}).get("cost")
-        cost = _usd_to_credits(cost_usd)
+        cost = min(bal, _usd_to_credits(cost_usd))
         async with db_write_lock:
             db.execute(
-                "UPDATE accounts SET balance=balance-? WHERE api_key=?", (cost, key)
+                "UPDATE accounts SET balance=balance+? WHERE api_key=?", (bal - cost, key)
             )
             db.commit()
-        await _reconcile_spend(reserved_usd, _billed_usd(cost_usd, cost))
+        actual_usd = _billed_usd(cost_usd, cost)
+        if cost_usd is None:
+            actual_usd = max(actual_usd, reserved_usd)
+        await _reconcile_spend(reservation_day, reserved_usd, actual_usd)
         return JSONResponse(
             data,
             headers={"X-Cost-Credits": str(cost), "X-Balance": str(max(0, bal - cost))},
@@ -703,11 +742,11 @@ async def chat(request: Request):
             m = payment_from_j(json.loads(base64.b64decode(channel_header)))
         except Exception:
             raise HTTPException(400, "X-Channel-Payment must be base64 JSON")
-        reserved_usd = await _reserve_daily_cap()
+        reservation_day, reserved_usd = await _reserve_daily_cap()
         try:
             sigma = bob.accept(channel_contract, m, price=CHANNEL_PRICE)
         except ValueError as e:
-            await _reconcile_spend(reserved_usd, 0.0)
+            await _reconcile_spend(reservation_day, reserved_usd, 0.0)
             raise HTTPException(402, f"channel payment rejected: {e}")
         countersign = base64.b64encode(json.dumps(sig_to_j(sigma)).encode()).decode()
         body["usage"] = {"include": True}
@@ -716,13 +755,19 @@ async def chat(request: Request):
                 r = await client.post(url, json=body, headers=upstream_headers)
         except Exception:
             await _reconcile_spend(
-                reserved_usd, _billed_usd(None, CHANNEL_PRICE)
+                reservation_day,
+                reserved_usd,
+                max(_billed_usd(None, CHANNEL_PRICE), reserved_usd),
             )
             raise
         data = r.json()
         cost_usd = (data.get("usage") or {}).get("cost") if r.status_code == 200 else None
         await _reconcile_spend(
-            reserved_usd, _billed_usd(cost_usd, CHANNEL_PRICE)
+            reservation_day,
+            reserved_usd,
+            max(_billed_usd(cost_usd, CHANNEL_PRICE), reserved_usd)
+            if cost_usd is None
+            else _billed_usd(cost_usd, CHANNEL_PRICE),
         )
         return JSONResponse(
             data,
@@ -739,11 +784,11 @@ async def chat(request: Request):
     except Exception:
         raise HTTPException(400, "X-Cash must be base64 JSON token list")
 
-    reserved_usd = await _reserve_daily_cap()
+    reservation_day, reserved_usd = await _reserve_daily_cap()
     try:
         prepaid = await _spend(tokens)
     except Exception:
-        await _reconcile_spend(reserved_usd, 0.0)
+        await _reconcile_spend(reservation_day, reserved_usd, 0.0)
         raise
     receipt_id = secrets.token_hex(16)
     async with db_write_lock:
@@ -797,7 +842,11 @@ async def chat(request: Request):
                 # over-charge on a network flake, but avoids free inference.
                 await _finalize(receipt_id, billed)
                 await _reconcile_spend(
-                    reserved_usd, _billed_usd(cost_usd, billed)
+                    reservation_day,
+                    reserved_usd,
+                    max(_billed_usd(cost_usd, billed), reserved_usd)
+                    if cost_usd is None
+                    else _billed_usd(cost_usd, billed),
                 )
 
         return StreamingResponse(
@@ -811,11 +860,11 @@ async def chat(request: Request):
             r = await client.post(url, json=body, headers=upstream_headers)
     except Exception:
         await _finalize(receipt_id, 0)
-        await _reconcile_spend(reserved_usd, 0.0)
+        await _reconcile_spend(reservation_day, reserved_usd, 0.0)
         raise
     if r.status_code != 200:
         await _finalize(receipt_id, 0)  # upstream failed: full refund via change
-        await _reconcile_spend(reserved_usd, 0.0)
+        await _reconcile_spend(reservation_day, reserved_usd, 0.0)
         return JSONResponse(
             r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": r.text},
             status_code=r.status_code,
@@ -825,7 +874,10 @@ async def chat(request: Request):
     cost_usd = (data.get("usage") or {}).get("cost")
     cost = min(prepaid, _usd_to_credits(cost_usd))
     await _finalize(receipt_id, cost)
-    await _reconcile_spend(reserved_usd, _billed_usd(cost_usd, cost))
+    actual_usd = _billed_usd(cost_usd, cost)
+    if cost_usd is None:
+        actual_usd = max(actual_usd, reserved_usd)
+    await _reconcile_spend(reservation_day, reserved_usd, actual_usd)
     return JSONResponse(
         data,
         headers={"X-Change-Receipt": receipt_id, "X-Cost-Credits": str(cost)},
