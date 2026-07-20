@@ -396,24 +396,49 @@ class Wallet:
         self._clear_prepared()   # tip moved; any prepared token is now stale
         return reply, {"cost": price, "remaining": payer.D - payer.tip.bal}
 
+    @staticmethod
+    def _xcash(chosen: list[dict]) -> str:
+        spend = [{"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
+                 for t in chosen]
+        return base64.b64encode(json.dumps(spend).encode()).decode()
+
     def chat(self, messages: list[dict], model: str, prepay: int = 2000,
              stream: bool = False, **kwargs):
-        headers = {}
-        if not model.startswith("local/"):  # local/* lane is free, no payment
-            spend = [
-                {"amount": t["amount"], "secret": t["secret"], "C": t["C"]}
-                for t in self._select(max(prepay, self.keys()["min_prepay"]))
-            ]
-            headers["X-Cash"] = base64.b64encode(json.dumps(spend).encode()).decode()
+        url = f"{self.url}/v1/chat/completions"
         body = {"model": model, "messages": messages, "stream": stream, **kwargs}
-        if stream:
-            return self.http.stream(
-                "POST", f"{self.url}/v1/chat/completions", json=body, headers=headers
-            )
-        resp = self.http.post(
-            f"{self.url}/v1/chat/completions", json=body, headers=headers
-        )
-        receipt = resp.headers.get("X-Change-Receipt")
-        settle = self.redeem_change(receipt) if receipt else {"cost": 0, "change": 0}
-        resp.raise_for_status()
-        return resp.json(), settle
+
+        if model.startswith("local/"):  # free lane, no payment
+            if stream:
+                return self.http.stream("POST", url, json=body)
+            resp = self.http.post(url, json=body)
+            resp.raise_for_status()
+            return resp.json(), {"cost": 0, "change": 0}
+
+        need = max(prepay, self.keys()["min_prepay"])
+        if stream:  # streaming can't self-heal (returns a live context); single try
+            headers = {"X-Cash": self._xcash(self._select(need))}
+            return self.http.stream("POST", url, json=body, headers=headers)
+
+        # Self-healing ecash: a token the router rejects as an INVALID SIGNATURE
+        # was signed by a mint epoch this router no longer honors (e.g. an old
+        # test router). _select has already removed the attempted tokens, so we
+        # just retry with the rest — a few dead tokens can't brick the wallet.
+        for _ in range(len(self.tokens) + 4):
+            try:
+                chosen = self._select(need)
+            except RuntimeError:
+                raise RuntimeError(
+                    "all ecash tokens were rejected as invalid (signed by a router "
+                    "that rotated its mint key). Run: cli.py claim <credits>")
+            resp = self.http.post(url, json=body,
+                                  headers={"X-Cash": self._xcash(chosen)})
+            if resp.status_code == 400 and "invalid token" in resp.text.lower():
+                continue  # dead tokens dropped by _select; try the rest
+            if resp.status_code >= 400:
+                self.tokens.extend(chosen)  # unrelated error: don't lose the tokens
+                self._save()
+                resp.raise_for_status()
+            receipt = resp.headers.get("X-Change-Receipt")
+            settle = self.redeem_change(receipt) if receipt else {"cost": 0, "change": 0}
+            return resp.json(), settle
+        raise RuntimeError("could not find a spendable ecash token; run: cli.py claim")
