@@ -1,6 +1,11 @@
 # anon-router: payment-private inference proxy (router + deposit watcher)
 FROM python:3.12-slim
 
+# tor: publishes a v3 onion service so users can reach the router over Tor,
+# where the router never sees a real client IP and there is no exit node.
+RUN apt-get update && apt-get install -y --no-install-recommends tor \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements.txt .
