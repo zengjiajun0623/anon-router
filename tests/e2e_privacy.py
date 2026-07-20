@@ -52,7 +52,12 @@ class Cap(BaseHTTPRequestHandler):
         self.wfile.write(out)
 
     def do_GET(self):
-        out = json.dumps({"data": []}).encode()
+        # Price models like OpenRouter does, so the router's cost-bound uses real
+        # (cheap) pricing rather than the conservative ceiling.
+        out = json.dumps({"data": [
+            {"id": "openai/gpt-4o-mini",
+             "pricing": {"prompt": "0.00000015", "completion": "0.0000006"}},
+        ]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))

@@ -58,6 +58,20 @@ CHANNEL_LANE_ENABLED = os.environ.get("CHANNEL_LANE_ENABLED", "0") == "1"
 DAILY_USD_CAP = float(os.environ.get("DAILY_USD_CAP", "0"))
 MAX_REQUEST_USD = max(CREDIT_USD, float(os.environ.get("MAX_REQUEST_USD", "0.50")))
 ACCOUNT_RATE_PER_MIN = int(os.environ.get("ACCOUNT_RATE_PER_MIN", "120"))
+# Cost-bounding: cap output tokens per request and price the worst case so the
+# prepay/balance always covers the maximum the operator can be billed upstream.
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "8192"))
+# TRUE worst-case $/token ceiling for models with no live pricing — must be an
+# UPPER bound on any real model so an unknown/typo model can never be
+# under-reserved (~$600 / 1M tokens is above today's priciest). Such requests
+# are then usually rejected by MAX_REQUEST_USD, which is the safe direction.
+PRICE_CEIL_PER_TOKEN = float(os.environ.get("PRICE_CEIL_PER_TOKEN", "0.0006"))
+# Hard reject on oversized input (bounds cost estimation error + a DoS lever).
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "2000000"))
+# A 'pending' receipt older than this was left by a crash (real requests finish
+# within the ~300s upstream timeout); only such receipts are auto-refunded, so
+# recovery never touches another worker's in-flight request.
+RECEIPT_STALE_SEC = int(os.environ.get("RECEIPT_STALE_SEC", "900"))
 
 if DEV_FAUCET and urlparse(UPSTREAM).hostname not in {"localhost", "127.0.0.1"}:
     message = "REFUSING TO START: DEV_FAUCET requires a localhost upstream"
@@ -97,8 +111,10 @@ UPSTREAM_ALLOWED_FIELDS = frozenset({
     "response_format", "tools", "tool_choice", "parallel_tool_calls",
     "functions", "function_call", "prediction", "modalities", "audio",
     "reasoning", "reasoning_effort", "verbosity", "usage",
-    # OpenRouter routing preferences (functional routing, not identity)
-    "provider", "models", "route", "transforms",
+    # OpenRouter provider prefs (same model, so cost-neutral) + prompt transforms.
+    # NOT "models"/"route": those let a request fall back to a DIFFERENT (possibly
+    # pricier) model than the one we priced, bypassing the cost bound.
+    "provider", "transforms",
 })
 
 
@@ -156,8 +172,14 @@ db.execute("PRAGMA busy_timeout=5000")
 db.execute("CREATE TABLE IF NOT EXISTS spent(secret TEXT PRIMARY KEY)")
 db.execute(
     "CREATE TABLE IF NOT EXISTS receipts("
-    "id TEXT PRIMARY KEY, prepaid INT, cost INT, state TEXT)"
+    "id TEXT PRIMARY KEY, prepaid INT, cost INT, state TEXT, change_sigs TEXT, ts INTEGER)"
 )
+# Migrate older DBs (change_sigs = idempotent redemption; ts = crash-recovery age).
+for _col, _type in (("change_sigs", "TEXT"), ("ts", "INTEGER")):
+    try:
+        db.execute(f"ALTER TABLE receipts ADD COLUMN {_col} {_type}")
+    except sqlite3.OperationalError:
+        pass  # column already present
 db.execute(
     "CREATE TABLE IF NOT EXISTS vouchers(code TEXT PRIMARY KEY, credits INT, state TEXT)"
 )
@@ -200,6 +222,23 @@ def log_safety_config():
         f"channel_prover={CHANNEL_PROVER} "
         f"daily_cap_usd={DAILY_USD_CAP}"
     )
+
+
+@app.on_event("startup")
+async def start_receipt_recovery():
+    # Awaited once before serving (immediate recovery of crashed receipts), then
+    # periodically so a crash mid-run self-heals without needing a restart.
+    await _recover_stale_receipts()
+
+    async def loop():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await _recover_stale_receipts()
+            except Exception as e:  # never let the sweep kill the loop
+                print(f"receipt recovery sweep error: {e}")
+
+    asyncio.create_task(loop())
 
 
 @app.middleware("http")
@@ -309,23 +348,34 @@ def _sign_outputs(outputs: list[dict]) -> list[dict]:
         raise HTTPException(400, str(e))
 
 
-async def _spend(tokens: list[dict]) -> int:
+def _verify_tokens(tokens: list[dict]) -> int:
+    """Read-only: check MIN_PREPAY + every signature, return the prepaid total.
+    Burns nothing — the caller bounds cost first, then spends atomically."""
     total = sum(int(t.get("amount", 0)) for t in tokens)
     if total < MIN_PREPAY:
         raise HTTPException(402, f"prepay {total} < minimum {MIN_PREPAY} credits")
     for t in tokens:
         if not mint.verify(int(t["amount"]), t["secret"], t["C"]):
             raise HTTPException(400, "invalid token signature")
+    return total
+
+
+async def _spend_and_open_receipt(tokens: list[dict], receipt_id: str,
+                                  prepaid: int) -> None:
+    """Burn the tokens AND open the pending receipt in ONE transaction, so a
+    crash can never take payment without leaving a redeemable receipt."""
     async with db_write_lock:
-        cur = db.cursor()
         try:
             for t in tokens:
-                cur.execute("INSERT INTO spent(secret) VALUES (?)", (t["secret"],))
+                db.execute("INSERT INTO spent(secret) VALUES (?)", (t["secret"],))
+            db.execute(
+                "INSERT INTO receipts(id, prepaid, cost, state, ts) VALUES (?, ?, 0, 'pending', ?)",
+                (receipt_id, prepaid, int(time.time())),
+            )
             db.commit()
         except sqlite3.IntegrityError:
             db.rollback()
             raise HTTPException(400, "token already spent")
-    return total
 
 
 async def _finalize(receipt_id: str, cost: int) -> None:
@@ -337,8 +387,27 @@ async def _finalize(receipt_id: str, cost: int) -> None:
         db.commit()
 
 
-async def _reserve_daily_cap() -> tuple[str, float]:
-    estimate = max(0.0, MAX_REQUEST_USD)
+async def _recover_stale_receipts() -> int:
+    """Finalize receipts left 'pending' by a crash (older than RECEIPT_STALE_SEC)
+    to cost=0 so the payer redeems a full refund. The age guard means a live
+    request's fresh receipt is never touched — safe even with multiple workers or
+    a rolling restart. NULL ts (pre-migration receipts) are treated as stale."""
+    async with db_write_lock:
+        cutoff = int(time.time()) - RECEIPT_STALE_SEC
+        cur = db.execute(
+            "UPDATE receipts SET cost=0, state='final' "
+            "WHERE state='pending' AND (ts IS NULL OR ts < ?)",
+            (cutoff,),
+        )
+        db.commit()
+        n = cur.rowcount
+    if n:
+        print(f"anon-router: recovered {n} stale receipt(s) -> full refund")
+    return n
+
+
+async def _reserve_daily_cap(estimate: float) -> tuple[str, float]:
+    estimate = max(0.0, estimate)
     async with db_write_lock:
         day = db.execute("SELECT date('now')").fetchone()[0]
         if DAILY_USD_CAP <= 0:
@@ -381,6 +450,87 @@ def _usd_to_credits(cost_usd: float | None) -> int:
     if cost_usd is None:
         return 1  # upstream gave no usage; charge the floor, log for investigation
     return max(1, math.ceil(cost_usd * MARKUP / CREDIT_USD))
+
+
+_pricing = {"data": {}, "ts": 0.0}
+
+
+async def _model_price(model: str):
+    """(prompt, completion) USD/token for `model` from OpenRouter, cached ~10 min.
+    None if unknown/unavailable — the caller falls back to PRICE_CEIL_PER_TOKEN."""
+    now = time.time()
+    if not _pricing["data"] or now - _pricing["ts"] > 600:
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(f"{UPSTREAM}/models",
+                                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"})
+            data = {}
+            for m in r.json().get("data", []):
+                p = m.get("pricing") or {}
+                try:
+                    data[m["id"]] = (float(p.get("prompt") or 0),
+                                     float(p.get("completion") or 0))
+                except (TypeError, ValueError):
+                    pass
+            if data:
+                _pricing["data"], _pricing["ts"] = data, now
+        except Exception:
+            pass  # keep any stale cache; caller uses the ceiling fallback
+    return _pricing["data"].get(model)
+
+
+def _safe_int(v, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _est_input_tokens(body: dict) -> int:
+    """Conservative UPPER bound on billable input tokens across EVERY forwarded
+    input-bearing field (not just messages), so a big tools/functions/prediction
+    payload can't slip past the cost bound. Rejects oversized input (413).
+    Note: text/JSON only — image/audio token cost is not modeled (text-chat MVP);
+    the daily cap is the backstop for multimodal until per-modality pricing lands.
+    """
+    parts = {k: body.get(k) for k in
+             ("messages", "prompt", "tools", "functions", "prediction", "tool_choice")
+             if k in body}
+    try:
+        blob = json.dumps(parts)
+    except Exception:
+        blob = ""
+    if len(blob) > MAX_INPUT_CHARS:
+        raise HTTPException(413, "request input too large")
+    return int(len(blob) / 3 * 1.4) + 16  # conservative chars->tokens (over-estimates)
+
+
+async def _bound_cost(body: dict, upstream_model: str) -> tuple[float, int]:
+    """Clamp output tokens on `body` in place, then compute the MAXIMUM this
+    request can bill upstream (live per-model pricing, else a true ceiling).
+    Reject if that maximum exceeds the per-request cap. Returns (worst_usd,
+    worst_credits) — what a lane must have prepaid/reserved to never be under-paid.
+    """
+    # Canonicalize the output limit across BOTH field names to one clamped field,
+    # so neither can be used to request more output than we price.
+    req_out = max(_safe_int(body.get("max_tokens"), 0),
+                  _safe_int(body.get("max_completion_tokens"), 0))
+    out_cap = min(req_out if req_out > 0 else MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
+    body["max_tokens"] = out_cap
+    body.pop("max_completion_tokens", None)
+    n = max(1, min(_safe_int(body.get("n"), 1), 8))
+    if "n" in body:
+        body["n"] = n
+    out = out_cap * n
+    inp = _est_input_tokens(body)
+    price = await _model_price(upstream_model)
+    p_price, c_price = price if price is not None else (PRICE_CEIL_PER_TOKEN,
+                                                        PRICE_CEIL_PER_TOKEN)
+    worst = inp * p_price + out * c_price
+    if worst > MAX_REQUEST_USD:
+        raise HTTPException(402, f"request may cost ${worst:.4f} upstream, over the "
+                            f"${MAX_REQUEST_USD:.2f} per-request cap — lower max_tokens/n")
+    return worst, max(1, math.ceil(worst / CREDIT_USD))
 
 
 @app.get("/mint/keys")
@@ -692,16 +842,23 @@ async def redeem_change(receipt_id: str, request: Request):
     raw_body = await request.body()
     async with db_write_lock:
         row = db.execute(
-            "SELECT prepaid, cost, state FROM receipts WHERE id=?", (receipt_id,)
+            "SELECT prepaid, cost, state, change_sigs FROM receipts WHERE id=?",
+            (receipt_id,),
         ).fetchone()
         if not row:
             raise HTTPException(404, "unknown receipt")
-        prepaid, cost, state = row
+        prepaid, cost, state, cached = row
+        change = max(0, prepaid - (cost or 0))
         if state == "pending":
             raise HTTPException(409, "request still in flight, retry shortly")
+        if state == "redeemed":
+            # Idempotent replay: a lost response is safe to retry — return the
+            # SAME signed change instead of losing it. (The client's built-in
+            # retry re-sends the same blinded outputs, so these signatures fit.)
+            return {"change": change, "cost": cost,
+                    "signatures": json.loads(cached) if cached else []}
         if state != "final":
-            raise HTTPException(409, "already redeemed or not final")
-        change = max(0, prepaid - cost)
+            raise HTTPException(409, "not final")
         if change:
             outputs = _parse_outputs(json.loads(raw_body))
             if sum(int(o["amount"]) for o in outputs) != change:
@@ -710,8 +867,8 @@ async def redeem_change(receipt_id: str, request: Request):
         else:
             signatures = []
         cur = db.execute(
-            "UPDATE receipts SET state='redeemed' WHERE id=? AND state='final'",
-            (receipt_id,),
+            "UPDATE receipts SET state='redeemed', change_sigs=? WHERE id=? AND state='final'",
+            (json.dumps(signatures), receipt_id),
         )
         db.commit()
         if cur.rowcount == 0:
@@ -790,11 +947,18 @@ async def chat(request: Request):
             raise HTTPException(401, "unknown API key")
         if bal <= 0:
             raise HTTPException(402, "insufficient credits; deposit ETH to top up")
-        reservation_day, reserved_usd = await _reserve_daily_cap()
+        # Reserve only the bounded worst-case for THIS request (not the whole
+        # balance): a crash then loses at most `hold`, and billing can never
+        # exceed what was held.
+        worst_usd, hold = await _bound_cost(body, upstream_model)
+        if bal < hold:
+            raise HTTPException(402, f"insufficient credits: need {hold} for this "
+                                f"request's max cost, have {bal}")
+        reservation_day, reserved_usd = await _reserve_daily_cap(worst_usd)
         async with db_write_lock:
             cur = db.execute(
                 "UPDATE accounts SET balance=balance-? WHERE api_key=? AND balance>=?",
-                (bal, key, bal),
+                (hold, key, hold),
             )
             db.commit()
         if cur.rowcount == 0:
@@ -807,7 +971,7 @@ async def chat(request: Request):
         except Exception:
             async with db_write_lock:
                 db.execute(
-                    "UPDATE accounts SET balance=balance+? WHERE api_key=?", (bal, key)
+                    "UPDATE accounts SET balance=balance+? WHERE api_key=?", (hold, key)
                 )
                 db.commit()
             await _reconcile_spend(reservation_day, reserved_usd, 0.0)
@@ -815,7 +979,7 @@ async def chat(request: Request):
         if r.status_code != 200:
             async with db_write_lock:
                 db.execute(
-                    "UPDATE accounts SET balance=balance+? WHERE api_key=?", (bal, key)
+                    "UPDATE accounts SET balance=balance+? WHERE api_key=?", (hold, key)
                 )
                 db.commit()
             await _reconcile_spend(reservation_day, reserved_usd, 0.0)
@@ -827,10 +991,10 @@ async def chat(request: Request):
             )
         data = r.json()
         cost_usd = (data.get("usage") or {}).get("cost")
-        cost = min(bal, _usd_to_credits(cost_usd))
+        cost = min(hold, _usd_to_credits(cost_usd))
         async with db_write_lock:
             db.execute(
-                "UPDATE accounts SET balance=balance+? WHERE api_key=?", (bal - cost, key)
+                "UPDATE accounts SET balance=balance+? WHERE api_key=?", (hold - cost, key)
             )
             db.commit()
         actual_usd = _billed_usd(cost_usd, cost)
@@ -859,7 +1023,13 @@ async def chat(request: Request):
                 "channel payment must be base64 JSON in X-Channel-Payment "
                 "or a JSON object in the _channel_payment body field",
             )
-        reservation_day, reserved_usd = await _reserve_daily_cap()
+        # The channel pays a flat CHANNEL_PRICE, so reject any request whose
+        # bounded max cost exceeds it (else the operator eats the difference).
+        worst_usd, worst_credits = await _bound_cost(body, upstream_model)
+        if worst_credits > CHANNEL_PRICE:
+            raise HTTPException(402, f"request may cost {worst_credits} credits, over the "
+                                f"channel's flat price {CHANNEL_PRICE}; lower max_tokens/n")
+        reservation_day, reserved_usd = await _reserve_daily_cap(worst_usd)
         try:
             # STARK verification shells out to the rpay binary (~0.5 s); run it
             # off the event loop so other lanes stay responsive.
@@ -903,20 +1073,21 @@ async def chat(request: Request):
     except Exception:
         raise HTTPException(400, "X-Cash must be base64 JSON token list")
 
-    reservation_day, reserved_usd = await _reserve_daily_cap()
+    # Bound the worst-case upstream cost and require the prepay covers it BEFORE
+    # burning anything — so the router can never be billed more than was paid.
+    prepaid = _verify_tokens(tokens)
+    worst_usd, worst_credits = await _bound_cost(body, upstream_model)
+    if prepaid < worst_credits:
+        raise HTTPException(402, f"prepay {prepaid} < {worst_credits} credits needed to "
+                            "cover this request's maximum cost; attach more tokens")
+
+    reservation_day, reserved_usd = await _reserve_daily_cap(worst_usd)
+    receipt_id = secrets.token_hex(16)
     try:
-        prepaid = await _spend(tokens)
+        await _spend_and_open_receipt(tokens, receipt_id, prepaid)
     except Exception:
         await _reconcile_spend(reservation_day, reserved_usd, 0.0)
         raise
-    receipt_id = secrets.token_hex(16)
-    async with db_write_lock:
-        db.execute(
-            "INSERT INTO receipts(id, prepaid, cost, state) "
-            "VALUES (?, ?, 0, 'pending')",
-            (receipt_id, prepaid),
-        )
-        db.commit()
 
     body["usage"] = {"include": True}  # OpenRouter returns exact USD cost
 
