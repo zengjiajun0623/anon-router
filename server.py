@@ -225,18 +225,49 @@ def app_js():
     )
 
 
+def _onion_address() -> str:
+    """The published v3 onion, read from tor's own hostname file (the source of
+    truth) so /privacy reflects reality whenever TOR_ONION=1 actually publishes
+    a service; falls back to an explicit ONION_ADDRESS override for tests."""
+    path = os.environ.get("ONION_HOSTNAME_FILE", "/data/tor_hs/hostname")
+    try:
+        with open(path) as f:
+            addr = f.read().strip()
+        if addr:
+            return addr
+    except OSError:
+        pass
+    return os.environ.get("ONION_ADDRESS", "")
+
+
 @app.get("/privacy")
 def privacy():
     """Machine-readable privacy posture — the honest boundary."""
+    onion = _onion_address()
     return {
         "no_account": True,
+        "no_card_no_kyc": True,
         "no_cookies_or_sessions": True,
-        "auth": "stateless bearer key or per-request channel payment",
-        "payment_unlinkable": "channel lane (confetti) + ecash lane",
-        "what_provider_sees": "only the router, never the end user",
-        "what_router_sees": "prompt content + connection metadata (IP/timing)",
-        "not_yet_private": ["transport (use Tor/proxy)", "deposit funding origin"],
-        "upgrade_path": ["onion service", "shielded-pool funding", "key rotation"],
+        "auth": "stateless bearer key",
+        "live_lane": "ecash (blind-signature, custodial)",
+        "roadmap_lane": "confetti channel (non-custodial, per-request ZK)",
+        "payment_unlinkable": ("cryptographically unlinkable at the signature layer "
+                               "(blind-signed ecash); the custodial router still sees "
+                               "deposit and redemption amounts + timing, so deposit a "
+                               "common round amount and spend over time to avoid "
+                               "statistical correlation"),
+        "what_provider_sees": "only the router — not your identity, IP, or card",
+        "what_router_sees": ("prompt content + connection metadata (IP/timing); IPs are "
+                             "not logged, but requests under the same bearer key are "
+                             "linkable by that key — rotate keys to unlink"),
+        "what_the_model_sees": ("your prompt content — it must, to answer you; use a "
+                                "local/self-hosted model to keep content off third parties"),
+        "transport": {"onion_live": bool(onion), "onion": onion or None},
+        "custody": ("custodial: the router holds prepaid balances — keep balances "
+                    "small; the confetti lane removes this"),
+        "funding": ("pseudonymous: the on-chain deposit is public — fund from a fresh "
+                    "wallet, deposit a common round amount, and spend over time"),
+        "not_yet_private": ["deposit funding origin (shielded pool on roadmap)"],
     }
 
 

@@ -177,15 +177,19 @@
     <!-- PRIVACY STATEMENT -->
     <div class="card">
       <h2>What's private, honestly</h2>
-      <div class="kv"><span class="k">No account, no card, no cookies</span><span class="v">✓ today</span></div>
+      <div class="kv"><span class="k">No account, no card, no KYC, no cookies</span><span class="v">✓ today</span></div>
       <div class="kv"><span class="k">The model provider can't see who you are</span><span class="v">✓ it only sees the router</span></div>
-      <div class="kv"><span class="k">Your payments can't be linked to each other</span><span class="v">✓ blind-signed ecash</span></div>
-      <div class="kv"><span class="k">The model provider sees your prompt content</span><span class="v muted">it runs the model to answer you</span></div>
-      <div class="kv"><span class="k">The router still sees your IP</span><span class="v muted">Tor / onion support on the roadmap</span></div>
-      <div class="kv"><span class="k">Deposit funding origin</span><span class="v muted">pseudonymous; shielded funding on the roadmap</span></div>
-      <div class="note">Removing the account and card is the biggest privacy gain, and it's done. The
-        model provider still sees prompt content because it runs the model. Transport and funding
-        privacy are opt-in upgrades on the roadmap. Machine-readable posture at <code>/privacy</code>.</div>
+      <div class="kv"><span class="k">Spends are cryptographically unlinkable to your deposit</span><span class="v">✓ blind-signed ecash</span></div>
+      <div class="kv"><span class="k">Connect without revealing an IP</span><span class="v">✓ Tor .onion, live</span></div>
+      <div class="kv"><span class="k">The model reads your prompt content</span><span class="v muted">inherent — use a <code>local/*</code> model to keep it off third parties</span></div>
+      <div class="kv"><span class="k">Deposit funding origin</span><span class="v muted">pseudonymous — fund fresh, round amount, spend over time</span></div>
+      <div class="kv"><span class="k">Who holds your prepaid balance</span><span class="v muted">the router (custodial) — keep it small</span></div>
+      <div class="note">Removing the account and card is the biggest privacy gain, and it's done: the
+        provider only ever sees the router, never your identity or card. Connect over the <code>.onion</code>
+        to hide your IP too. Honest caveats: blind signatures unlink spends at the signature layer, but a
+        custodial router can still correlate deposit and spend by amount/timing (so use round amounts + spend
+        over time), the model reads your prompt, and the balance is custodial. The confetti lane
+        (non-custodial, no metadata) and shielded funding are on the roadmap. Full posture at <code>/privacy</code>.</div>
     </div>
   </div>
 
@@ -193,6 +197,9 @@
     Testnet demo. Deposits use Sepolia test ETH; no real funds are involved.
     The escrow contract's safety core is machine-checked (Lean) and reviewed
     by three independent models.
+    <div id="onion-line" class="hidden" style="margin-top:8px">
+      Reachable over Tor (no IP, no exit node): <code id="onion-addr" class="mono"></code>
+    </div>
   </div>
 </div>
 

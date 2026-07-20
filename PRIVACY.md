@@ -8,9 +8,11 @@ is exactly what holds today and what is an upgrade.
 
 | Layer | Question | Status (MVP) |
 |---|---|---|
-| **Payment** | Does the money link you to your requests? | **Private.** No account, no card. Payments are unlinkable — the channel lane (confetti, per-request ZK) and the ecash lane (blind signatures) both prevent linking payments to a payer. |
-| **Transport** | Does the network path link you? | **Not yet.** The router still sees your IP, timing, and prompt content. Use Tor/a proxy today; an onion service is planned. Auth is stateless (no cookies/sessions) and IPs are not logged (`--no-access-log`), so nothing *server-side* links requests — but the connection itself can. |
-| **Funding** | Does the money's origin link you? | **Pseudonymous.** The deposit comes from an on-chain address. Fund from a fresh wallet for pseudonymity; shielded-pool funding (hides the source in an anonymity set) is planned. |
+| **Payment** | Does the money link you to your requests? | **Private.** No account, no card, no KYC. The live **ecash lane** blind-signs your balance, so spends are *cryptographically* unlinkable to your deposit at the signature layer. Caveat: the custodial router still sees deposit and redemption amounts + timing, so deposit a common round amount and spend over time to avoid statistical correlation. |
+| **Transport** | Does the network path link you? | **Onion live.** The router is reachable as a Tor v3 `.onion`, so you can connect without revealing an IP and with no exit node in the path. Over clearnet the router still sees your IP; IPs are not logged (`--no-access-log`) and auth is stateless (no cookies/sessions), so nothing server-side links requests *beyond the bearer key you present* — reusing one key ties its requests to one balance, so rotate keys (free, `/account/new`) to unlink. |
+| **Funding** | Does the money's origin link you? | **Pseudonymous.** The deposit is a public on-chain transaction. Fund from a fresh wallet, deposit a common round amount, and spend over time so the deposit doesn't fingerprint your usage; shielded-pool funding (hides the source in an anonymity set) is on the roadmap. |
+| **Content** | Does the model see your prompt? | **Yes — inherently.** A hosted model must read your prompt to answer. The router adds no logging, but the model provider processes the text. For content privacy, use the **local/self-hosted model lane** (`local/*`). |
+| **Custody** | Who holds your prepaid balance? | **The router (custodial).** This is a custody risk, not a privacy leak — keep balances small. The confetti (non-custodial) lane removes it; it is on the roadmap. |
 
 ## Why payment-layer-only is a real MVP
 

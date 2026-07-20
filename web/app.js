@@ -427,3 +427,12 @@ wireCopy('copy-key', 'apikey');
 wireCopy('copy-base', 'baseurl');
 updateSendState();
 mintKeys().then(redeemPendingChange).then(renderBalance).catch(() => renderBalance());
+
+// Show the Tor .onion address in the footer when the router publishes one.
+fetch('/privacy').then((r) => r.json()).then((p) => {
+  const onion = p && p.transport && p.transport.onion;
+  if (onion) {
+    $('onion-addr').textContent = onion;
+    $('onion-line').classList.remove('hidden');
+  }
+}).catch(() => {});
