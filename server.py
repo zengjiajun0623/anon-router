@@ -114,10 +114,38 @@ CHAIN_RPC = os.environ.get("CHAIN_RPC", "http://127.0.0.1:8545")
 app = FastAPI(title="anon-router")
 
 
+@app.middleware("http")
+async def privacy_headers(request: Request, call_next):
+    """Transport-privacy hygiene (MVP): auth is stateless (headers only, no
+    cookies/sessions), so nothing here links two requests. We never read
+    X-Forwarded-For or log client IPs (run uvicorn with --no-access-log).
+    Responses are no-store so intermediaries don't cache identifying data.
+    """
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response  # Server header suppressed via uvicorn --no-server-header
+
+
 @app.get("/")
 def index():
     from fastapi.responses import FileResponse
     return FileResponse(os.path.join(ROOT, "web", "index.html"))
+
+
+@app.get("/privacy")
+def privacy():
+    """Machine-readable privacy posture — the honest boundary."""
+    return {
+        "no_account": True,
+        "no_cookies_or_sessions": True,
+        "auth": "stateless bearer key or per-request channel payment",
+        "payment_unlinkable": "channel lane (confetti) + ecash lane",
+        "what_provider_sees": "only the router, never the end user",
+        "what_router_sees": "prompt content + connection metadata (IP/timing)",
+        "not_yet_private": ["transport (use Tor/proxy)", "deposit funding origin"],
+        "upgrade_path": ["onion service", "shielded-pool funding", "key rotation"],
+    }
 
 
 def _parse_outputs(payload: dict) -> list[dict]:

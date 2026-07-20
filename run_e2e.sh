@@ -33,7 +33,7 @@ cast rpc anvil_setBalance 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC 0x21e19e0c9
 echo "== start router =="
 VAULT_ADDRESS="$VAULT" CONFETTI_ADDRESS="$CONFETTI" CHAIN_RPC="$RPC" \
   CREDIT_SECRET="$CREDIT_SECRET" PUBLIC_BASE_URL="http://127.0.0.1:8402" \
-  .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8402 > "$ROOT/server.log" 2>&1 &
+  .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8402 --no-access-log --no-server-header > "$ROOT/server.log" 2>&1 &
 # wait for readiness (XMSS keygen takes a few seconds)
 for i in $(seq 1 30); do curl -s http://127.0.0.1:8402/mint/keys >/dev/null 2>&1 && break; sleep 1; done
 

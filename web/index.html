@@ -86,6 +86,9 @@
         <div class="kv"><span class="k">Base URL</span><span class="v mono" id="baseurl"></span></div>
         <div class="note">Use it with any OpenAI-compatible tool: set <code>base_url</code> and this
           key. Keep it safe — it holds your credits.</div>
+        <div style="margin-top:12px"><button id="rotate" class="ghost">New session key</button>
+          <span class="note" style="display:inline;margin-left:8px">Keys are free and unlinkable —
+            rotate per session to avoid tying requests together.</span></div>
       </div>
     </div>
 
@@ -164,6 +167,20 @@
             transactions you sign.</div>
         </div>
       </div>
+    </div>
+  </div>
+
+    <!-- PRIVACY STATEMENT -->
+    <div class="card">
+      <h2>What's private, honestly</h2>
+      <div class="kv"><span class="k">No account, no card, no cookies</span><span class="v">✓ today</span></div>
+      <div class="kv"><span class="k">The model provider can't see who you are</span><span class="v">✓ it only sees the router</span></div>
+      <div class="kv"><span class="k">Your payments can't be linked to each other</span><span class="v">✓ channel &amp; ecash lanes</span></div>
+      <div class="kv"><span class="k">The router still sees your IP &amp; prompt</span><span class="v muted">use Tor/proxy; onion service planned</span></div>
+      <div class="kv"><span class="k">Deposit funding origin</span><span class="v muted">pseudonymous; shielded funding planned</span></div>
+      <div class="note">MVP posture: removing the account/card is the biggest privacy gain, and it's
+        done. Transport and funding privacy are opt-in upgrades on the roadmap, not claimed yet.
+        See <code>/privacy</code>.</div>
     </div>
   </div>
 
@@ -320,7 +337,18 @@ async function channelWithdraw() {
     'Withdrawn. Your deposit was escrowed on-chain the whole time and returned to you unilaterally.';
 }
 
+async function rotate() {
+  // Mint a fresh unlinkable key for a new session. Prior credits stay on the
+  // old key (fund the new one, or keep both); this is about not tying sessions.
+  const r = await fetch('/account/new', {method: 'POST'});
+  account = await r.json();
+  document.getElementById('apikey').textContent = account.api_key;
+  document.getElementById('ch-note') && null;
+  document.getElementById('balance').textContent = '0';
+}
+
 document.getElementById('mint').onclick = mint;
+document.getElementById('rotate').onclick = rotate;
 document.getElementById('deposit').onclick = deposit;
 document.getElementById('send').onclick = send;
 document.getElementById('prompt').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
