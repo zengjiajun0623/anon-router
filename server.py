@@ -94,9 +94,28 @@ db.execute(
 db.execute(
     "CREATE TABLE IF NOT EXISTS vouchers(code TEXT PRIMARY KEY, credits INT, state TEXT)"
 )
+db.execute(
+    "CREATE TABLE IF NOT EXISTS accounts("
+    "api_key TEXT PRIMARY KEY, key_hash TEXT UNIQUE, balance INT)"
+)
+db.execute(
+    "CREATE TABLE IF NOT EXISTS seen_deposits(txhash TEXT PRIMARY KEY)"
+)
 db.commit()
 
+# Simple custodial lane: deposit ETH -> credits on a bearer API key. This is the
+# "simpler than OpenRouter" front door; the anonymous ecash/channel lanes are
+# the trust-minimized alternative. CREDITS_PER_ETH sets the exchange rate.
+CREDITS_PER_ETH = int(os.environ.get("CREDITS_PER_ETH", "10000000"))  # 1 ETH -> 10M credits
+VAULT_ADDRESS = os.environ.get("VAULT_ADDRESS", "")
+
 app = FastAPI(title="anon-router")
+
+
+@app.get("/")
+def index():
+    from fastapi.responses import FileResponse
+    return FileResponse(os.path.join(ROOT, "web", "index.html"))
 
 
 def _parse_outputs(payload: dict) -> list[dict]:
@@ -171,6 +190,72 @@ async def topup(request: Request):
     if total > FAUCET_MAX:
         raise HTTPException(400, f"faucet cap {FAUCET_MAX} credits per call")
     return {"signatures": _sign_outputs(outputs)}
+
+
+def _key_hash(api_key: str) -> str:
+    from web3 import Web3
+    return "0x" + Web3.keccak(text=api_key).hex()  # 0x-prefixed to match watcher event
+
+
+@app.post("/account/new")
+def account_new():
+    """Mint a fresh bearer API key. Fund it by depositing ETH to the vault
+    referencing its key_hash; the watcher credits it."""
+    api_key = "sk-anon-" + secrets.token_urlsafe(24)
+    kh = _key_hash(api_key)
+    db.execute(
+        "INSERT INTO accounts(api_key, key_hash, balance) VALUES (?, ?, 0)",
+        (api_key, kh),
+    )
+    db.commit()
+    from web3 import Web3
+    return {
+        "api_key": api_key,
+        "key_hash": kh,
+        "vault_address": VAULT_ADDRESS,
+        "deposit_selector": "0x" + Web3.keccak(text="deposit(bytes32)").hex()[:8],
+        "credits_per_eth": CREDITS_PER_ETH,
+        "credit_usd": CREDIT_USD,
+        "base_url": os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8402") + "/v1",
+    }
+
+
+def _account_balance(api_key: str):
+    row = db.execute("SELECT balance FROM accounts WHERE api_key=?", (api_key,)).fetchone()
+    return None if row is None else row[0]
+
+
+@app.get("/account/status")
+def account_status(request: Request):
+    auth = request.headers.get("Authorization", "")
+    key = auth[7:] if auth.startswith("Bearer ") else ""
+    bal = _account_balance(key)
+    if bal is None:
+        raise HTTPException(401, "unknown API key")
+    return {"balance": bal, "credit_usd": CREDIT_USD, "usd": bal * CREDIT_USD}
+
+
+@app.post("/account/credit")
+async def account_credit(request: Request):
+    """Internal: the deposit watcher credits an account for an on-chain deposit.
+    Guarded by CREDIT_SECRET so only the watcher can call it."""
+    secret = os.environ.get("CREDIT_SECRET", "")
+    if not secret or request.headers.get("X-Credit-Secret") != secret:
+        raise HTTPException(403, "forbidden")
+    body = await request.json()
+    kh, credits, txhash = body["key_hash"], int(body["credits"]), body["txhash"]
+    cur = db.cursor()
+    try:
+        cur.execute("INSERT INTO seen_deposits(txhash) VALUES (?)", (txhash,))
+    except sqlite3.IntegrityError:
+        return {"status": "already_credited"}  # idempotent per tx
+    cur.execute(
+        "UPDATE accounts SET balance=balance+? WHERE key_hash=?", (credits, kh)
+    )
+    db.commit()
+    if cur.rowcount == 0:
+        return {"status": "no_such_account"}
+    return {"status": "credited", "credits": credits}
 
 
 @app.get("/channel/params")
@@ -322,6 +407,29 @@ async def chat(request: Request):
             r = await client.post(url, json=body, headers=upstream_headers)
         return JSONResponse(
             r.json(), status_code=r.status_code, headers={"X-Cost-Credits": "0"}
+        )
+
+    # Bearer-key account lane: works with any OpenAI-compatible client.
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer sk-anon-"):
+        key = auth[len("Bearer "):]
+        bal = _account_balance(key)
+        if bal is None:
+            raise HTTPException(401, "unknown API key")
+        if bal <= 0:
+            raise HTTPException(402, "insufficient credits; deposit ETH to top up")
+        body["usage"] = {"include": True}
+        async with httpx.AsyncClient(timeout=300) as client:
+            r = await client.post(url, json=body, headers=upstream_headers)
+        if r.status_code != 200:
+            return JSONResponse(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": r.text}, status_code=r.status_code)
+        data = r.json()
+        cost = _usd_to_credits((data.get("usage") or {}).get("cost"))
+        db.execute("UPDATE accounts SET balance=balance-? WHERE api_key=?", (cost, key))
+        db.commit()
+        return JSONResponse(
+            data,
+            headers={"X-Cost-Credits": str(cost), "X-Balance": str(max(0, bal - cost))},
         )
 
     channel_header = request.headers.get("X-Channel-Payment")

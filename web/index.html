@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>anon-router — pay crypto for AI inference</title>
+<style>
+  :root {
+    --bg: #0b0d0e; --panel: #14181a; --panel2: #0f1315; --text: #e7eaeb;
+    --muted: #889096; --accent: #4db6a4; --accent-dim: #2f6d63;
+    --border: #222a2d; --danger: #d98a6a; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 48px 20px 96px; }
+  header h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.02em; }
+  header p { color: var(--muted); margin: 0 0 4px; font-size: 17px; }
+  .sub { font-size: 14px; }
+  .grid { display: grid; gap: 18px; margin-top: 34px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 22px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); margin: 0 0 14px; font-weight: 600; }
+  .step { display: flex; align-items: baseline; gap: 10px; }
+  .step .n { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
+  button {
+    background: var(--accent); color: #05100e; border: none; font-weight: 600;
+    padding: 10px 16px; border-radius: 8px; cursor: pointer; font-size: 14px;
+  }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  input, select {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 10px 12px; border-radius: 8px; font-size: 14px; width: 100%;
+  }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0;
+    border-bottom: 1px solid var(--border); font-size: 13px; }
+  .kv:last-child { border-bottom: none; }
+  .kv .k { color: var(--muted); }
+  .kv .v { text-align: right; word-break: break-all; }
+  .bal { font-size: 30px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .bal small { font-size: 14px; color: var(--muted); }
+  .muted { color: var(--muted); }
+  .hidden { display: none; }
+  .chat { display: flex; flex-direction: column; height: 340px; }
+  .log { flex: 1; overflow-y: auto; padding: 4px 2px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 88%; padding: 9px 13px; border-radius: 10px; white-space: pre-wrap; font-size: 14px; }
+  .msg.u { align-self: flex-end; background: var(--accent-dim); color: #eafffb; }
+  .msg.a { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); }
+  .composer { display: flex; gap: 8px; margin-top: 12px; }
+  .pill { display: inline-block; font-size: 12px; color: var(--accent); border: 1px solid var(--accent-dim);
+    border-radius: 999px; padding: 2px 10px; }
+  .note { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  .foot { margin-top: 40px; font-size: 12.5px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>anon-router</h1>
+    <p>Deposit crypto, get an API key, call any model. No account, no card.</p>
+    <p class="sub muted">An OpenAI-compatible endpoint. The router meters usage per request;
+      your provider never sees a name or a card.</p>
+  </header>
+
+  <div class="grid">
+    <!-- STEP 1 -->
+    <div class="card">
+      <h2>1 · Get a key</h2>
+      <div id="key-start">
+        <div class="step"><span class="n">→</span>
+          <div>No signup. Click to mint an anonymous API key.</div></div>
+        <div style="margin-top:14px"><button id="mint">Get API key</button></div>
+      </div>
+      <div id="key-info" class="hidden">
+        <div class="kv"><span class="k">API key</span><span class="v mono" id="apikey"></span></div>
+        <div class="kv"><span class="k">Base URL</span><span class="v mono" id="baseurl"></span></div>
+        <div class="note">Use it with any OpenAI-compatible tool: set <code>base_url</code> and this
+          key. Keep it safe — it holds your credits.</div>
+      </div>
+    </div>
+
+    <!-- STEP 2 -->
+    <div class="card" id="deposit-card">
+      <h2>2 · Deposit for credits</h2>
+      <div id="deposit-locked" class="muted">Get a key first.</div>
+      <div id="deposit-body" class="hidden">
+        <div class="row" style="margin-bottom:12px">
+          <input id="amount" type="number" step="0.001" value="0.05" min="0" />
+          <span class="muted" style="white-space:nowrap">ETH</span>
+          <button id="deposit">Deposit with wallet</button>
+        </div>
+        <div class="bal"><span id="balance">0</span> <small>credits</small>
+          <small id="usd"></small></div>
+        <div class="kv" style="margin-top:12px"><span class="k">Vault</span>
+          <span class="v mono" id="vault"></span></div>
+        <div class="note" id="dep-note">Sends ETH to the vault referencing your key hash;
+          the router credits you within a couple of seconds. No wallet? Send ETH to the vault
+          with your key hash as calldata.</div>
+      </div>
+    </div>
+
+    <!-- STEP 3 -->
+    <div class="card">
+      <h2>3 · Chat <span class="pill">live</span></h2>
+      <div class="row" style="margin-bottom:12px">
+        <select id="model">
+          <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
+          <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
+          <option value="local/qwen3:8b">local/qwen3:8b (free)</option>
+        </select>
+      </div>
+      <div class="chat">
+        <div class="log" id="log"></div>
+        <div class="composer">
+          <input id="prompt" placeholder="Ask anything…" />
+          <button id="send">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    Custodial simple lane shown here. The trust-minimized lane (ZK payment channels, deposits
+    escrowed on-chain, unlinkable per-request payments) is the same endpoint with a channel wallet.
+  </div>
+</div>
+
+<script>
+let account = null;
+
+async function mint() {
+  const r = await fetch('/account/new', {method: 'POST'});
+  account = await r.json();
+  document.getElementById('key-start').classList.add('hidden');
+  document.getElementById('key-info').classList.remove('hidden');
+  document.getElementById('apikey').textContent = account.api_key;
+  document.getElementById('baseurl').textContent = account.base_url;
+  document.getElementById('deposit-locked').classList.add('hidden');
+  document.getElementById('deposit-body').classList.remove('hidden');
+  document.getElementById('vault').textContent = account.vault_address || '(set VAULT_ADDRESS)';
+  pollBalance();
+}
+
+async function pollBalance() {
+  if (!account) return;
+  try {
+    const r = await fetch('/account/status', {headers: {Authorization: 'Bearer ' + account.api_key}});
+    const d = await r.json();
+    document.getElementById('balance').textContent = d.balance.toLocaleString();
+    document.getElementById('usd').textContent = '· $' + (d.usd).toFixed(2);
+  } catch (e) {}
+  setTimeout(pollBalance, 2500);
+}
+
+async function deposit() {
+  if (!account) return;
+  if (!window.ethereum) { alert('No injected wallet found. Send ETH to the vault manually with your key hash as calldata.'); return; }
+  const eth = document.getElementById('amount').value;
+  const wei = BigInt(Math.round(parseFloat(eth) * 1e18));
+  const accts = await window.ethereum.request({method: 'eth_requestAccounts'});
+  const data = account.deposit_selector + account.key_hash.replace(/^0x/, '');
+  await window.ethereum.request({
+    method: 'eth_sendTransaction',
+    params: [{from: accts[0], to: account.vault_address, value: '0x' + wei.toString(16), data}],
+  });
+}
+
+function add(role, text) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + (role === 'user' ? 'u' : 'a');
+  el.textContent = text;
+  const log = document.getElementById('log');
+  log.appendChild(el); log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+async function send() {
+  const input = document.getElementById('prompt');
+  const text = input.value.trim();
+  if (!text) return;
+  if (!account) { alert('Get a key first.'); return; }
+  input.value = '';
+  add('user', text);
+  const pending = add('assistant', '…');
+  try {
+    const r = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + account.api_key},
+      body: JSON.stringify({model: document.getElementById('model').value,
+        messages: [{role: 'user', content: text}]}),
+    });
+    const d = await r.json();
+    if (!r.ok) { pending.textContent = '⚠ ' + (d.detail || JSON.stringify(d)); return; }
+    pending.textContent = d.choices?.[0]?.message?.content || '(no content)';
+  } catch (e) { pending.textContent = '⚠ ' + e.message; }
+}
+
+document.getElementById('mint').onclick = mint;
+document.getElementById('deposit').onclick = deposit;
+document.getElementById('send').onclick = send;
+document.getElementById('prompt').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+</script>
+</body>
+</html>
