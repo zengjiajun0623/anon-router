@@ -5,184 +5,503 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>anon-router · pay crypto for AI inference</title>
 <style>
+  /* IBM Plex Mono, self-hosted (the CSP blocks CDN fonts by design — see /privacy) */
+  @font-face {
+    font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 400;
+    font-display: swap; src: url(/fonts/ibm-plex-mono-400.woff2) format('woff2');
+  }
+  @font-face {
+    font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 600;
+    font-display: swap; src: url(/fonts/ibm-plex-mono-600.woff2) format('woff2');
+  }
+  @font-face {
+    font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 700;
+    font-display: swap; src: url(/fonts/ibm-plex-mono-700.woff2) format('woff2');
+  }
+
   :root {
-    --bg: #f6f7f8; --panel: #ffffff; --panel2: #f1f4f5; --text: #1a1e20;
-    --muted: #5c6770; --accent: #0f766e; --accent-dim: #b7dcd5;
-    --border: #dde3e6; --danger: #a8502f; --radius: 10px;
+    /* Modernist tokens (claude.ai/design "Anon-router 黑客风格重设计") */
+    --bg: #f3f2f2; --text: #201e1d; --accent: #ec3013;
+    --divider: rgba(32, 30, 29, 0.4);
+    --n100: #f8f4f4; --n200: #eae7e7; --n300: #d7d3d3; --n500: #9b9797;
+    --n600: #7d7979; --n700: #605d5d; --n800: #444141;
+    --accent-100: #fff2ef; --accent-300: #ffc4b8; --accent-700: #ae1800;
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font: 14px/1.65 var(--mono);
     -webkit-font-smoothing: antialiased;
   }
-  a { color: var(--accent); }
-  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .wrap { max-width: 920px; margin: 0 auto; padding: 48px 20px 96px; }
-  header h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.02em; }
-  header p { color: var(--muted); margin: 0 0 4px; font-size: 17px; }
-  .sub { font-size: 14px; }
-  .grid { display: grid; gap: 18px; margin-top: 34px; }
-  .card {
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 22px;
+  a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
+  a:hover { color: var(--accent); }
+  code, .mono { font-family: inherit; }
+  ::selection { background: var(--accent-300); }
+  :focus { outline: none; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @keyframes ar-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+  .cursor { color: var(--accent); animation: ar-blink 1.1s step-end infinite; }
+  .hidden { display: none !important; }
+  .muted { color: var(--n600); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+  .kicker {
+    font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--n600);
   }
-  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
-    color: var(--muted); margin: 0 0 14px; font-weight: 600; }
-  .step { display: flex; align-items: baseline; gap: 10px; }
-  .step .n { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
+
+  /* ── header ── */
+  .top { border-bottom: 2px solid var(--divider); }
+  .top .wrap {
+    padding-top: 14px; padding-bottom: 14px;
+    display: flex; align-items: baseline; gap: 24px; flex-wrap: wrap;
+  }
+  .brand { font-weight: 700; letter-spacing: 0.02em; }
+  .top nav {
+    margin-left: auto; display: flex; gap: 20px; font-size: 12px;
+    letter-spacing: 0.1em; text-transform: uppercase;
+  }
+  .top nav a { text-decoration: none; border-bottom: 1px solid var(--text); }
+  .top nav a:hover { border-bottom-color: var(--accent); }
+
+  /* ── hero ── */
+  .hero { padding: 56px 0 48px; }
+  .banner {
+    margin: 0; font-family: inherit; color: var(--accent); font-size: 11px;
+    line-height: 1.25; overflow-x: auto; font-weight: 600;
+  }
+  .hero h1 {
+    margin: 40px 0 0; font-size: 34px; line-height: 1.25; font-weight: 700;
+    max-width: 30ch; text-wrap: pretty;
+  }
+  .hero .lede { margin: 20px 0 0; max-width: 66ch; color: var(--n700); }
+  .tags {
+    margin-top: 28px; display: flex; gap: 10px; flex-wrap: wrap;
+    font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  .tags span { border: 1px solid var(--text); padding: 3px 10px; }
+  .tags span.hot { border-color: var(--accent); color: var(--accent); }
+
+  /* ── protocol diagram ── */
+  .proto {
+    border-top: 2px solid var(--divider); border-bottom: 2px solid var(--divider);
+    background: var(--n100);
+  }
+  .proto .wrap { padding-top: 32px; padding-bottom: 32px; }
+  .proto pre {
+    margin: 16px 0 0; font-family: inherit; font-size: 13px; line-height: 1.5;
+    overflow-x: auto;
+  }
+  .proto .redact { background: var(--text); color: var(--text); }
+  .proto .sever { color: var(--accent); font-weight: 700; }
+
+  /* ── numbered steps ── */
+  .step { border-top: 2px solid var(--divider); }
+  .step .wrap {
+    padding-top: 48px; padding-bottom: 48px;
+    display: grid; grid-template-columns: 120px 1fr; gap: 32px; align-items: start;
+  }
+  .step .num { font-size: 44px; font-weight: 700; color: var(--accent); line-height: 1; }
+  .step h2, .flat h2 {
+    margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .step .how { margin: 12px 0 20px; max-width: 62ch; color: var(--n700); }
+  .step:first-of-type { border-top: 0; }
+
+  /* ── buttons ── */
   button {
-    background: var(--accent); color: #ffffff; border: none; font-weight: 600;
-    padding: 10px 16px; border-radius: 8px; cursor: pointer; font-size: 14px;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer;
+    background: var(--accent); color: var(--bg); border: 2px solid var(--accent);
+    padding: 8px 16px; border-radius: 0;
   }
-  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
-  button.small { padding: 7px 12px; font-size: 13px; font-weight: 500; }
+  button:hover { background: var(--accent-700); border-color: var(--accent-700); }
   button:disabled { opacity: 0.45; cursor: default; }
+  button.ghost { background: transparent; color: var(--text); border-color: var(--text); }
+  button.ghost:hover { background: var(--n200); }
+  button.small { padding: 5px 12px; font-size: 11px; }
   button.copy {
-    flex: none; background: transparent; color: var(--muted);
-    border: 1px solid var(--border); font-weight: 500; font-size: 11.5px;
-    padding: 3px 9px; border-radius: 6px;
+    flex: none; background: transparent; color: var(--n600);
+    border: 1px solid var(--divider); font-weight: 600; font-size: 10px;
+    padding: 3px 9px;
   }
-  button.copy:hover { color: var(--text); border-color: var(--accent-dim); }
-  button.copy.done { color: var(--accent); border-color: var(--accent-dim); }
+  button.copy:hover { color: var(--text); border-color: var(--text); }
+  button.copy.done { color: var(--accent); border-color: var(--accent); }
   button.linklike {
-    background: none; border: none; padding: 0; font-size: 12.5px;
-    color: var(--muted); font-weight: 400; cursor: pointer;
+    background: none; border: none; padding: 0; font-size: 12px;
+    color: var(--n600); font-weight: 400; letter-spacing: 0; text-transform: none;
     text-decoration: underline; text-underline-offset: 3px;
   }
-  button.linklike:hover { color: var(--text); }
+  button.linklike:hover { color: var(--text); background: none; }
+
+  /* ── inputs ── */
   input, select {
-    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
-    padding: 10px 12px; border-radius: 8px; font-size: 14px; width: 100%;
+    font-family: var(--mono); font-size: 13px; color: var(--text);
+    background: var(--n100); border: 2px solid var(--text); border-radius: 0;
+    padding: 8px 12px; width: 100%; caret-color: var(--accent);
   }
-  .row { display: flex; gap: 10px; align-items: center; }
-  .kv { display: flex; align-items: center; gap: 12px; padding: 8px 0;
-    border-bottom: 1px solid var(--border); font-size: 13px; }
-  .kv:last-child { border-bottom: none; }
-  .kv .k { color: var(--muted); flex: none; }
-  .kv .v { flex: 1; text-align: right; word-break: break-all; }
-  .bal { font-size: 30px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
-  .muted { color: var(--muted); }
-  .hidden { display: none; }
-  .chat { display: flex; flex-direction: column; height: 340px; }
-  .log { flex: 1; overflow-y: auto; padding: 4px 2px; display: flex; flex-direction: column; gap: 12px; }
-  .msg { max-width: 88%; padding: 9px 13px; border-radius: 10px; white-space: pre-wrap; font-size: 14px; }
-  .msg.u { align-self: flex-end; background: var(--accent-dim); color: #0b3d38; }
-  .msg.a { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); }
-  .msg.err { background: var(--panel2); border: 1px solid rgba(168, 80, 47, 0.35); color: var(--danger); }
-  .composer { display: flex; gap: 8px; margin-top: 12px; }
-  .pill { display: inline-block; font-size: 12px; color: var(--accent); border: 1px solid var(--accent-dim);
-    border-radius: 999px; padding: 2px 10px; }
-  .pill.soon { color: var(--muted); border-color: var(--border); }
-  .note { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
-  .foot { margin-top: 40px; font-size: 12.5px; color: var(--muted); }
+  input:focus-visible, select:focus-visible { border-color: var(--accent); outline: none; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .note { font-size: 12px; color: var(--n600); margin-top: 10px; }
+
+  /* ── step 01 · wallet ── */
+  .keybox { border: 2px solid var(--text); background: var(--n100); }
+  .keybox .kv {
+    display: flex; align-items: center; gap: 12px; padding: 12px 16px; flex-wrap: wrap;
+  }
+  .keybox .k {
+    font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--n600); flex: none;
+  }
+  .keybox .v {
+    font-size: 13px; font-weight: 600; word-break: break-all; flex: 1; min-width: 200px;
+  }
+  .keybox .save {
+    border-top: 1px solid var(--n300); padding: 10px 16px; font-size: 12px;
+    color: var(--n700);
+  }
+
+  /* ── step 02 · deposit ── */
+  .dep-grid { display: grid; grid-template-columns: 1fr 240px; gap: 40px; align-items: start; }
+  .dep-row { display: flex; align-items: stretch; flex-wrap: wrap; gap: 0; }
+  .dep-row input { width: 110px; text-align: right; font-weight: 600; }
+  .dep-row .unit {
+    display: flex; align-items: center; padding: 0 14px;
+    border: 2px solid var(--text); border-left: 0; font-size: 12px; letter-spacing: 0.1em;
+  }
+  .dep-row button { margin-left: 12px; }
+  .balbox { border: 2px solid var(--text); padding: 18px 20px; }
+  .bal { font-size: 40px; font-weight: 700; line-height: 1.2; margin-top: 6px; }
+  .balbox .side {
+    font-size: 11px; color: var(--accent); letter-spacing: 0.1em;
+    text-transform: uppercase; margin-top: 4px; min-height: 1.2em;
+  }
+
+  /* ── step 03 · chat ── */
+  .chatbox { border: 2px solid var(--text); }
+  .chatbar {
+    display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+    border-bottom: 2px solid var(--text); background: var(--n100); flex-wrap: wrap;
+  }
+  .chatbar select { width: auto; border: 0; background: transparent; padding: 0; font-weight: 600; }
+  .chatbar .sess {
+    margin-left: auto; font-size: 11px; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--n600);
+  }
+  .log {
+    height: 320px; overflow-y: auto; padding: 20px 16px;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .log:empty::before {
+    content: '> no history. no history is the feature.';
+    color: var(--n500); font-size: 13px;
+  }
+  .msg { max-width: 66ch; white-space: pre-wrap; font-size: 14px; }
+  .msg::before {
+    display: block; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+    margin-bottom: 4px; white-space: normal;
+  }
+  .msg.u { align-self: flex-start; max-width: 60ch; font-weight: 600; }
+  .msg.u::before { content: '> you'; color: var(--accent); }
+  .msg.a {
+    align-self: flex-start; border-left: 2px solid var(--n300);
+    padding-left: 16px; color: var(--n800);
+  }
+  .msg.a::before { content: 'model'; color: var(--n600); }
+  .msg.err { border-left-color: var(--accent); color: var(--accent-700); }
+  .msg.err::before { content: 'error'; color: var(--accent); }
+  .composer { display: flex; border-top: 2px solid var(--text); }
+  .composer input { flex: 1; border: 0; background: transparent; padding: 12px 16px; }
+  .composer button { border: 0; border-left: 2px solid var(--text); }
+
+  /* ── what's private ── */
+  .flat { border-top: 2px solid var(--divider); }
+  .flat .wrap { padding-top: 48px; padding-bottom: 48px; }
+  .checklist { border-top: 2px solid var(--text); margin-top: 24px; }
+  .check {
+    display: grid; grid-template-columns: 40px 1fr auto; gap: 16px;
+    padding: 14px 0; border-bottom: 1px solid var(--n300); align-items: baseline;
+  }
+  .check:last-child { border-bottom: 2px solid var(--text); }
+  .check .box { color: var(--accent); font-weight: 700; }
+  .check .what { font-weight: 600; }
+  .check .why { font-size: 12px; color: var(--n600); }
+  .limits {
+    margin-top: 28px; border-left: 4px solid var(--accent);
+    padding: 4px 0 4px 20px; max-width: 76ch;
+  }
+  .limits .kicker { color: var(--accent); font-weight: 700; margin-bottom: 8px; }
+  .limits p { margin: 0; font-size: 13px; color: var(--n700); }
+  .limits code { background: var(--n200); padding: 1px 6px; }
+
+  /* ── quickstart ── */
+  .quick { border-top: 2px solid var(--divider); background: var(--n100); }
+  .quick .wrap {
+    padding-top: 48px; padding-bottom: 48px;
+    display: grid; grid-template-columns: 1fr 1.2fr; gap: 40px; align-items: start;
+  }
+  .quick p { margin: 12px 0 0; max-width: 46ch; color: var(--n700); }
+  .term {
+    margin: 0; font-family: inherit; font-size: 13px; line-height: 1.7;
+    background: var(--text); color: var(--bg); padding: 20px 24px; overflow-x: auto;
+  }
+  .term .c { color: var(--n500); }
+  .term .s { color: var(--accent-300); }
+
+  /* ── poster close ── */
+  .poster { background: var(--accent); color: var(--accent-100); }
+  .poster .wrap { padding-top: 72px; padding-bottom: 72px; }
+  .poster .kicker { color: inherit; opacity: 0.8; }
+  .poster blockquote {
+    margin: 20px 0 0; font-size: clamp(28px, 4.5vw, 44px); line-height: 1.2;
+    font-weight: 700; max-width: 26ch; text-wrap: pretty;
+  }
+  .poster .attr { margin-top: 20px; font-size: 13px; letter-spacing: 0.08em; }
+
+  /* ── footer ── */
+  footer { border-top: 2px solid var(--divider); }
+  footer .wrap {
+    padding-top: 28px; padding-bottom: 28px;
+    display: grid; gap: 10px; font-size: 12px; color: var(--n600);
+  }
+  footer code { word-break: break-all; color: var(--text); }
+  footer .line { display: flex; gap: 20px; flex-wrap: wrap; }
+  footer .line .right { margin-left: auto; }
+
+  @media (max-width: 760px) {
+    .step .wrap { grid-template-columns: 1fr; gap: 12px; }
+    .dep-grid, .quick .wrap { grid-template-columns: 1fr; }
+    .check { grid-template-columns: 32px 1fr; }
+    .check .why { grid-column: 2; }
+    .banner { font-size: 7px; }
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1>anon-router</h1>
-    <p>Deposit crypto, get credits, chat privately. No signup, no card, no KYC.</p>
-    <p class="sub muted">Try it in the browser below. To call it from code or an agent,
-      run the local proxy and point any OpenAI or Anthropic tool at it,
-      <a href="/quickstart">Quickstart</a>. Your spends carry no identity and are
-      cryptographically decoupled from your deposit.</p>
+
+  <!-- ── header ── -->
+  <header class="top">
+    <div class="wrap">
+      <div class="brand">anon-router<span class="cursor">_</span></div>
+      <div class="kicker" style="letter-spacing:0.14em">testnet // sepolia // no real funds</div>
+      <nav>
+        <a href="/quickstart">quickstart</a>
+        <a href="/privacy">/privacy</a>
+        <a href="#tor">.onion</a>
+        <a href="https://github.com/zengjiajun0623/anon-router">github</a>
+      </nav>
+    </div>
   </header>
 
-  <div class="grid">
-    <!-- STEP 1 -->
-    <div class="card">
-      <h2>1 · Create a wallet</h2>
-      <div id="key-start">
-        <div class="step"><span class="n">→</span>
-          <div>No signup. Click to create an anonymous wallet.</div></div>
-        <div class="row" style="margin-top:14px">
-          <button id="mint">Create wallet</button>
-          <button id="import-start" class="linklike" type="button">Returning? Restore a wallet backup</button>
-          <span class="note" id="wallet-note-start" style="margin:0"></span>
-        </div>
-      </div>
-      <div id="key-info" class="hidden">
-        <div class="kv"><span class="k">Recovery key</span>
-          <span class="v mono" id="apikey"></span>
-          <button class="copy" id="copy-key" type="button">Copy</button></div>
-        <div class="note"><strong>Save it.</strong> Hit <em>Back up wallet</em> below to store your
-          recovery key and credits; <em>Import wallet</em> restores them in any browser. Recharge the
-          same wallet and your credit adds up. It funds the chat below. To call the API from code or an
-          agent, run the local proxy (<a href="/quickstart">Quickstart</a>).</div>
-        <div class="row" style="margin-top:12px">
-          <button id="export" class="ghost small" type="button">Back up wallet</button>
-          <button id="import-again" class="ghost small" type="button">Import wallet</button>
-          <span class="note" id="wallet-note" style="margin:0"></span>
-        </div>
-      </div>
-      <input type="file" id="import-file" accept="application/json,.json" class="hidden" />
+  <!-- ── hero ── -->
+  <section class="hero wrap">
+    <pre class="banner"> █████╗ ███╗   ██╗ ██████╗ ███╗   ██╗      ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗
+██╔══██╗████╗  ██║██╔═══██╗████╗  ██║      ██╔══██╗██╔═══██╗██║   ██║╚══██╔══╝██╔════╝██╔══██╗
+███████║██╔██╗ ██║██║   ██║██╔██╗ ██║█████╗██████╔╝██║   ██║██║   ██║   ██║   █████╗  ██████╔╝
+██╔══██║██║╚██╗██║██║   ██║██║╚██╗██║╚════╝██╔══██╗██║   ██║██║   ██║   ██║   ██╔══╝  ██╔══██╗
+██║  ██║██║ ╚████║╚██████╔╝██║ ╚████║      ██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║
+╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═══╝      ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝</pre>
+    <h1>Pay crypto for AI inference. The provider never learns who asked.</h1>
+    <p class="lede">No signup. No card. No KYC. Deposit testnet ETH, receive blind-signed
+      bearer tokens, spend them on any model. Every spend is cryptographically severed
+      from the deposit that funded it — the math is verifiable, the payer is not.</p>
+    <div class="tags">
+      <span>blind-signed ecash</span>
+      <span>openai + anthropic api</span>
+      <span>lean-proved settlement core</span>
+      <span class="hot">reachable over tor</span>
     </div>
+  </section>
 
-    <!-- STEP 2 -->
-    <div class="card" id="deposit-card">
-      <h2>2 · Deposit for credits</h2>
-      <div id="deposit-locked" class="muted">Get a key first.</div>
-      <div id="deposit-body" class="hidden">
-        <div class="row" style="margin-bottom:4px">
-          <input id="amount" type="number" step="0.001" value="0.05" min="0" />
-          <span class="muted" style="white-space:nowrap">ETH</span>
-          <button id="deposit">Deposit with wallet</button>
+  <!-- ── protocol diagram ── -->
+  <section class="proto">
+    <div class="wrap">
+      <div class="kicker">// how a request pays for itself</div>
+      <pre>┌────────────┐      ┌──────────────────┐      ┌───────────────┐      ┌────────────────┐
+│  DEPOSIT   │─────▶│    BLIND MINT    │─────▶│     SPEND     │─────▶│   INFERENCE    │
+│ 0.05 ETH   │      │ signs the token  │      │ X-Cash: <span class="redact">████</span>  │      │ provider sees  │
+│ sepolia    │      │ without seeing it│      │ bearer, burned│      │ only the router│
+└────────────┘      └──────────────────┘      └───────────────┘      └────────────────┘
+      │                       │                       │
+      └── pseudonymous ───────┘                       └── anonymous. no account, no key,
+          (mint sees this)      <span class="sever">╳ link severed</span>          no name — the token checked out.</pre>
+    </div>
+  </section>
+
+  <!-- ── step 01 · wallet ── -->
+  <section class="step">
+    <div class="wrap">
+      <div class="num">01</div>
+      <div>
+        <h2>Create a wallet</h2>
+        <p class="how">No email, no phone, no name. A wallet is a recovery key — hold it
+          and the credits are yours; lose it and no one can help you, which is the point.</p>
+        <div id="key-start">
+          <div class="row">
+            <button id="mint">create wallet</button>
+            <button id="import-start" class="linklike" type="button">returning? restore a wallet backup</button>
+            <span class="note" id="wallet-note-start" style="margin:0"></span>
+          </div>
         </div>
-        <div class="note" id="deposit-usd" style="margin:0 0 10px"></div>
-        <div class="note" style="margin:0 0 10px">Your wallet will switch to Sepolia. Need test ETH?
-          Get it free from a Sepolia faucet
-          (<a href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia" target="_blank" rel="noopener">Google</a>,
-          <a href="https://sepolia-faucet.pk910.de" target="_blank" rel="noopener">PoW faucet</a>).</div>
-        <div class="bal">$<span id="balance">0.00</span></div>
-        <div class="note" id="bal-side" style="margin-top:2px"></div>
+        <div id="key-info" class="hidden">
+          <div class="keybox">
+            <div class="kv">
+              <span class="k">recovery&nbsp;key</span>
+              <span class="v mono" id="apikey"></span>
+              <button class="copy" id="copy-key" type="button">Copy</button>
+            </div>
+            <div class="save">Save it. <strong>Back up wallet</strong> stores your key and
+              credits; <strong>Import wallet</strong> restores them in any browser. Recharge
+              the same wallet and credit adds up. It funds the chat below. To call the API
+              from code or an agent, run the local proxy (<a href="/quickstart">quickstart</a>).</div>
+          </div>
+          <div class="row" style="margin-top:16px">
+            <button id="export" class="ghost small" type="button">back up wallet</button>
+            <button id="import-again" class="ghost small" type="button">import wallet</button>
+            <span class="note" id="wallet-note" style="margin:0"></span>
+          </div>
+        </div>
+        <input type="file" id="import-file" accept="application/json,.json" class="hidden" />
       </div>
     </div>
+  </section>
 
-    <!-- STEP 3 -->
-    <div class="card">
-      <h2>3 · Chat <span class="pill">live</span></h2>
-      <div class="row" style="margin-bottom:12px">
-        <select id="model">
-          <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
-        </select>
+  <!-- ── step 02 · deposit ── -->
+  <section class="step">
+    <div class="wrap">
+      <div class="num">02</div>
+      <div>
+        <h2>Deposit for credits</h2>
+        <div id="deposit-locked" class="how" style="margin-bottom:0">&gt; locked. create a wallet first.</div>
+        <div id="deposit-body" class="hidden">
+          <div class="dep-grid">
+            <div>
+              <p class="how" style="max-width:56ch">Send from any wallet — it switches you
+                to Sepolia. Credits land in ~2s. Need test ETH? A Sepolia faucet gives it
+                away (<a href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia" target="_blank" rel="noopener">Google</a>,
+                <a href="https://sepolia-faucet.pk910.de" target="_blank" rel="noopener">PoW faucet</a>).</p>
+              <div class="dep-row">
+                <input id="amount" type="number" step="0.001" value="0.05" min="0" />
+                <span class="unit">ETH</span>
+                <button id="deposit">deposit with wallet</button>
+              </div>
+              <div class="note" id="deposit-usd"></div>
+            </div>
+            <div class="balbox">
+              <div class="kicker">credit balance</div>
+              <div class="bal">$<span id="balance">0.00</span></div>
+              <div class="side" id="bal-side"></div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="note" style="margin:0 0 12px">Private by default: your spends carry no identity and
-        aren't cryptographically tied to your deposit.</div>
-      <div class="chat">
-        <div class="log" id="log"></div>
-        <div class="composer">
-          <input id="prompt" placeholder="Ask anything…" />
-          <button id="send">Send</button>
+    </div>
+  </section>
+
+  <!-- ── step 03 · chat ── -->
+  <section class="step">
+    <div class="wrap">
+      <div class="num">03</div>
+      <div>
+        <h2>Chat live</h2>
+        <p class="how">Private by default: each request prepays with a bearer token attached
+          in the <code style="background:var(--n200);padding:1px 6px">X-Cash</code> header.
+          Verified, burned, forgotten.</p>
+        <div class="chatbox">
+          <div class="chatbar">
+            <select id="model">
+              <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
+            </select>
+            <span class="sess">session: unlinkable · logs: none</span>
+          </div>
+          <div class="log" id="log"></div>
+          <div class="composer">
+            <input id="prompt" placeholder="Ask anything…" />
+            <button id="send">send</button>
+          </div>
         </div>
         <div class="note hidden" id="chat-hint" style="margin-top:8px"></div>
       </div>
     </div>
+  </section>
 
-    <!-- PRIVACY STATEMENT (minimal, honest) -->
-    <div class="card">
+  <!-- ── what's private ── -->
+  <section class="flat" id="private">
+    <div class="wrap">
       <h2>What's private</h2>
-      <div class="kv"><span class="k">No signup, no card, no KYC</span><span class="v">✓ (a deposit makes a pseudonymous account; a voucher makes none)</span></div>
-      <div class="kv"><span class="k">No direct link from a spend to your deposit</span><span class="v">✓ blind-signed ecash</span></div>
-      <div class="kv"><span class="k">The provider only ever sees the router, never you</span><span class="v">✓</span></div>
-      <div class="note">Honest limits: the blind signatures remove the <em>direct</em> cryptographic link,
-        but in practice unlinkability is only as strong as how many others are claiming and spending in the
-        same window (small on this early alpha). The router still sees amounts and timing, and our app
-        doesn't log IPs but the hosting edge can, so connect over the <code>.onion</code> and space out
-        claims and spends. The model reads your prompt (use a <code>local/*</code> model to keep it off
-        third parties); the balance is custodial. Full posture at <code>/privacy</code>.</div>
+      <div class="checklist">
+        <div class="check">
+          <span class="box">[x]</span>
+          <span class="what">No signup, no card, no KYC</span>
+          <span class="why">a deposit makes a pseudonymous account; a voucher makes none</span>
+        </div>
+        <div class="check">
+          <span class="box">[x]</span>
+          <span class="what">No direct link from a spend to your deposit</span>
+          <span class="why">blind-signed ecash (BDHKE)</span>
+        </div>
+        <div class="check">
+          <span class="box">[x]</span>
+          <span class="what">The provider only ever sees the router, never you</span>
+          <span class="why">requests carry no identity</span>
+        </div>
+      </div>
+      <div class="limits">
+        <div class="kicker">honest limits — read this part</div>
+        <p>Blind signatures remove the <em>direct</em> cryptographic link, but unlinkability
+          is only as strong as the crowd claiming and spending in the same window (small, on
+          this alpha). The router still sees amounts and timing. We don't log IPs; the hosting
+          edge can — so connect over the <code>.onion</code> and space out claims and spends.
+          The model reads your prompt (use a <code>local/*</code> model to keep it off third
+          parties). The balance is custodial: we hold the float — keep balances small. The
+          non-custodial escrow, safety core machine-checked in Lean, is on the roadmap.
+          Full posture at <a href="/privacy">/privacy</a>.</p>
+      </div>
     </div>
-  </div>
+  </section>
 
-  <div class="foot">
-    Testnet demo. Deposits use Sepolia test ETH; no real funds are involved.
-    Today's deposits sit in a custodial vault (we hold the float — keep balances small).
-    The non-custodial escrow, whose safety core is machine-checked (Lean), is on the roadmap.
-    <div id="onion-line" class="hidden" style="margin-top:8px">
-      Reachable over Tor (hides your IP, no exit node): <code id="onion-addr" class="mono"></code>
+  <!-- ── quickstart ── -->
+  <section class="quick" id="quickstart">
+    <div class="wrap">
+      <div>
+        <h2 style="margin:0;font-size:20px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase">Call it from code</h2>
+        <p>There is no hosted API key — a persistent key is a linkable identifier, so that
+          lane was removed. Run the local proxy and point any OpenAI or Anthropic tool at it:
+          Cursor, Claude Code, the SDKs. Full steps: <a href="/quickstart">/quickstart</a>.</p>
+      </div>
+      <pre class="term"><span class="c">$</span> anon-router serve
+<span class="c"># proxy listening on http://127.0.0.1:8788</span>
+<span class="c">&#8203;</span>
+<span class="c">$</span> export OPENAI_BASE_URL=http://127.0.0.1:8788/v1
+<span class="c">$</span> anon-router chat <span class="s">"hello"</span> --model openai/gpt-4o-mini
+<span class="c"># pays per request. no key. no account.</span></pre>
     </div>
-  </div>
-</div>
+  </section>
+
+  <!-- ── poster close ── -->
+  <section class="poster">
+    <div class="wrap">
+      <div class="kicker">// why this exists</div>
+      <blockquote>"Privacy is necessary for an open society in the electronic age."</blockquote>
+      <div class="attr">— Eric Hughes, A Cypherpunk's Manifesto, 1993. Inference shouldn't be the exception.</div>
+    </div>
+  </section>
+
+  <!-- ── footer ── -->
+  <footer id="tor">
+    <div class="wrap">
+      <div id="onion-line" class="hidden">
+        reachable over tor (hides your IP, no exit node):
+        <code id="onion-addr" class="mono"></code>
+      </div>
+      <div class="line">
+        <span>testnet demo · deposits use sepolia test ETH · no real funds</span>
+        <span class="right">contract: 3 independent reviews + Lean safety proof ·
+          <a href="https://github.com/zengjiajun0623/anon-router/blob/main/VERIFICATION.md">VERIFICATION.md</a></span>
+      </div>
+    </div>
+  </footer>
 
 <script type="module" src="/app.js"></script>
 </body>

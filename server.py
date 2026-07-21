@@ -370,6 +370,21 @@ def app_js():
     )
 
 
+_FONTS = {"ibm-plex-mono-400.woff2", "ibm-plex-mono-600.woff2",
+          "ibm-plex-mono-700.woff2"}
+
+
+@app.get("/fonts/{name}")
+def fonts(name: str):
+    """Self-hosted webfonts (same-origin; the CSP blocks CDN fonts by design)."""
+    if name not in _FONTS:
+        raise HTTPException(404, "unknown font")
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        os.path.join(ROOT, "web", "fonts", name), media_type="font/woff2"
+    )
+
+
 def _onion_address() -> str:
     """The published v3 onion, read from tor's own hostname file (the source of
     truth) so /privacy reflects reality whenever TOR_ONION=1 actually publishes
