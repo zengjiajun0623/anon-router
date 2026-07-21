@@ -1,136 +1,131 @@
 # anon-router
 
-Pay crypto for AI inference. Deposit testnet ETH (or redeem a voucher), get
-credits, and call any model. The provider only ever sees an anonymous router,
-and your spends are cryptographically decoupled from the deposit that funded
-them. You use it through a small local proxy (`anon-router serve`) that speaks
-the OpenAI and Anthropic APIs; there is no hosted API key, because a persistent
-key would be a linkable identifier, so that lane was removed.
+[![PyPI](https://img.shields.io/pypi/v/anon-router.svg)](https://pypi.org/project/anon-router/)
 
-## Try the demo (local)
+**Pay crypto for AI inference, privately.** Deposit testnet ETH (or redeem a
+voucher), get credits, and call any model (GPT, Claude, and more). The provider
+only ever sees an anonymous router, and your spends are cryptographically
+decoupled from the deposit that funded them. No account, no card, no KYC.
 
-```bash
-./run_e2e.sh            # anvil + contracts + router + watcher, asserts 7/7 stages
-# then open the site:
-#   http://127.0.0.1:8402   (KEEP=1 ./run_e2e.sh leaves it running)
-```
+> Product name: **Tornado Router**. The package, repo, and CLI are still
+> `anon-router` during the rename.
 
-The site (`web/index.html`): create a wallet (no signup), **deposit ETH** from
-any wallet (it switches you to Sepolia), watch credits land in ~2s, and **chat**
-in the browser. To use it from code or an agent (Cursor, Claude Code, the OpenAI
-SDK), run the local proxy (`anon-router serve`) and point the tool at
-`http://127.0.0.1:8788`; see `CLI.md` or the `/quickstart` page.
-
-## What's built
-
-| Lane | What it gives you | Trust |
-|---|---|---|
-| **Simple** (`sk-anon-*` bearer key + `CreditVault`) | deposit → key → any OpenAI client | custodial (operator holds float) |
-| **Ecash** (blind-signed tokens) | unlinkable prepaid credits | trusted mint |
-| **Channel** (confetti zk payment channels, on-chain escrow) | deposits escrowed on-chain, unlinkable per-request payments | trust-minimized: operator can't steal/freeze |
-| **Free** (`local/*`) | self-hosted models, no payment | — |
-
-**Verification:** the on-chain contract has three independent code reviews
-(Fable, Codex, Kimi) plus a machine-checked Lean proof of its safety core
-(conservation, no-theft, terminality) — see [VERIFICATION.md](VERIFICATION.md).
-The settlement core is also written in the [Verity](https://veritylang.com) Lean
-EDSL that compiles to EVM. Testnet-only; nothing is deployed to a public chain.
-
----
-
-Payer-anonymous, OpenAI-compatible inference proxy. Prepay for credits, spend them as blind-signed bearer tokens: the router can verify every payment but cannot link any request to the deposit that funded it, or link two requests to each other.
-
-v1 rail is Cashu-style blind signatures (BDHKE) with a trusted mint. The channel lane replaces the trusted mint with confetti zk payment channels (see `../zk-payments-confetti/PROTOCOL.md`) so the router also cannot steal or freeze deposits.
-
-## How it works
-
-1. Deposit (dev: free faucet; prod: USDC) and receive blind-signed tokens in power-of-two credit denominations. 1 credit = $0.0001.
-2. Each `/v1/chat/completions` request attaches tokens in the `X-Cash` header as prepayment.
-3. The router verifies + burns the tokens, proxies to the upstream (OpenRouter), reads the exact USD cost from usage accounting, and holds the overpayment under a one-time receipt (`X-Change-Receipt` response header).
-4. The wallet redeems the receipt for fresh blind-signed change tokens.
-
-Blinding means the mint signs tokens without seeing them, so issued tokens and spent tokens are cryptographically unlinkable. Amount is bound by using one mint key per denomination.
+Live testnet alpha: **https://anon-router-production.up.railway.app** (Sepolia,
+custodial MVP).
 
 ## Quickstart
 
 ```bash
+pip install anon-router
+
+anon-router redeem <voucher>          # anonymous credit, no crypto needed
+#   or, on-chain: anon-router deposit 0.05 --key wallet.json  &&  anon-router claim
+
+anon-router serve                     # a private OpenAI + Anthropic endpoint on :8788
+```
+
+Then point any OpenAI- or Anthropic-compatible tool at `http://127.0.0.1:8788`:
+
+```bash
+curl http://127.0.0.1:8788/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"say hi"}]}'
+```
+
+Full walkthrough: the [`/quickstart`](https://anon-router-production.up.railway.app/quickstart)
+page or [`CLI.md`](CLI.md).
+
+**There is no hosted API key.** A persistent key would be an identifier the router
+sees on every call, so it could not be unlinkable. The developer interface is the
+local proxy, which attaches blind-signed ecash client-side. (The `api_key` on the
+proxy is any string.)
+
+## How it works
+
+1. **Fund once.** Deposit Sepolia ETH to a `CreditVault` (a watcher credits your
+   account) or redeem a voucher. Then `claim` drains your whole balance into
+   blind-signed ecash tokens, in one deliberate step.
+2. **Spend per request.** Each `/v1/chat/completions` call attaches ecash in the
+   `X-Cash` header. The router verifies and burns the tokens, forwards to the
+   upstream (OpenRouter), bills the exact cost, and returns change **in-band** as
+   fresh blind-signed tokens on the same response (Cashu NUT-08 style).
+3. **Unlinkable.** The mint blind-signs tokens it never sees unblinded (BDHKE), so
+   issued tokens and spent tokens cannot be linked, and a spend cannot be tied to
+   the funding account. One mint key per denomination binds the amount.
+
+## What's private, honestly
+
+- **No signup, no card, no KYC.** A deposit creates a pseudonymous account (a key
+  hash); a voucher creates none.
+- **No direct link from a spend to your deposit** (blind signatures). In practice,
+  unlinkability is only as strong as the number of others claiming and spending in
+  the same window, which is small on an early alpha.
+- **The provider only ever sees the router**, never you.
+- **Honest limits:** the model reads your prompt (use a `local/*` model to keep it
+  off third parties); the balance is **custodial** (keep it small); the router
+  still sees amounts and timing; the app does not log IPs but the hosting edge can,
+  so connect over the live Tor `.onion` and space out claims and spends.
+
+Machine-readable posture:
+[`/privacy`](https://anon-router-production.up.railway.app/privacy) ·
+[`PRIVACY.md`](PRIVACY.md).
+
+## Lanes
+
+| Lane | What it is | Trust | Status |
+|---|---|---|---|
+| **Ecash** (blind-signed tokens) | unlinkable prepaid credits, the live payment rail | custodial (operator holds float) | **live** |
+| **Channel** (confetti zk payment channels, on-chain escrow) | deposits escrowed on-chain, operator cannot steal or freeze | trust-minimized | roadmap (off by default) |
+| **Free** (`local/*`) | self-hosted models, no payment | n/a | dev |
+
+The old "bearer key into any OpenAI client" lane was intentionally removed: a
+persistent hosted key is linkable, which defeats the point.
+
+## Verification
+
+The confetti channel contract has three independent code reviews (Fable, Codex,
+Kimi) plus a machine-checked **Lean** proof of its safety core (conservation,
+no-theft, terminality); see [VERIFICATION.md](VERIFICATION.md). The settlement
+core is also written in the [Verity](https://veritylang.com) Lean EDSL that
+compiles to EVM. The live money path (cost-bounding, at-most-once spend and
+change, crash recovery, data-minimization) is covered by `tests/e2e_*.py` and was
+reviewed by Codex + Kimi + Fable.
+
+## Honest limitations
+
+- **Custodial:** the router holds prepaid float and could refuse redemption. The
+  confetti channel lane removes this (roadmap).
+- **Single instance, SQLite:** no HA. Multi-instance + Postgres is the mainnet
+  gate (one instance is downtime; many on SQLite is double-spend).
+- **Testnet only:** Sepolia ETH, no real funds. Mainnet needs an audit + counsel.
+- **Unlinkability is anonymity-set-dependent** and weakens without Tor.
+
+## Repo layout
+
+- `server.py`: the router (spend/redeem/change, cost-bounding, deposit-watcher
+  supervision, `/privacy`), `watcher.py`: the on-chain deposit watcher.
+- `wallet.py` / `cli.py`: the client wallet + the `anon-router` CLI.
+- `serve_ecash.py`: the local proxy (OpenAI + Anthropic); `anthropic_proxy.py`
+  does the Anthropic to OpenAI translation.
+- `mint.py` / `ec.py`: the BDHKE mint.
+- `web/`: the site, the in-browser ecash wallet, and `/quickstart`.
+- `confetti/`, `contracts/`, `lean/`, `verity/`: the non-custodial channel lane
+  and its proofs.
+
+## Run your own router (local dev)
+
+```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env   # set OPENROUTER_API_KEY
-.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8402
-
-# in another shell
-.venv/bin/python cli.py topup 50000          # $5 of dev credits
-.venv/bin/python cli.py chat "hello there"   # pays per request
-.venv/bin/python cli.py balance
+cp .env.example .env          # set OPENROUTER_API_KEY (and DEV_FAUCET=0 to sell credits)
+./run_e2e.sh                  # anvil + contracts + router + watcher, asserts the E2E stages
 ```
 
-Any OpenAI-compatible client works against `http://127.0.0.1:8402/v1` if it can attach the `X-Cash` header per request (the CLI/wallet does this automatically).
+Issue voucher codes with `python admin.py issue 50000`.
 
-## Selling credits (vouchers)
+## Status / roadmap
 
-The MVP resale loop: the operator funds an OpenRouter account wholesale, sells voucher codes through any channel (USDC, WeChat, resellers), and buyers redeem codes for anonymous credits. The mint sees which voucher a redemption came from but cannot link the resulting tokens to any later request (blind signatures).
-
-```bash
-# operator, on the router box:
-.venv/bin/python admin.py issue 50000          # prints a code worth $5
-.venv/bin/python admin.py list                 # ledger of issued/redeemed
-
-# buyer, anywhere:
-python cli.py redeem ar-XXXXXXXXXXXXXXXXXXXX   # code → anonymous credits
-python cli.py chat "hello" --model openai/gpt-4o-mini
-```
-
-Set `DEV_FAUCET=0` in `.env` for any deployment where credits are sold.
-
-## Trust-minimized channel lane (confetti, M4a)
-
-An opt-in payment lane where the buyer's deposit is governed by the confetti
-zk payment channel instead of trusting the mint. See [confetti/README.md](confetti/README.md).
-
-```bash
-python cli.py channel open 5000                       # deposit 5000 credits
-python cli.py chat "hello" --model openai/gpt-4o-mini --channel
-python cli.py channel status
-```
-
-Each request builds a payment proof, the router verifies and countersigns it,
-and a stale/rolled-back close is provably challengeable. M4a runs off-chain
-against an in-memory referee with the reference (non-ZK) prover; M4b adds the
-on-chain contract and the real STARK prover.
-
-## Free local lane
-
-Models prefixed `local/` route to a free upstream (RTX 3080 PC running Ollama, reached via ssh tunnel) and require no payment. For user testing without spending credits:
-
-```bash
-ssh -f -N -L 11435:127.0.0.1:11434 pc3080   # once per boot
-.venv/bin/python cli.py chat "hello" --model local/qwen3:8b
-```
-
-Override the upstream with `LOCAL_UPSTREAM` in `.env`.
-
-## Honest limitations (v1)
-
-- The mint is trusted with float: it could refuse redemption. v2 (confetti channels) removes this.
-- Payment unlinkability is not payer anonymity: use fresh connections/proxy for transport privacy. Requests within one HTTP session are linkable by the connection itself.
-- Prepay is a fixed amount per request, not a per-model max-cost estimate.
-- Streaming change redemption requires polling the receipt after the stream ends.
-- Dev faucet stands in for the USDC deposit watcher.
-
-## Milestones
-
-- **v0** — blind-signature mint, OpenRouter proxy, exact-cost metering. Done.
-- **Voucher resale** — operator sells codes, buyers redeem for anonymous credits. Done.
-- **Simple lane** — `CreditVault` deposit → bearer key → any OpenAI client; site + watcher. Done.
-- **M4a** — confetti off-chain channel protocol + router lane. Done.
-- **M4b** — on-chain escrow (`ConfettiChannels`), deposits leave custody, 3-reviewer + Lean-proof gate. Done (local Anvil).
-- **Verity** — settlement core written in Lean, compiled to EVM. In progress.
-- **M4b-real** — SP1 Groth16 verifier replacing the mock. In progress (Docker/colima).
-
-## Roadmap
-
-- USDC deposit lane (same as `CreditVault`, ERC-20 `transferFrom`)
-- Known-answer sampling audits of upstreams, published scores
-- new-api/one-api payment module (中转站 integration)
-- Durable persistence of the router's off-chain state (dedup/inbox/XMSS)
-- Public deploy to Ethereum Sepolia (operator holds the key; counsel gate first)
+- Live Sepolia testnet alpha: ecash lane, custodial, faucet off, channel off,
+  daily spend cap. **Done.**
+- Non-custodial confetti channel lane on-chain, with a real verifier (not the
+  mock). **In progress.**
+- HA + Postgres, independent security audit, counsel: the mainnet gate. **Pending.**
