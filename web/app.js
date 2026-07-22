@@ -4,6 +4,7 @@
 import * as ecash from '/ecash.js';
 import { encryptJSON, decryptJSON, deriveVaultKey, sealWithKey, openWithKey } from '/crypto.js';
 import * as usage from '/usage.js';
+import * as chat from '/chat.js';
 
 let account = null;
 let keys = null;         // /mint/keys payload (denomination pubkeys etc.)
@@ -25,7 +26,6 @@ const CHAT_KEY = 'anon-router-chat-v1';
 // inside this AES-GCM envelope on disk; the plaintext WALLET_KEY/ACCOUNT_KEY are
 // removed. The decrypted wallet is held in `mem` in memory after unlock.
 const VAULT_KEY = 'anon-router-vault-v1';
-const CHAT_MAX = 200;   // cap persisted messages so storage can't grow unbounded
 
 // Wallet storage has two modes:
 //   * plaintext (default, skippable path): loadWallet/saveWallet read/write
@@ -86,26 +86,87 @@ async function enableVault(passphrase) {
   for (const k of [WALLET_KEY, ACCOUNT_KEY]) { try { localStorage.removeItem(k); } catch (e) {} }
 }
 
-// Persist the current chat transcript by snapshotting the rendered log. Called
-// after a turn settles (not mid-stream), so the saved assistant text is final.
-function persistChat() {
-  try {
-    const msgs = [...$('log').children].map((el) => ({
-      role: el.classList.contains('u') ? 'user' : 'assistant',
-      err: el.classList.contains('err'),
-      text: el.textContent,
-    })).filter((m) => m.text && m.text !== '…').slice(-CHAT_MAX);
-    localStorage.setItem(CHAT_KEY, JSON.stringify(msgs));
-  } catch (e) {}
-}
+// ---- chat sessions (multiple conversations, stored on-device via chat.js) ----
+let activeSession = null;
 
-function restoreChat() {
-  let msgs = [];
-  try { msgs = JSON.parse(localStorage.getItem(CHAT_KEY)) || []; } catch (e) { msgs = []; }
-  for (const m of msgs) {
+function renderMessages(session) {
+  const log = $('log');
+  log.innerHTML = '';
+  for (const m of (session && session.messages) || []) {
     const el = add(m.role, m.text);
     if (m.err) el.classList.add('err');
   }
+}
+
+async function renderSessionBar() {
+  const sel = $('session-select');
+  if (!sel) return;
+  const sessions = await chat.listSessions();
+  sel.innerHTML = '';
+  for (const s of sessions) {
+    const o = document.createElement('option');
+    o.value = s.id;
+    o.textContent = (s.title || 'New chat') + (s.count ? ` (${s.count})` : '');
+    sel.appendChild(o);
+  }
+  if (activeSession) sel.value = activeSession.id;
+}
+
+async function loadSession(id) {
+  const s = await chat.getSession(id);
+  if (!s) return;
+  activeSession = s;
+  renderMessages(s);
+  if (s.model) {
+    const m = $('model');
+    if ([...m.options].some((o) => o.value === s.model)) m.value = s.model;
+  }
+  await renderSessionBar();
+  updateSendState();
+}
+
+async function newChat() {
+  activeSession = chat.newSession($('model').value);
+  await chat.putSession(activeSession);
+  $('log').innerHTML = '';
+  await renderSessionBar();
+  updateSendState();
+}
+
+async function renameActiveSession() {
+  if (!activeSession) return;
+  const t = prompt('Rename this chat:', activeSession.title || '');
+  if (t === null) return;
+  activeSession.title = t.trim() || activeSession.title;
+  await chat.putSession(activeSession);
+  await renderSessionBar();
+}
+
+async function deleteActiveSession() {
+  if (!activeSession) return;
+  if (!confirm('Delete this conversation?')) return;
+  await chat.deleteSession(activeSession.id);
+  activeSession = null;
+  const list = await chat.listSessions();
+  if (list.length) await loadSession(list[0].id); else await newChat();
+}
+
+// Open the most recent conversation, migrating a legacy single transcript first.
+async function initSessions() {
+  const list = await chat.listSessions();
+  if (!list.length) {
+    let legacy = null;
+    try { legacy = JSON.parse(localStorage.getItem(CHAT_KEY)); } catch (e) {}
+    if (Array.isArray(legacy) && legacy.length) {
+      const s = chat.newSession($('model').value);
+      s.messages = legacy.map((m) => ({ role: m.role, text: m.text, err: !!m.err, ts: Date.now() }));
+      s.title = chat.titleFrom(s.messages);
+      await chat.putSession(s);
+      try { localStorage.removeItem(CHAT_KEY); } catch (e) {}
+    }
+  }
+  const fresh = await chat.listSessions();
+  if (fresh.length) await loadSession(fresh[0].id); else await newChat();
 }
 
 async function mintKeys() {
@@ -558,7 +619,14 @@ async function send() {
     inFlight = false;
     await flushWallet();   // ensure any wallet change this turn is durable
     renderBalance();
-    persistChat();   // snapshot the settled transcript so a refresh keeps it
+    // Save the turn into the active conversation (on-device only).
+    if (activeSession) {
+      chat.appendMessage(activeSession, 'user', text);
+      chat.appendMessage(activeSession, 'assistant', pending.textContent,
+        pending.classList.contains('err'));
+      await chat.putSession(activeSession);
+      renderSessionBar();
+    }
     if (requestStarted) {
       rec.latencyMs = Date.now() - startedAt;
       usage.recordRequest(rec);   // on-device only; never sent to the server
@@ -706,6 +774,7 @@ function newWallet() {
   $('deposit-locked').classList.remove('hidden');
   reflectEncState();
   renderBalance();
+  newChat();   // fresh conversation to match the fresh wallet (old chats remain)
 }
 
 // ---- at-rest encryption UI ----
@@ -876,7 +945,7 @@ async function restoreSession() {
     account = savedAccount;
     unlockAfterKey();
   }
-  restoreChat();
+  await initSessions();
   reflectEncState();
   updateSendState();
   try { await mintKeys(); await redeemPendingChange(); } catch (e) {}
@@ -892,6 +961,12 @@ async function boot() {
 
 // tabs
 for (const v of VIEWS) $('tab-' + v).onclick = () => showView(v);
+
+// chat sessions
+$('new-chat').onclick = newChat;
+$('rename-chat').onclick = renameActiveSession;
+$('delete-chat').onclick = deleteActiveSession;
+$('session-select').onchange = (e) => loadSession(e.target.value);
 
 // activity actions
 $('act-export').onclick = async () => {
@@ -909,15 +984,18 @@ const clearActivity = async () => {
 };
 $('act-clear').onclick = clearActivity;
 $('set-clear-activity').onclick = clearActivity;
-$('set-clear-chat').onclick = () => {
-  if (!confirm('Clear chat history on this device?')) return;
+$('set-clear-chat').onclick = async () => {
+  if (!confirm('Delete ALL conversations on this device?')) return;
   try { localStorage.removeItem(CHAT_KEY); } catch (e) {}
-  $('log').innerHTML = '';
+  await chat.clearAll();
+  activeSession = null;
+  await newChat();
 };
 $('set-clear-all').onclick = () => {
   if (!confirm('Erase EVERYTHING on this device (wallet, activity, chat)? Back up your '
     + 'wallet first — its credits are gone otherwise.')) return;
   usage.clearUsage();
+  chat.clearAll();
   for (const k of [ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY,
                    PENDING_CHANGE_KEY, VAULT_KEY, RETENTION_KEY]) {
     try { localStorage.removeItem(k); } catch (e) {}

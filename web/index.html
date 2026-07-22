@@ -178,10 +178,16 @@
     <!-- STEP 3 -->
     <div class="card">
       <h2>3 · Chat <span class="pill">live</span></h2>
-      <div class="row" style="margin-bottom:12px">
+      <div class="row" style="margin-bottom:10px">
         <select id="model">
           <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
         </select>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <select id="session-select" style="flex:1"></select>
+        <button id="new-chat" class="small ghost" type="button">New</button>
+        <button id="rename-chat" class="copy" type="button">Rename</button>
+        <button id="delete-chat" class="copy" type="button">Delete</button>
       </div>
       <div class="note" style="margin:0 0 12px">Private by default: your spends carry no identity and
         aren't cryptographically tied to your deposit.</div>
