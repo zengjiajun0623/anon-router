@@ -342,7 +342,8 @@ def main():
                             f"{ROUTER}/account/credit",
                             headers={"X-Credit-Secret": CREDIT_SECRET},
                             json={"key_hash": kh, "credits": credits,
-                                  "txhash": txhash, "log_index": log_index},
+                                  "txhash": txhash, "log_index": log_index,
+                                  "block_number": ev["blockNumber"]},
                         )
                         resp.raise_for_status()
                         status = resp.json().get("status")

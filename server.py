@@ -248,8 +248,35 @@ try:
 except sqlite3.OperationalError:
     pass
 db.execute("CREATE TABLE IF NOT EXISTS spend_ledger(day TEXT PRIMARY KEY, usd REAL)")
+# Append-only credit ledger: every change to an account balance writes a row, so
+# balances are auditable (accounts.balance is a projection of SUM(delta)) and
+# deposits vs claims can be reconciled. Identity-poor by design: keyed by the
+# account key_hash and a reason/ref only — never linked to any spend (spends are
+# ecash, off-ledger). reason ∈ {deposit, claim}. ref = event_id | idem_key.
+db.execute(
+    "CREATE TABLE IF NOT EXISTS credit_ledger("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, key_hash TEXT, delta INTEGER, "
+    "reason TEXT, ref TEXT, ts INTEGER)"
+)
+db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_kh ON credit_ledger(key_hash, ts)")
+# One row per credited on-chain deposit event (supersedes the bare seen_deposits
+# marker for history/reconciliation). event_id = txhash:logIndex.
+db.execute(
+    "CREATE TABLE IF NOT EXISTS deposits("
+    "event_id TEXT PRIMARY KEY, key_hash TEXT, credits INTEGER, "
+    "block_number INTEGER, status TEXT, ts INTEGER)"
+)
 db.commit()
 db_write_lock = asyncio.Lock()
+
+
+def _ledger(cur, key_hash: str, delta: int, reason: str, ref: str) -> None:
+    """Append one credit-ledger row inside the caller's open transaction."""
+    cur.execute(
+        "INSERT INTO credit_ledger(key_hash, delta, reason, ref, ts) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (key_hash, int(delta), reason, ref, int(time.time())),
+    )
 
 account_creations = deque()
 account_rate_lock = threading.Lock()
@@ -993,6 +1020,7 @@ async def account_credit(request: Request):
         raise HTTPException(403, "forbidden")
     body = await request.json()
     kh, credits, txhash = body["key_hash"], int(body["credits"]), body["txhash"]
+    block_number = body.get("block_number")
     # dedup per LOG, not per tx: one tx can emit several Deposited events
     event_id = f"{txhash}:{body.get('log_index', 0)}"
     async with db_write_lock:
@@ -1009,6 +1037,14 @@ async def account_credit(request: Request):
             # do NOT mark seen: the account may be created later and re-scanned
             return {"status": "no_such_account"}
         cur.execute("INSERT INTO seen_deposits(txhash) VALUES (?)", (event_id,))
+        _ledger(cur, kh, credits, "deposit", event_id)
+        cur.execute(
+            "INSERT OR REPLACE INTO deposits(event_id, key_hash, credits, "
+            "block_number, status, ts) VALUES (?, ?, ?, ?, 'credited', ?)",
+            (event_id, kh, credits,
+             int(block_number) if block_number is not None else None,
+             int(time.time())),
+        )
         db.commit()
     return {"status": "credited", "credits": credits}
 
@@ -1094,6 +1130,7 @@ async def mint_claim(request: Request):
             )
             if cur.rowcount == 0:
                 raise HTTPException(409, "balance changed, retry")
+            _ledger(cur, _key_hash(key), -total, "claim", idem_key)
             response = {"signatures": signatures}
             if idem_key:
                 db.execute(
