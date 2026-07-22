@@ -370,6 +370,15 @@ def app_js():
     )
 
 
+@app.get("/crypto.js")
+def crypto_js():
+    """Wallet-backup encryption module (Web Crypto only; same-origin, no CDN)."""
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        os.path.join(ROOT, "web", "crypto.js"), media_type="text/javascript"
+    )
+
+
 def _onion_address() -> str:
     """The published v3 onion, read from tor's own hostname file (the source of
     truth) so /privacy reflects reality whenever TOR_ONION=1 actually publishes

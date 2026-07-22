@@ -2,6 +2,7 @@
 // crypto lives in /ecash.js and is unchanged here.
 
 import * as ecash from '/ecash.js';
+import { encryptJSON, decryptJSON } from '/crypto.js';
 
 let account = null;
 let keys = null;         // /mint/keys payload (denomination pubkeys etc.)
@@ -17,9 +18,41 @@ const $ = (id) => document.getElementById(id);
 const WALLET_KEY = 'anon-router-ecash-v1';
 const PENDING_CLAIM_KEY = 'anon-router-pending-claim-v1';
 const PENDING_CHANGE_KEY = 'anon-router-pending-change-v1';
+// The account (recovery/funding key + deposit context) and the chat transcript
+// are persisted alongside the ecash tokens so a page refresh restores the whole
+// session, not just the balance. NOTE: like the tokens, these are stored in the
+// clear today — at-rest encryption (passphrase/AES-GCM) is the next increment.
+const ACCOUNT_KEY = 'anon-router-account-v1';
+const CHAT_KEY = 'anon-router-chat-v1';
+const CHAT_MAX = 200;   // cap persisted messages so storage can't grow unbounded
 const loadWallet = () => { try { return JSON.parse(localStorage.getItem(WALLET_KEY)) || []; } catch (e) { return []; } };
 const saveWallet = (t) => localStorage.setItem(WALLET_KEY, JSON.stringify(t));
 const ecashBalance = () => loadWallet().reduce((s, t) => s + t.amount, 0);
+
+const loadAccount = () => { try { return JSON.parse(localStorage.getItem(ACCOUNT_KEY)) || null; } catch (e) { return null; } };
+const saveAccount = (a) => { try { localStorage.setItem(ACCOUNT_KEY, JSON.stringify(a)); } catch (e) {} };
+
+// Persist the current chat transcript by snapshotting the rendered log. Called
+// after a turn settles (not mid-stream), so the saved assistant text is final.
+function persistChat() {
+  try {
+    const msgs = [...$('log').children].map((el) => ({
+      role: el.classList.contains('u') ? 'user' : 'assistant',
+      err: el.classList.contains('err'),
+      text: el.textContent,
+    })).filter((m) => m.text && m.text !== '…').slice(-CHAT_MAX);
+    localStorage.setItem(CHAT_KEY, JSON.stringify(msgs));
+  } catch (e) {}
+}
+
+function restoreChat() {
+  let msgs = [];
+  try { msgs = JSON.parse(localStorage.getItem(CHAT_KEY)) || []; } catch (e) { msgs = []; }
+  for (const m of msgs) {
+    const el = add(m.role, m.text);
+    if (m.err) el.classList.add('err');
+  }
+}
 
 async function mintKeys() {
   if (!keys) keys = await (await fetch('/mint/keys')).json();
@@ -76,6 +109,7 @@ async function mint() {
     const r = await fetch('/account/new', { method: 'POST' });
     if (!r.ok) throw new Error('could not mint a key (' + r.status + '), try again');
     account = await r.json();
+    saveAccount(account);   // survive a refresh (see ACCOUNT_KEY)
   } catch (e) {
     btn.disabled = false;
     walletNote(e.message);
@@ -449,6 +483,7 @@ async function send() {
   } finally {
     inFlight = false;
     renderBalance();
+    persistChat();   // snapshot the settled transcript so a refresh keeps it
   }
 }
 
@@ -464,13 +499,7 @@ function walletNote(msg) {
   walletNoteTimer = setTimeout(() => { el.textContent = ''; }, 6000);
 }
 
-function exportWallet() {
-  const data = {
-    format: 'anon-router-wallet-v1',
-    exported_at: new Date().toISOString(),
-    account,
-    tokens: loadWallet(),
-  };
+function downloadBackup(data, note) {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -479,39 +508,121 @@ function exportWallet() {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-  walletNote('Backup downloaded. Keep the file private; it is the money.');
+  walletNote(note);
+}
+
+// Back up the wallet. Default: prompt for a passphrase and encrypt the payload
+// (the file is bearer money, so an encrypted backup is far safer to store/sync).
+// Skippable — an empty passphrase falls back to a plaintext backup after an
+// explicit warning, honoring "encryption is optional".
+async function exportWallet() {
+  const payload = { account, tokens: loadWallet() };
+  const pass = prompt(
+    'Set a passphrase to ENCRYPT this backup (recommended — the file is your '
+    + 'money).\n\nLeave blank to export UNENCRYPTED.');
+  if (pass === null) return;  // user cancelled the whole export
+  if (pass) {
+    const confirmPass = prompt('Re-enter the passphrase to confirm.');
+    if (confirmPass === null) return;
+    if (confirmPass !== pass) { walletNote('Passphrases did not match — not exported.'); return; }
+    let vault;
+    try {
+      vault = await encryptJSON(payload, pass);
+    } catch (e) {
+      walletNote('Could not encrypt the backup: ' + e.message);
+      return;
+    }
+    downloadBackup(
+      { format: 'anon-router-wallet-enc-v1', exported_at: new Date().toISOString(), vault },
+      'Encrypted backup downloaded. Keep the passphrase safe — it cannot be recovered.');
+    return;
+  }
+  if (!confirm('Export WITHOUT encryption? Anyone who gets this file can spend '
+               + 'your credits.')) return;
+  downloadBackup(
+    { format: 'anon-router-wallet-v1', exported_at: new Date().toISOString(), account, tokens: loadWallet() },
+    'Unencrypted backup downloaded. Keep the file private; it is the money.');
+}
+
+// Validate a decrypted {account, tokens} payload and merge it into this wallet.
+// Merge (deduped by secret) so importing never drops tokens already here.
+function applyImportedPayload(payload) {
+  if (!payload || !payload.account || typeof payload.account.api_key !== 'string'
+      || !Array.isArray(payload.tokens)) {
+    throw new Error('bad format');
+  }
+  for (const t of payload.tokens) {
+    if (!(Number.isInteger(t.amount) && t.amount > 0
+        && typeof t.secret === 'string' && typeof t.C === 'string')) {
+      throw new Error('bad token');
+    }
+  }
+  const bySecret = new Map(loadWallet().map((t) => [t.secret, t]));
+  for (const t of payload.tokens) {
+    bySecret.set(t.secret, { amount: t.amount, secret: t.secret, C: t.C });
+  }
+  saveWallet([...bySecret.values()]);
+  account = payload.account;
+  saveAccount(account);
+  unlockAfterKey();
+  renderBalance();
+  walletNote('Wallet imported.');
 }
 
 function importWalletFile(file) {
   const fr = new FileReader();
-  fr.onload = () => {
+  fr.onload = async () => {
+    let data;
+    try { data = JSON.parse(fr.result); } catch (e) {
+      walletNote('That file is not an anon-router wallet backup.');
+      return;
+    }
     try {
-      const data = JSON.parse(fr.result);
-      if (data.format !== 'anon-router-wallet-v1' || !data.account
-          || typeof data.account.api_key !== 'string' || !Array.isArray(data.tokens)) {
+      if (data.format === 'anon-router-wallet-enc-v1') {
+        const pass = prompt('This backup is encrypted. Enter its passphrase.');
+        if (pass === null) return;   // cancelled
+        let payload;
+        try {
+          payload = await decryptJSON(data.vault, pass);
+        } catch (e) {
+          walletNote(e.message || 'Could not decrypt the backup.');
+          return;
+        }
+        applyImportedPayload(payload);
+      } else if (data.format === 'anon-router-wallet-v1') {
+        applyImportedPayload({ account: data.account, tokens: data.tokens });
+      } else {
         throw new Error('bad format');
       }
-      for (const t of data.tokens) {
-        if (!(Number.isInteger(t.amount) && t.amount > 0
-            && typeof t.secret === 'string' && typeof t.C === 'string')) {
-          throw new Error('bad token');
-        }
-      }
-      // Merge, deduped by secret: importing must never drop tokens already here.
-      const bySecret = new Map(loadWallet().map((t) => [t.secret, t]));
-      for (const t of data.tokens) {
-        bySecret.set(t.secret, { amount: t.amount, secret: t.secret, C: t.C });
-      }
-      saveWallet([...bySecret.values()]);
-      account = data.account;
-      unlockAfterKey();
-      renderBalance();
-      walletNote('Wallet imported.');
     } catch (e) {
-      walletNote('That file is not an anon-router wallet backup.');
+      walletNote('That file is not a valid anon-router wallet backup.');
     }
   };
   fr.readAsText(file);
+}
+
+// Clear this browser's wallet and start fresh. The tokens live ONLY here, so
+// this can destroy credits — gate it behind an explicit back-up-first confirm.
+function newWallet() {
+  const bal = ecashBalance();
+  const warn = bal > 0
+    ? `This browser holds ${bal} credits ($${(bal * ((keys && keys.credit_usd) || 0.0001)).toFixed(2)}). `
+      + 'Starting a new wallet CLEARS them from this browser. Back up first if you '
+      + 'want to keep them. Continue?'
+    : 'Start a new wallet? This clears the current wallet from this browser.';
+  if (!confirm(warn)) return;
+  for (const k of [ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY, PENDING_CHANGE_KEY]) {
+    try { localStorage.removeItem(k); } catch (e) {}
+  }
+  account = null;
+  lastAcctBal = 0;
+  $('log').innerHTML = '';
+  $('key-info').classList.add('hidden');
+  $('key-start').classList.remove('hidden');
+  $('mint').disabled = false;
+  $('deposit-body').classList.add('hidden');
+  $('deposit-locked').classList.remove('hidden');
+  renderBalance();
 }
 
 // ---- copy affordances ----
@@ -551,6 +662,7 @@ $('prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); 
 $('model').addEventListener('change', updateSendState);
 $('amount').addEventListener('input', renderDepositPreview);
 $('export').onclick = exportWallet;
+$('new-wallet').onclick = newWallet;
 const importInput = $('import-file');
 $('import-start').onclick = () => importInput.click();
 $('import-again').onclick = () => importInput.click();
@@ -559,6 +671,17 @@ importInput.addEventListener('change', () => {
   importInput.value = '';   // allow re-importing the same file
 });
 wireCopy('copy-key', 'apikey');
+
+// Restore a prior session so a refresh keeps the whole wallet, not just the
+// balance: re-hydrate the saved account (re-locks nothing, shows the key +
+// deposit UI and drains any leftover balance once) and re-render the chat.
+const savedAccount = loadAccount();
+if (savedAccount && typeof savedAccount.api_key === 'string') {
+  account = savedAccount;
+  unlockAfterKey();
+}
+restoreChat();
+
 updateSendState();
 mintKeys().then(redeemPendingChange).then(renderBalance).catch(() => renderBalance());
 
