@@ -2,7 +2,7 @@
 // crypto lives in /ecash.js and is unchanged here.
 
 import * as ecash from '/ecash.js';
-import { encryptJSON, decryptJSON } from '/crypto.js';
+import { encryptJSON, decryptJSON, deriveVaultKey, sealWithKey, openWithKey } from '/crypto.js';
 
 let account = null;
 let keys = null;         // /mint/keys payload (denomination pubkeys etc.)
@@ -18,19 +18,72 @@ const $ = (id) => document.getElementById(id);
 const WALLET_KEY = 'anon-router-ecash-v1';
 const PENDING_CLAIM_KEY = 'anon-router-pending-claim-v1';
 const PENDING_CHANGE_KEY = 'anon-router-pending-change-v1';
-// The account (recovery/funding key + deposit context) and the chat transcript
-// are persisted alongside the ecash tokens so a page refresh restores the whole
-// session, not just the balance. NOTE: like the tokens, these are stored in the
-// clear today — at-rest encryption (passphrase/AES-GCM) is the next increment.
 const ACCOUNT_KEY = 'anon-router-account-v1';
 const CHAT_KEY = 'anon-router-chat-v1';
+// Encrypted-at-rest vault (opt-in). When present, the account + tokens live ONLY
+// inside this AES-GCM envelope on disk; the plaintext WALLET_KEY/ACCOUNT_KEY are
+// removed. The decrypted wallet is held in `mem` in memory after unlock.
+const VAULT_KEY = 'anon-router-vault-v1';
 const CHAT_MAX = 200;   // cap persisted messages so storage can't grow unbounded
-const loadWallet = () => { try { return JSON.parse(localStorage.getItem(WALLET_KEY)) || []; } catch (e) { return []; } };
-const saveWallet = (t) => localStorage.setItem(WALLET_KEY, JSON.stringify(t));
+
+// Wallet storage has two modes:
+//   * plaintext (default, skippable path): loadWallet/saveWallet read/write
+//     localStorage synchronously — unchanged, crash-safe behavior.
+//   * vault (a passphrase is set): `mem` is the in-memory source of truth; every
+//     write re-encrypts asynchronously with a key derived ONCE at unlock. The
+//     synchronous crash-recovery records (PENDING_*) are only dropped AFTER an
+//     awaited flushWallet(), so the async write never opens a money-loss window.
+let vaultMode = false;       // true when the wallet is stored as an encrypted vault
+let vaultKey = null;         // CryptoKey held in memory while unlocked (never persisted)
+let vaultSalt = null;        // b64 salt bound to this vault
+const mem = { account: null, tokens: [] };
+let persistTimer = null;
+
+const loadWallet = () => {
+  if (vaultMode) return mem.tokens;
+  try { return JSON.parse(localStorage.getItem(WALLET_KEY)) || []; } catch (e) { return []; }
+};
+const saveWallet = (t) => {
+  if (vaultMode) { mem.tokens = t; schedulePersist(); }
+  else localStorage.setItem(WALLET_KEY, JSON.stringify(t));
+};
 const ecashBalance = () => loadWallet().reduce((s, t) => s + t.amount, 0);
 
-const loadAccount = () => { try { return JSON.parse(localStorage.getItem(ACCOUNT_KEY)) || null; } catch (e) { return null; } };
-const saveAccount = (a) => { try { localStorage.setItem(ACCOUNT_KEY, JSON.stringify(a)); } catch (e) {} };
+const loadAccount = () => {
+  if (vaultMode) return mem.account;
+  try { return JSON.parse(localStorage.getItem(ACCOUNT_KEY)) || null; } catch (e) { return null; }
+};
+const saveAccount = (a) => {
+  if (vaultMode) { mem.account = a; schedulePersist(); }
+  else { try { localStorage.setItem(ACCOUNT_KEY, JSON.stringify(a)); } catch (e) {} }
+};
+
+// Coalesce rapid writes; a real durability point uses awaited flushWallet().
+function schedulePersist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => { persistTimer = null; flushWallet().catch(() => {}); }, 120);
+}
+
+// Durably write the encrypted vault NOW. Awaited at money-critical points before
+// dropping a plaintext recovery record. No-op in plaintext mode (already durable).
+async function flushWallet() {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  if (!vaultMode || !vaultKey) return;
+  const env = await sealWithKey(
+    { account: mem.account, tokens: mem.tokens }, vaultKey, vaultSalt);
+  localStorage.setItem(VAULT_KEY, JSON.stringify(env));
+}
+
+// Turn on at-rest encryption: derive a key, migrate the current plaintext wallet
+// into the vault, and remove the plaintext copies.
+async function enableVault(passphrase) {
+  const cur = { account: loadAccount(), tokens: loadWallet() };
+  const dk = await deriveVaultKey(passphrase, null);
+  vaultKey = dk.key; vaultSalt = dk.salt; vaultMode = true;
+  mem.account = cur.account; mem.tokens = cur.tokens;
+  await flushWallet();
+  for (const k of [WALLET_KEY, ACCOUNT_KEY]) { try { localStorage.removeItem(k); } catch (e) {} }
+}
 
 // Persist the current chat transcript by snapshotting the rendered log. Called
 // after a turn settles (not mid-stream), so the saved assistant text is final.
@@ -140,6 +193,7 @@ async function claimToEcash(balance) {
       'Idempotency-Key': pending.idempotencyKey,
     }, k.pubkeys);
     saveWallet(loadWallet().concat(minted));
+    await flushWallet();   // durable before dropping the plaintext claim record
     localStorage.removeItem(PENDING_CLAIM_KEY);
     lastAcctBal = 0;
   } finally { claiming = false; }
@@ -333,10 +387,12 @@ async function redeemPendingChange() {
   });
   if (r.status === 404) {
     saveWallet(loadWallet().concat(p.spend));       // never spent — tokens live
+    await flushWallet();
     localStorage.removeItem(PENDING_CHANGE_KEY);
   } else if (r.ok) {
     const settle = ecash.absorbChange(await r.json(), p.blanks, k.pubkeys);
     if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
+    await flushWallet();
     localStorage.removeItem(PENDING_CHANGE_KEY);
   } else {
     // Any other status (409 still in flight, or a 5xx) leaves the spend
@@ -431,6 +487,10 @@ async function send() {
       spent = sel.spend;
       blanks = await ecash.prepareChangeBlanks();
       saveWallet(sel.keep);
+      // Make the spend-removal durable BEFORE the request and before writing the
+      // (plaintext, synchronous) recovery record, so a crash can never leave the
+      // spent tokens back in the vault alongside a pending record (double-count).
+      await flushWallet();
       // Persist the in-flight spend so a page close recovers the change.
       localStorage.setItem(PENDING_CHANGE_KEY, JSON.stringify({ spend: spent, blanks }));
       renderBalance();
@@ -458,6 +518,7 @@ async function send() {
       if (hdr) {  // tokens were spent — absorb the change either way (success or upstream error)
         const settle = ecash.absorbChange(JSON.parse(atob(hdr)), blanks, k0.pubkeys);
         if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
+        await flushWallet();   // change durable before dropping the recovery record
         localStorage.removeItem(PENDING_CHANGE_KEY);
         spent = null;
       } else if (r.status === 400 || r.status === 402) {
@@ -466,6 +527,7 @@ async function send() {
         // pending record so redeemPendingChange() can recover the change; do NOT
         // restore tokens that may already be spent.
         saveWallet(loadWallet().concat(spent));
+        await flushWallet();   // restoration durable before dropping the record
         localStorage.removeItem(PENDING_CHANGE_KEY);
         spent = null;
       }
@@ -482,6 +544,7 @@ async function send() {
     showErr(pending, friendly(0, e.message, free));
   } finally {
     inFlight = false;
+    await flushWallet();   // ensure any wallet change this turn is durable
     renderBalance();
     persistChat();   // snapshot the settled transcript so a refresh keeps it
   }
@@ -611,9 +674,11 @@ function newWallet() {
       + 'want to keep them. Continue?'
     : 'Start a new wallet? This clears the current wallet from this browser.';
   if (!confirm(warn)) return;
-  for (const k of [ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY, PENDING_CHANGE_KEY]) {
+  for (const k of [ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY, PENDING_CHANGE_KEY, VAULT_KEY]) {
     try { localStorage.removeItem(k); } catch (e) {}
   }
+  vaultMode = false; vaultKey = null; vaultSalt = null;
+  mem.account = null; mem.tokens = [];
   account = null;
   lastAcctBal = 0;
   $('log').innerHTML = '';
@@ -622,7 +687,75 @@ function newWallet() {
   $('mint').disabled = false;
   $('deposit-body').classList.add('hidden');
   $('deposit-locked').classList.remove('hidden');
+  reflectEncState();
   renderBalance();
+}
+
+// ---- at-rest encryption UI ----
+
+// Reflect vault state on the "Encrypt this wallet" control.
+function reflectEncState() {
+  const btn = $('encrypt');
+  const state = $('enc-state');
+  if (!btn || !state) return;
+  if (vaultMode) {
+    btn.classList.add('hidden');
+    state.textContent = '🔒 Encrypted at rest';
+  } else {
+    btn.classList.remove('hidden');
+    state.textContent = '';
+  }
+}
+
+// Turn on encryption for the current wallet (prompt + confirm passphrase).
+async function encryptWallet() {
+  if (vaultMode) return;
+  if (!account && ecashBalance() === 0) {
+    walletNote('Create or import a wallet first.');
+    return;
+  }
+  const pass = prompt('Set a passphrase to encrypt this wallet on this device.\n\n'
+    + 'There is NO recovery if you forget it — back up your wallet first.');
+  if (pass === null) return;
+  if (!pass) { walletNote('Encryption cancelled (empty passphrase).'); return; }
+  const confirmPass = prompt('Re-enter the passphrase to confirm.');
+  if (confirmPass === null) return;
+  if (confirmPass !== pass) { walletNote('Passphrases did not match — not encrypted.'); return; }
+  try {
+    await enableVault(pass);
+  } catch (e) {
+    walletNote('Could not encrypt: ' + (e.message || e));
+    return;
+  }
+  reflectEncState();
+  walletNote('Wallet encrypted on this device. It will ask for the passphrase on reload.');
+}
+
+// If an encrypted vault exists, prompt to unlock it into memory. Returns true
+// once unlocked (or if there is no vault); false if the user left it locked.
+async function maybeUnlockVault() {
+  let env = null;
+  try { env = JSON.parse(localStorage.getItem(VAULT_KEY)); } catch (e) { env = null; }
+  if (!env) return true;   // plaintext mode, nothing to unlock
+  for (;;) {
+    const pass = prompt('This wallet is encrypted. Enter your passphrase to unlock.');
+    if (pass === null) return false;   // user cancelled -> stay locked
+    try {
+      const dk = await deriveVaultKey(pass, env.salt);
+      const data = await openWithKey(env, dk.key);
+      vaultKey = dk.key; vaultSalt = env.salt; vaultMode = true;
+      mem.account = (data && data.account) || null;
+      mem.tokens = (data && Array.isArray(data.tokens)) ? data.tokens : [];
+      return true;
+    } catch (e) {
+      alert('Wrong passphrase. Try again, or discard the encrypted wallet.');
+    }
+  }
+}
+
+function showLocked(locked) {
+  $('locked').classList.toggle('hidden', !locked);
+  document.querySelector('.grid').classList.toggle('hidden', locked);
 }
 
 // ---- copy affordances ----
@@ -663,6 +796,7 @@ $('model').addEventListener('change', updateSendState);
 $('amount').addEventListener('input', renderDepositPreview);
 $('export').onclick = exportWallet;
 $('new-wallet').onclick = newWallet;
+$('encrypt').onclick = encryptWallet;
 const importInput = $('import-file');
 $('import-start').onclick = () => importInput.click();
 $('import-again').onclick = () => importInput.click();
@@ -673,17 +807,41 @@ importInput.addEventListener('change', () => {
 wireCopy('copy-key', 'apikey');
 
 // Restore a prior session so a refresh keeps the whole wallet, not just the
-// balance: re-hydrate the saved account (re-locks nothing, shows the key +
-// deposit UI and drains any leftover balance once) and re-render the chat.
-const savedAccount = loadAccount();
-if (savedAccount && typeof savedAccount.api_key === 'string') {
-  account = savedAccount;
-  unlockAfterKey();
+// balance. If an encrypted vault exists, unlock it FIRST (into memory) so the
+// mode-aware loaders see the decrypted wallet.
+async function restoreSession() {
+  const savedAccount = loadAccount();
+  if (savedAccount && typeof savedAccount.api_key === 'string') {
+    account = savedAccount;
+    unlockAfterKey();
+  }
+  restoreChat();
+  reflectEncState();
+  updateSendState();
+  try { await mintKeys(); await redeemPendingChange(); } catch (e) {}
+  renderBalance();
 }
-restoreChat();
 
-updateSendState();
-mintKeys().then(redeemPendingChange).then(renderBalance).catch(() => renderBalance());
+async function boot() {
+  const unlocked = await maybeUnlockVault();
+  if (!unlocked) { showLocked(true); return; }   // stay locked until unlocked/discarded
+  showLocked(false);
+  await restoreSession();
+}
+
+$('unlock').onclick = async () => {
+  if (await maybeUnlockVault()) { showLocked(false); await restoreSession(); }
+};
+$('discard-vault').onclick = () => {
+  if (!confirm('Discard the encrypted wallet on this device? If you have no '
+    + 'backup + passphrase, its credits are gone for good.')) return;
+  for (const k of [VAULT_KEY, ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY, PENDING_CHANGE_KEY]) {
+    try { localStorage.removeItem(k); } catch (e) {}
+  }
+  location.reload();
+};
+
+boot();
 
 // Populate the model dropdown from the LIVE catalog so it never offers a retired
 // model. Keep a small curated shortlist (in preference order); fall back to the

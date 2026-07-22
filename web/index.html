@@ -89,6 +89,17 @@
       cryptographically decoupled from your deposit.</p>
   </header>
 
+  <!-- LOCKED OVERLAY: shown when an encrypted wallet exists but isn't unlocked -->
+  <div class="card hidden" id="locked">
+    <h2>Wallet locked</h2>
+    <div class="note" style="margin:0 0 12px">This browser holds an <strong>encrypted</strong>
+      wallet. Enter its passphrase to unlock and use your credits.</div>
+    <div class="row">
+      <button id="unlock">Unlock</button>
+      <button id="discard-vault" class="linklike" type="button">Discard this encrypted wallet</button>
+    </div>
+  </div>
+
   <div class="grid">
     <!-- STEP 1 -->
     <div class="card">
@@ -113,9 +124,11 @@
         <div class="row" style="margin-top:12px">
           <button id="export" class="ghost small" type="button">Back up wallet</button>
           <button id="import-again" class="ghost small" type="button">Import wallet</button>
+          <button id="encrypt" class="linklike" type="button">Encrypt this wallet</button>
           <button id="new-wallet" class="linklike" type="button">Start a new wallet</button>
-          <span class="note" id="wallet-note" style="margin:0"></span>
+          <span class="note" id="enc-state" style="margin:0"></span>
         </div>
+        <span class="note" id="wallet-note" style="margin:6px 0 0;display:block"></span>
       </div>
       <input type="file" id="import-file" accept="application/json,.json" class="hidden" />
     </div>

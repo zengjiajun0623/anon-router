@@ -44,6 +44,48 @@ export async function encryptJSON(obj, passphrase) {
   };
 }
 
+// ---- key-reuse API for the live at-rest vault ----
+// The backup helpers above re-derive the key each call (fine for a one-shot
+// file). The live wallet re-encrypts on every change, so we derive the key ONCE
+// on unlock (210k PBKDF2 is deliberately slow) and reuse the CryptoKey for all
+// subsequent seals. The salt is fixed per vault (so the same passphrase re-opens
+// it); a fresh IV is drawn per seal.
+
+/** Derive (and cache-able) an AES-GCM key from a passphrase. Pass an existing
+ *  salt (b64) to re-open a vault, or null to mint a new one. */
+export async function deriveVaultKey(passphrase, saltB64) {
+  if (!passphrase) throw new Error('passphrase required');
+  const salt = saltB64 ? unb64(saltB64) : crypto.getRandomValues(new Uint8Array(16));
+  const key = await deriveKey(passphrase, salt, KDF_ITERATIONS);
+  return { key, salt: b64(salt), iterations: KDF_ITERATIONS };
+}
+
+/** Seal an object with an already-derived key. Fresh IV every call. */
+export async function sealWithKey(obj, key, saltB64, iterations) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv }, key, ENC.encode(JSON.stringify(obj)));
+  return {
+    v: 1, kdf: 'PBKDF2-SHA256', iterations: iterations || KDF_ITERATIONS,
+    salt: saltB64, iv: b64(iv), ct: b64(ct),
+  };
+}
+
+/** Open a vault envelope with an already-derived key. Throws on wrong key. */
+export async function openWithKey(env, key) {
+  if (!env || env.v !== 1 || typeof env.ct !== 'string') {
+    throw new Error('unsupported or corrupt vault');
+  }
+  let pt;
+  try {
+    pt = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: unb64(env.iv) }, key, unb64(env.ct));
+  } catch (e) {
+    throw new Error('wrong passphrase or corrupt vault');
+  }
+  return JSON.parse(DEC.decode(pt));
+}
+
 /** Decrypt an envelope produced by encryptJSON. Throws on a wrong passphrase,
  *  tampering, or an unsupported format (AES-GCM auth tag catches all three). */
 export async function decryptJSON(env, passphrase) {
