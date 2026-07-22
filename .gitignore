@@ -28,6 +28,7 @@ state.db-wal
 state.db-*
 .watcher_credited
 .watcher_halt
+.watcher_heartbeat
 .provider-wallet.json
 *.egg-info/
 build/

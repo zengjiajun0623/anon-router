@@ -352,31 +352,19 @@ def quickstart():
     return FileResponse(os.path.join(ROOT, "web", "quickstart.html"))
 
 
-@app.get("/ecash.js")
-def ecash_js():
-    """In-browser BDHKE wallet module (same-origin; no CDN loads)."""
+@app.get("/{fname}.js")
+def static_js(fname: str):
+    """Serve a frontend ES module from web/<fname>.js (same-origin; no CDN, no
+    inline script). Name is validated to a bare identifier so there is no path
+    traversal; only files that exist are served."""
+    import re
     from fastapi.responses import FileResponse
-    return FileResponse(
-        os.path.join(ROOT, "web", "ecash.js"), media_type="text/javascript"
-    )
-
-
-@app.get("/app.js")
-def app_js():
-    """Frontend app module (same-origin; no CDN loads, no inline script)."""
-    from fastapi.responses import FileResponse
-    return FileResponse(
-        os.path.join(ROOT, "web", "app.js"), media_type="text/javascript"
-    )
-
-
-@app.get("/crypto.js")
-def crypto_js():
-    """Wallet-backup encryption module (Web Crypto only; same-origin, no CDN)."""
-    from fastapi.responses import FileResponse
-    return FileResponse(
-        os.path.join(ROOT, "web", "crypto.js"), media_type="text/javascript"
-    )
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", fname):
+        raise HTTPException(404, "not found")
+    path = os.path.join(ROOT, "web", fname + ".js")
+    if not os.path.isfile(path):
+        raise HTTPException(404, "not found")
+    return FileResponse(path, media_type="text/javascript")
 
 
 def _onion_address() -> str:

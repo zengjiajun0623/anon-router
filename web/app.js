@@ -3,6 +3,7 @@
 
 import * as ecash from '/ecash.js';
 import { encryptJSON, decryptJSON, deriveVaultKey, sealWithKey, openWithKey } from '/crypto.js';
+import * as usage from '/usage.js';
 
 let account = null;
 let keys = null;         // /mint/keys payload (denomination pubkeys etc.)
@@ -464,6 +465,10 @@ async function send() {
   const model = $('model').value;
   const free = model.startsWith('local/');   // local lane is free, no payment
   if (!free && ecashBalance() <= 0) { updateSendState(); return; }
+  // Per-request usage metadata, recorded on-device only (see usage.js).
+  const startedAt = Date.now();
+  const rec = { model, free, streamed: free, status: 0, costCredits: 0,
+                inputTokens: 0, outputTokens: 0, error: '' };
   input.value = '';
   add('user', text);
   const pending = add('assistant', '…');
@@ -504,6 +509,9 @@ async function send() {
       method: 'POST', headers,
       body: JSON.stringify({ model, messages: [{ role: 'user', content: text }], stream: free }),
     });
+    rec.status = r.status;
+    const cc = r.headers.get('X-Cost-Credits');
+    if (cc != null) rec.costCredits = parseInt(cc, 10) || 0;
     if (free) {
       const ctype = r.headers.get('Content-Type') || '';
       if (!r.ok || !ctype.includes('text/event-stream')) {
@@ -532,7 +540,10 @@ async function send() {
         spent = null;
       }
       let d = null; try { d = await r.json(); } catch (e) {}
+      const u = d && d.usage;
+      if (u) { rec.inputTokens = u.prompt_tokens | 0; rec.outputTokens = u.completion_tokens | 0; }
       if (!r.ok) {
+        rec.error = (d && (d.detail || (d.error && (d.error.message || d.error)))) || String(r.status);
         showErr(pending, friendly(r.status, (d && (d.detail || d.error)) || r.statusText, free));
       } else {
         pending.textContent = (d && d.choices && d.choices[0] && d.choices[0].message
@@ -541,12 +552,18 @@ async function send() {
     }
   } catch (e) {
     if (spent && !requestStarted) { saveWallet(loadWallet().concat(spent)); spent = null; }
+    rec.error = e.message || 'error';
     showErr(pending, friendly(0, e.message, free));
   } finally {
     inFlight = false;
     await flushWallet();   // ensure any wallet change this turn is durable
     renderBalance();
     persistChat();   // snapshot the settled transcript so a refresh keeps it
+    if (requestStarted) {
+      rec.latencyMs = Date.now() - startedAt;
+      usage.recordRequest(rec);   // on-device only; never sent to the server
+      if (activeView === 'activity') renderActivity();
+    }
   }
 }
 
@@ -755,7 +772,51 @@ async function maybeUnlockVault() {
 
 function showLocked(locked) {
   $('locked').classList.toggle('hidden', !locked);
-  document.querySelector('.grid').classList.toggle('hidden', locked);
+  $('main').classList.toggle('hidden', locked);
+}
+
+// ---- views / navigation + Activity ----
+let activeView = 'chat';
+const VIEWS = ['chat', 'activity', 'settings'];
+const escHtml = (s) => String(s == null ? '' : s).replace(
+  /[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function showView(name) {
+  activeView = name;
+  for (const v of VIEWS) {
+    $('view-' + v).classList.toggle('hidden', v !== name);
+    $('tab-' + v).classList.toggle('active', v === name);
+  }
+  if (name === 'activity') renderActivity();
+}
+
+async function renderActivity() {
+  const rows = await usage.allRequests();
+  const cu = (keys && keys.credit_usd) || 0.0001;
+  const t = usage.totals(rows);
+  $('act-empty').classList.toggle('hidden', rows.length > 0);
+  $('act-stats').innerHTML = [
+    ['Requests', t.requests],
+    ['Spent', '$' + (t.costCredits * cu).toFixed(4)],
+    ['Input tokens', t.inputTokens.toLocaleString()],
+    ['Output tokens', t.outputTokens.toLocaleString()],
+    ['Success', rows.length ? (t.successRate * 100).toFixed(0) + '%' : '—'],
+    ['Avg latency', t.avgLatencyMs ? t.avgLatencyMs + ' ms' : '—'],
+  ].map(([k, v]) => `<div class="s"><div class="v">${escHtml(v)}</div><div class="k">${k}</div></div>`).join('');
+
+  const bm = usage.byModel(rows);
+  $('act-by-model').innerHTML = bm.length
+    ? '<tr><th>Model</th><th class="num">Reqs</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th></tr>'
+      + bm.map((g) => `<tr><td>${escHtml(g.model)}</td><td class="num">${g.requests}</td>`
+        + `<td class="num">${g.inputTokens}</td><td class="num">${g.outputTokens}</td>`
+        + `<td class="num">$${(g.costCredits * cu).toFixed(4)}</td></tr>`).join('')
+    : '';
+  const bd = usage.byDay(rows);
+  $('act-by-day').innerHTML = bd.length
+    ? '<tr><th>Day</th><th class="num">Reqs</th><th class="num">Cost</th></tr>'
+      + bd.map((g) => `<tr><td>${g.day}</td><td class="num">${g.requests}</td>`
+        + `<td class="num">$${(g.costCredits * cu).toFixed(4)}</td></tr>`).join('')
+    : '';
 }
 
 // ---- copy affordances ----
@@ -829,6 +890,49 @@ async function boot() {
   await restoreSession();
 }
 
+// tabs
+for (const v of VIEWS) $('tab-' + v).onclick = () => showView(v);
+
+// activity actions
+$('act-export').onclick = async () => {
+  const rows = await usage.allRequests();
+  const blob = new Blob([usage.toCSV(rows)], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'anon-router-activity-' + new Date().toISOString().slice(0, 10) + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+};
+const clearActivity = async () => {
+  if (!confirm('Clear all activity on this device?')) return;
+  await usage.clearUsage(); renderActivity();
+};
+$('act-clear').onclick = clearActivity;
+$('set-clear-activity').onclick = clearActivity;
+$('set-clear-chat').onclick = () => {
+  if (!confirm('Clear chat history on this device?')) return;
+  try { localStorage.removeItem(CHAT_KEY); } catch (e) {}
+  $('log').innerHTML = '';
+};
+$('set-clear-all').onclick = () => {
+  if (!confirm('Erase EVERYTHING on this device (wallet, activity, chat)? Back up your '
+    + 'wallet first — its credits are gone otherwise.')) return;
+  usage.clearUsage();
+  for (const k of [ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY,
+                   PENDING_CHANGE_KEY, VAULT_KEY, RETENTION_KEY]) {
+    try { localStorage.removeItem(k); } catch (e) {}
+  }
+  location.reload();
+};
+// retention
+const RETENTION_KEY = 'anon-router-retention-days';
+$('set-retention').value = (() => { try { return localStorage.getItem(RETENTION_KEY) || '0'; } catch (e) { return '0'; } })();
+$('set-retention').onchange = async () => {
+  const d = parseInt($('set-retention').value, 10) || 0;
+  try { localStorage.setItem(RETENTION_KEY, String(d)); } catch (e) {}
+  if (d > 0) await usage.pruneOlderThan(Date.now() - d * 86400000);
+};
+
 $('unlock').onclick = async () => {
   if (await maybeUnlockVault()) { showLocked(false); await restoreSession(); }
 };
@@ -842,6 +946,13 @@ $('discard-vault').onclick = () => {
 };
 
 boot();
+
+// Apply the activity retention window on load (prune anything older).
+(() => {
+  let d = 0;
+  try { d = parseInt(localStorage.getItem(RETENTION_KEY) || '0', 10) || 0; } catch (e) {}
+  if (d > 0) usage.pruneOlderThan(Date.now() - d * 86400000);
+})();
 
 // Populate the model dropdown from the LIVE catalog so it never offers a retired
 // model. Keep a small curated shortlist (in preference order); fall back to the
