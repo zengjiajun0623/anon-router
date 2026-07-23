@@ -32,3 +32,5 @@ state.db-*
 *.egg-info/
 build/
 dist/
+node_modules/
+.data/

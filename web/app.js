@@ -221,24 +221,116 @@ async function ensureChain() {
   }
 }
 
+/** Inline deposit error: what happened + how to fix it. Replaces alert(). */
+function showDepositError(what, fix) {
+  const el = $('deposit-err');
+  if (!el) return;
+  el.innerHTML = '';
+  el.appendChild(document.createTextNode(what));
+  if (fix) {
+    const hint = document.createElement('span');
+    hint.className = 'fix';
+    hint.textContent = fix;
+    el.appendChild(hint);
+  }
+  el.classList.add('visible');
+}
+
+function clearDepositError() {
+  const el = $('deposit-err');
+  if (!el) return;
+  el.classList.remove('visible');
+  el.textContent = '';
+}
+
+/** Map wallet / deposit failures to plain copy + a fix hint. */
+function depositFriendly(err) {
+  const code = err && (err.code != null ? err.code
+    : (err.data && err.data.originalError && err.data.originalError.code));
+  const msg = String((err && err.message) || '');
+  const low = msg.toLowerCase();
+
+  // EIP-1193 user rejection (MetaMask 4001; some wallets use -32000 / "rejected").
+  if (code === 4001 || code === 'ACTION_REJECTED'
+      || /user rejected|user denied|rejected the request|denied transaction|request rejected/i.test(msg)) {
+    return {
+      what: 'You cancelled the request in your wallet.',
+      fix: 'Click Deposit again when you’re ready to approve the connection, network switch, or transaction.',
+    };
+  }
+  // Wrong / unrecognized chain, or switch failed.
+  if (code === 4902 || code === -32603
+      || /Unrecognized chain|chain id|wallet_switchEthereumChain|addEthereumChain|wrong network|incorrect network/i.test(msg)) {
+    return {
+      what: 'Couldn’t switch your wallet to Sepolia.',
+      fix: 'Open your wallet, select the Sepolia network, then click Deposit again.',
+    };
+  }
+  // Insufficient funds for value + gas.
+  if (/insufficient funds|exceeds balance|insufficient balance|not enough eth/i.test(low)) {
+    return {
+      what: 'Not enough Sepolia ETH in this wallet.',
+      fix: 'Get free test ETH from a Sepolia faucet (links above), then try again.',
+    };
+  }
+  // Connected account doesn’t match / access issues.
+  if (/unauthorized|do not have access|selected address/i.test(low)) {
+    return {
+      what: 'Wrong wallet account selected.',
+      fix: 'In your wallet, pick the account that holds Sepolia ETH, then click Deposit again.',
+    };
+  }
+  return {
+    what: 'Deposit not sent' + (msg ? ': ' + msg.replace(/^Error:\s*/i, '') : '.'),
+    fix: 'Check your wallet prompt, confirm you’re on Sepolia with enough test ETH, then retry.',
+  };
+}
+
 async function deposit() {
   if (!account) return;
-  if (!window.ethereum) { alert('No browser wallet found. Install one like MetaMask to deposit.'); return; }
+  clearDepositError();
   const wei = ethToWei($('amount').value);
-  if (wei == null) { alert('Enter a valid ETH amount above 0.'); return; }
+  if (wei == null) {
+    showDepositError(
+      'Enter a valid ETH amount above 0.',
+      'Use a decimal like 0.05 — amounts must be greater than zero.',
+    );
+    return;
+  }
+  if (!window.ethereum) {
+    showDepositError(
+      'No browser wallet found.',
+      'Install MetaMask, Rabby, or Coinbase Wallet, then reload this page and try again.',
+    );
+    return;
+  }
+  const btn = $('deposit');
+  btn.disabled = true;
   try {
     const accts = await window.ethereum.request({ method: 'eth_requestAccounts' });
     await ensureChain();  // switch the wallet to Sepolia BEFORE sending the deposit
+    // Re-check after switch: some wallets report success but stay on the wrong chain.
+    let chainId;
+    try { chainId = await window.ethereum.request({ method: 'eth_chainId' }); } catch (e) {}
+    if (chainId && String(chainId).toLowerCase() !== wantChainHex().toLowerCase()) {
+      showDepositError(
+        'Wallet is still on the wrong network.',
+        'Switch to Sepolia in your wallet, then click Deposit again.',
+      );
+      return;
+    }
     const data = account.deposit_selector + account.key_hash.replace(/^0x/, '');
     await window.ethereum.request({
       method: 'eth_sendTransaction',
       params: [{ from: accts[0], to: account.vault_address, value: '0x' + wei.toString(16), data }],
     });
+    clearDepositError();
     watchFunding(true);  // wait through mining until this deposit credits + drains
   } catch (err) {
-    // user rejected the connect / network switch / tx, or the switch failed
-    const msg = (err && err.message) ? err.message : 'cancelled';
-    alert('Deposit not sent: ' + msg);
+    const { what, fix } = depositFriendly(err);
+    showDepositError(what, fix);
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -549,7 +641,10 @@ $('deposit').onclick = deposit;
 $('send').onclick = send;
 $('prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
 $('model').addEventListener('change', updateSendState);
-$('amount').addEventListener('input', renderDepositPreview);
+$('amount').addEventListener('input', () => {
+  clearDepositError();
+  renderDepositPreview();
+});
 $('export').onclick = exportWallet;
 const importInput = $('import-file');
 $('import-start').onclick = () => importInput.click();
