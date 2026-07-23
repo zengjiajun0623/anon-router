@@ -12,8 +12,12 @@ export CREDITS_PER_ETH=10000000
 
 echo "== cleanup =="
 pkill -f "uvicorn server:app" 2>/dev/null; pkill -f "watcher.py" 2>/dev/null
+# anvil restarts as a fresh chain below, so stale watcher state (cursor/ledger/
+# halt) would be reconciled against a different chain and falsely trip the
+# deep-reorg halt. Clear it for a clean local run.
+rm -f "$ROOT"/.watcher_cursor "$ROOT"/.watcher_credited "$ROOT"/.watcher_halt "$ROOT"/.watcher_heartbeat
 if ! cast block-number --rpc-url $RPC >/dev/null 2>&1; then
-  echo "== start anvil =="; anvil --silent > "$ROOT/contracts/anvil.log" 2>&1 &
+  echo "== start anvil =="; anvil --silent --block-time 1 > "$ROOT/contracts/anvil.log" 2>&1 &
   sleep 3
 fi
 
@@ -22,7 +26,7 @@ cd "$ROOT/contracts"
 dep() { forge create "$1" --rpc-url $RPC --private-key $DEPLOYER --broadcast ${2:+--constructor-args $2} 2>&1 | grep "Deployed to" | awk '{print $3}'; }
 MOCK=$(dep src/MockVerifier.sol:MockVerifier)
 CONFETTI=$(forge create src/ConfettiChannels.sol:ConfettiChannels --rpc-url $RPC --private-key $DEPLOYER --broadcast --constructor-args $MOCK 60 300 120 86400 2>&1 | grep "Deployed to" | awk '{print $3}')
-VAULT=$(dep src/CreditVault.sol:CreditVault)
+VAULT=$(dep src/CreditVault.sol:CreditVault 0x0000000000000000000000000000000000000000)
 echo "  MockVerifier=$MOCK"; echo "  ConfettiChannels=$CONFETTI"; echo "  CreditVault=$VAULT"
 cd "$ROOT"
 

@@ -76,6 +76,20 @@
   .pill.soon { color: var(--muted); border-color: var(--border); }
   .note { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
   .foot { margin-top: 40px; font-size: 12.5px; color: var(--muted); }
+  nav.tabs { display: flex; gap: 4px; margin: 26px 0 4px; border-bottom: 1px solid var(--border); }
+  nav.tabs button { background: none; border: none; color: var(--muted); font-weight: 600;
+    font-size: 14px; padding: 8px 14px; border-radius: 8px 8px 0 0; cursor: pointer;
+    border-bottom: 2px solid transparent; }
+  nav.tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .view.hidden { display: none; }
+  table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.data th, table.data td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
+  table.data th { color: var(--muted); font-weight: 600; }
+  table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .stats { display: flex; gap: 28px; flex-wrap: wrap; margin: 4px 0 18px; }
+  .stats .s .v { font-size: 24px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .stats .s .k { font-size: 12px; color: var(--muted); }
+  .scroll { overflow-x: auto; }
 </style>
 </head>
 <body>
@@ -89,6 +103,25 @@
       cryptographically decoupled from your deposit.</p>
   </header>
 
+  <!-- LOCKED OVERLAY: shown when an encrypted wallet exists but isn't unlocked -->
+  <div class="card hidden" id="locked">
+    <h2>Wallet locked</h2>
+    <div class="note" style="margin:0 0 12px">This browser holds an <strong>encrypted</strong>
+      wallet. Enter its passphrase to unlock and use your credits.</div>
+    <div class="row">
+      <button id="unlock">Unlock</button>
+      <button id="discard-vault" class="linklike" type="button">Discard this encrypted wallet</button>
+    </div>
+  </div>
+
+  <div id="main">
+  <nav class="tabs">
+    <button id="tab-chat" class="active" data-view="chat">Chat</button>
+    <button id="tab-activity" data-view="activity">Activity</button>
+    <button id="tab-settings" data-view="settings">Settings</button>
+  </nav>
+
+  <div id="view-chat" class="view">
   <div class="grid">
     <!-- STEP 1 -->
     <div class="card">
@@ -113,8 +146,11 @@
         <div class="row" style="margin-top:12px">
           <button id="export" class="ghost small" type="button">Back up wallet</button>
           <button id="import-again" class="ghost small" type="button">Import wallet</button>
-          <span class="note" id="wallet-note" style="margin:0"></span>
+          <button id="encrypt" class="linklike" type="button">Encrypt this wallet</button>
+          <button id="new-wallet" class="linklike" type="button">Start a new wallet</button>
+          <span class="note" id="enc-state" style="margin:0"></span>
         </div>
+        <span class="note" id="wallet-note" style="margin:6px 0 0;display:block"></span>
       </div>
       <input type="file" id="import-file" accept="application/json,.json" class="hidden" />
     </div>
@@ -142,10 +178,16 @@
     <!-- STEP 3 -->
     <div class="card">
       <h2>3 · Chat <span class="pill">live</span></h2>
-      <div class="row" style="margin-bottom:12px">
+      <div class="row" style="margin-bottom:10px">
         <select id="model">
           <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
         </select>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <select id="session-select" style="flex:1"></select>
+        <button id="new-chat" class="small ghost" type="button">New</button>
+        <button id="rename-chat" class="copy" type="button">Rename</button>
+        <button id="delete-chat" class="copy" type="button">Delete</button>
       </div>
       <div class="note" style="margin:0 0 12px">Private by default: your spends carry no identity and
         aren't cryptographically tied to your deposit.</div>
@@ -173,6 +215,50 @@
         third parties); the balance is custodial. Full posture at <code>/privacy</code>.</div>
     </div>
   </div>
+  </div><!-- #view-chat -->
+
+  <div id="view-activity" class="view hidden">
+    <div class="card">
+      <h2>Activity <span class="muted" style="text-transform:none;font-weight:400;letter-spacing:0">· stored on this device only</span></h2>
+      <div class="stats" id="act-stats"></div>
+      <div class="row" style="margin-bottom:14px">
+        <button id="act-export" class="ghost small" type="button">Export CSV</button>
+        <button id="act-clear" class="linklike" type="button">Clear activity</button>
+        <span class="note" id="act-empty" style="margin:0">No requests yet — chat to see usage here.</span>
+      </div>
+      <h2>By model</h2>
+      <div class="scroll"><table class="data" id="act-by-model"></table></div>
+      <h2 style="margin-top:20px">By day</h2>
+      <div class="scroll"><table class="data" id="act-by-day"></table></div>
+    </div>
+  </div>
+
+  <div id="view-settings" class="view hidden">
+    <div class="card">
+      <h2>Local data</h2>
+      <div class="kv"><span class="k">Activity retention</span><span class="v">
+        <select id="set-retention" style="width:auto;display:inline-block">
+          <option value="0">Keep everything</option>
+          <option value="7">7 days</option>
+          <option value="30">30 days</option>
+          <option value="90">90 days</option>
+        </select></span></div>
+      <div class="note" style="margin:10px 0 14px">Usage/activity and chat history are stored
+        <strong>only in this browser</strong> and never sent to the server. Clear them anytime.</div>
+      <div class="row">
+        <button id="set-clear-activity" class="ghost small" type="button">Clear activity</button>
+        <button id="set-clear-chat" class="ghost small" type="button">Clear chat history</button>
+        <button id="set-clear-all" class="linklike" type="button">Erase everything on this device</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Privacy</h2>
+      <div class="note">Payments are blind-signed ecash, cryptographically unlinkable to your
+        deposit. The router never sees a persistent key on the inference path, and usage/logs
+        live only here on your device — not on the server. Full posture at <code>/privacy</code>.</div>
+    </div>
+  </div>
+  </div><!-- #main -->
 
   <div class="foot">
     Testnet demo. Deposits use Sepolia test ETH; no real funds are involved.

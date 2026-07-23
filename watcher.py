@@ -48,6 +48,13 @@ USDC_ADDRESS = os.environ.get("USDC_ADDRESS")
 CREDITS_PER_USDC = (int(os.environ.get("CREDITS_PER_USDC", "10000"))
                     if USDC_ADDRESS else None)
 POLL = float(os.environ.get("POLL_SECONDS", "2"))
+# How long to keep re-scanning a deposit whose account row is not present yet
+# (the router returned no_such_account) before giving up. A deposit can be
+# scanned in the brief window before /account/new commits, or the depositor may
+# create the account slightly after funding it; holding the cursor lets it
+# credit once the account appears. Bounded so a deposit to a keyHash that never
+# gets an account can't wedge the cursor (and thus all later credits) forever.
+NO_ACCOUNT_GRACE_SEC = float(os.environ.get("NO_ACCOUNT_GRACE_SEC", "3600"))
 # CONFIRMATIONS / FINALITY_DEPTH default off the chain id (resolved in main once
 # the RPC is up); an explicit env var always wins. See _chain_defaults().
 _CONFIRMATIONS_ENV = os.environ.get("CONFIRMATIONS")
@@ -248,6 +255,9 @@ def main():
     vault = w3.eth.contract(address=Web3.to_checksum_address(VAULT), abi=abi)
     from_block = _load_cursor(w3.eth.block_number)
     credited = _load_credited()
+    # event_id -> first time we saw no_such_account for it, so the grace window
+    # is measured from first sighting, not reset each poll.
+    no_account_seen = {}
     print(f"watcher: vault={VAULT} chain={chain_id} from block {from_block}, "
           f"{CREDITS_PER_ETH} credits/ETH, {confirmations} confirmations, "
           f"finality_depth {finality_depth}, tracking {len(credited)} credit(s)")
@@ -326,12 +336,14 @@ def main():
                         credits = ev["args"]["amount"] * CREDITS_PER_ETH // 10**18
                     txhash = ev["transactionHash"].hex()
                     log_index = ev["logIndex"]
+                    event_id = f"{txhash}:{log_index}"
                     try:
                         resp = http.post(
                             f"{ROUTER}/account/credit",
                             headers={"X-Credit-Secret": CREDIT_SECRET},
                             json={"key_hash": kh, "credits": credits,
-                                  "txhash": txhash, "log_index": log_index},
+                                  "txhash": txhash, "log_index": log_index,
+                                  "block_number": ev["blockNumber"]},
                         )
                         resp.raise_for_status()
                         status = resp.json().get("status")
@@ -340,7 +352,27 @@ def main():
                         print(f"  credit failed ({e}); will retry range from {from_block}")
                         advanced = False
                         break
+                    if status == "no_such_account":
+                        # The account row isn't present yet (the deposit was scanned
+                        # before /account/new committed, or the depositor funded a
+                        # keyHash before creating the account). The server left it
+                        # uncredited on purpose ("may be created later and
+                        # re-scanned"), so DO NOT advance the cursor past it — hold
+                        # the range so it credits once the account appears. Give up
+                        # only after NO_ACCOUNT_GRACE_SEC so an account that never
+                        # gets created can't wedge the cursor for everyone.
+                        first = no_account_seen.setdefault(event_id, time.time())
+                        if time.time() - first < NO_ACCOUNT_GRACE_SEC:
+                            print(f"  no account yet for {kh[:14]}.. ({event_id}); "
+                                  f"holding cursor at {from_block} to retry")
+                            advanced = False
+                            break
+                        print(f"  WARNING: giving up on {event_id} for {kh[:14]}.. "
+                              f"after {NO_ACCOUNT_GRACE_SEC:.0f}s with no account; skipping")
+                        no_account_seen.pop(event_id, None)
+                        continue  # let the cursor advance past this dead deposit
                     if status in ("credited", "already_credited"):
+                        no_account_seen.pop(event_id, None)
                         # track for deep-reorg reconciliation
                         new_entries.append({
                             "event_id": f"{txhash}:{log_index}",

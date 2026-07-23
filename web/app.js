@@ -2,6 +2,9 @@
 // crypto lives in /ecash.js and is unchanged here.
 
 import * as ecash from '/ecash.js';
+import { encryptJSON, decryptJSON, deriveVaultKey, sealWithKey, openWithKey } from '/crypto.js';
+import * as usage from '/usage.js';
+import * as chat from '/chat.js';
 
 let account = null;
 let keys = null;         // /mint/keys payload (denomination pubkeys etc.)
@@ -17,9 +20,154 @@ const $ = (id) => document.getElementById(id);
 const WALLET_KEY = 'anon-router-ecash-v1';
 const PENDING_CLAIM_KEY = 'anon-router-pending-claim-v1';
 const PENDING_CHANGE_KEY = 'anon-router-pending-change-v1';
-const loadWallet = () => { try { return JSON.parse(localStorage.getItem(WALLET_KEY)) || []; } catch (e) { return []; } };
-const saveWallet = (t) => localStorage.setItem(WALLET_KEY, JSON.stringify(t));
+const ACCOUNT_KEY = 'anon-router-account-v1';
+const CHAT_KEY = 'anon-router-chat-v1';
+// Encrypted-at-rest vault (opt-in). When present, the account + tokens live ONLY
+// inside this AES-GCM envelope on disk; the plaintext WALLET_KEY/ACCOUNT_KEY are
+// removed. The decrypted wallet is held in `mem` in memory after unlock.
+const VAULT_KEY = 'anon-router-vault-v1';
+
+// Wallet storage has two modes:
+//   * plaintext (default, skippable path): loadWallet/saveWallet read/write
+//     localStorage synchronously — unchanged, crash-safe behavior.
+//   * vault (a passphrase is set): `mem` is the in-memory source of truth; every
+//     write re-encrypts asynchronously with a key derived ONCE at unlock. The
+//     synchronous crash-recovery records (PENDING_*) are only dropped AFTER an
+//     awaited flushWallet(), so the async write never opens a money-loss window.
+let vaultMode = false;       // true when the wallet is stored as an encrypted vault
+let vaultKey = null;         // CryptoKey held in memory while unlocked (never persisted)
+let vaultSalt = null;        // b64 salt bound to this vault
+const mem = { account: null, tokens: [] };
+let persistTimer = null;
+
+const loadWallet = () => {
+  if (vaultMode) return mem.tokens;
+  try { return JSON.parse(localStorage.getItem(WALLET_KEY)) || []; } catch (e) { return []; }
+};
+const saveWallet = (t) => {
+  if (vaultMode) { mem.tokens = t; schedulePersist(); }
+  else localStorage.setItem(WALLET_KEY, JSON.stringify(t));
+};
 const ecashBalance = () => loadWallet().reduce((s, t) => s + t.amount, 0);
+
+const loadAccount = () => {
+  if (vaultMode) return mem.account;
+  try { return JSON.parse(localStorage.getItem(ACCOUNT_KEY)) || null; } catch (e) { return null; }
+};
+const saveAccount = (a) => {
+  if (vaultMode) { mem.account = a; schedulePersist(); }
+  else { try { localStorage.setItem(ACCOUNT_KEY, JSON.stringify(a)); } catch (e) {} }
+};
+
+// Coalesce rapid writes; a real durability point uses awaited flushWallet().
+function schedulePersist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => { persistTimer = null; flushWallet().catch(() => {}); }, 120);
+}
+
+// Durably write the encrypted vault NOW. Awaited at money-critical points before
+// dropping a plaintext recovery record. No-op in plaintext mode (already durable).
+async function flushWallet() {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  if (!vaultMode || !vaultKey) return;
+  const env = await sealWithKey(
+    { account: mem.account, tokens: mem.tokens }, vaultKey, vaultSalt);
+  localStorage.setItem(VAULT_KEY, JSON.stringify(env));
+}
+
+// Turn on at-rest encryption: derive a key, migrate the current plaintext wallet
+// into the vault, and remove the plaintext copies.
+async function enableVault(passphrase) {
+  const cur = { account: loadAccount(), tokens: loadWallet() };
+  const dk = await deriveVaultKey(passphrase, null);
+  vaultKey = dk.key; vaultSalt = dk.salt; vaultMode = true;
+  mem.account = cur.account; mem.tokens = cur.tokens;
+  await flushWallet();
+  for (const k of [WALLET_KEY, ACCOUNT_KEY]) { try { localStorage.removeItem(k); } catch (e) {} }
+}
+
+// ---- chat sessions (multiple conversations, stored on-device via chat.js) ----
+let activeSession = null;
+
+function renderMessages(session) {
+  const log = $('log');
+  log.innerHTML = '';
+  for (const m of (session && session.messages) || []) {
+    const el = add(m.role, m.text);
+    if (m.err) el.classList.add('err');
+  }
+}
+
+async function renderSessionBar() {
+  const sel = $('session-select');
+  if (!sel) return;
+  const sessions = await chat.listSessions();
+  sel.innerHTML = '';
+  for (const s of sessions) {
+    const o = document.createElement('option');
+    o.value = s.id;
+    o.textContent = (s.title || 'New chat') + (s.count ? ` (${s.count})` : '');
+    sel.appendChild(o);
+  }
+  if (activeSession) sel.value = activeSession.id;
+}
+
+async function loadSession(id) {
+  const s = await chat.getSession(id);
+  if (!s) return;
+  activeSession = s;
+  renderMessages(s);
+  if (s.model) {
+    const m = $('model');
+    if ([...m.options].some((o) => o.value === s.model)) m.value = s.model;
+  }
+  await renderSessionBar();
+  updateSendState();
+}
+
+async function newChat() {
+  activeSession = chat.newSession($('model').value);
+  await chat.putSession(activeSession);
+  $('log').innerHTML = '';
+  await renderSessionBar();
+  updateSendState();
+}
+
+async function renameActiveSession() {
+  if (!activeSession) return;
+  const t = prompt('Rename this chat:', activeSession.title || '');
+  if (t === null) return;
+  activeSession.title = t.trim() || activeSession.title;
+  await chat.putSession(activeSession);
+  await renderSessionBar();
+}
+
+async function deleteActiveSession() {
+  if (!activeSession) return;
+  if (!confirm('Delete this conversation?')) return;
+  await chat.deleteSession(activeSession.id);
+  activeSession = null;
+  const list = await chat.listSessions();
+  if (list.length) await loadSession(list[0].id); else await newChat();
+}
+
+// Open the most recent conversation, migrating a legacy single transcript first.
+async function initSessions() {
+  const list = await chat.listSessions();
+  if (!list.length) {
+    let legacy = null;
+    try { legacy = JSON.parse(localStorage.getItem(CHAT_KEY)); } catch (e) {}
+    if (Array.isArray(legacy) && legacy.length) {
+      const s = chat.newSession($('model').value);
+      s.messages = legacy.map((m) => ({ role: m.role, text: m.text, err: !!m.err, ts: Date.now() }));
+      s.title = chat.titleFrom(s.messages);
+      await chat.putSession(s);
+      try { localStorage.removeItem(CHAT_KEY); } catch (e) {}
+    }
+  }
+  const fresh = await chat.listSessions();
+  if (fresh.length) await loadSession(fresh[0].id); else await newChat();
+}
 
 async function mintKeys() {
   if (!keys) keys = await (await fetch('/mint/keys')).json();
@@ -76,6 +224,7 @@ async function mint() {
     const r = await fetch('/account/new', { method: 'POST' });
     if (!r.ok) throw new Error('could not mint a key (' + r.status + '), try again');
     account = await r.json();
+    saveAccount(account);   // survive a refresh (see ACCOUNT_KEY)
   } catch (e) {
     btn.disabled = false;
     walletNote(e.message);
@@ -106,6 +255,7 @@ async function claimToEcash(balance) {
       'Idempotency-Key': pending.idempotencyKey,
     }, k.pubkeys);
     saveWallet(loadWallet().concat(minted));
+    await flushWallet();   // durable before dropping the plaintext claim record
     localStorage.removeItem(PENDING_CLAIM_KEY);
     lastAcctBal = 0;
   } finally { claiming = false; }
@@ -299,10 +449,12 @@ async function redeemPendingChange() {
   });
   if (r.status === 404) {
     saveWallet(loadWallet().concat(p.spend));       // never spent — tokens live
+    await flushWallet();
     localStorage.removeItem(PENDING_CHANGE_KEY);
   } else if (r.ok) {
     const settle = ecash.absorbChange(await r.json(), p.blanks, k.pubkeys);
     if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
+    await flushWallet();
     localStorage.removeItem(PENDING_CHANGE_KEY);
   } else {
     // Any other status (409 still in flight, or a 5xx) leaves the spend
@@ -374,6 +526,10 @@ async function send() {
   const model = $('model').value;
   const free = model.startsWith('local/');   // local lane is free, no payment
   if (!free && ecashBalance() <= 0) { updateSendState(); return; }
+  // Per-request usage metadata, recorded on-device only (see usage.js).
+  const startedAt = Date.now();
+  const rec = { model, free, streamed: free, status: 0, costCredits: 0,
+                inputTokens: 0, outputTokens: 0, error: '' };
   input.value = '';
   add('user', text);
   const pending = add('assistant', '…');
@@ -397,6 +553,10 @@ async function send() {
       spent = sel.spend;
       blanks = await ecash.prepareChangeBlanks();
       saveWallet(sel.keep);
+      // Make the spend-removal durable BEFORE the request and before writing the
+      // (plaintext, synchronous) recovery record, so a crash can never leave the
+      // spent tokens back in the vault alongside a pending record (double-count).
+      await flushWallet();
       // Persist the in-flight spend so a page close recovers the change.
       localStorage.setItem(PENDING_CHANGE_KEY, JSON.stringify({ spend: spent, blanks }));
       renderBalance();
@@ -410,6 +570,9 @@ async function send() {
       method: 'POST', headers,
       body: JSON.stringify({ model, messages: [{ role: 'user', content: text }], stream: free }),
     });
+    rec.status = r.status;
+    const cc = r.headers.get('X-Cost-Credits');
+    if (cc != null) rec.costCredits = parseInt(cc, 10) || 0;
     if (free) {
       const ctype = r.headers.get('Content-Type') || '';
       if (!r.ok || !ctype.includes('text/event-stream')) {
@@ -424,6 +587,7 @@ async function send() {
       if (hdr) {  // tokens were spent — absorb the change either way (success or upstream error)
         const settle = ecash.absorbChange(JSON.parse(atob(hdr)), blanks, k0.pubkeys);
         if (settle.tokens.length) saveWallet(loadWallet().concat(settle.tokens));
+        await flushWallet();   // change durable before dropping the recovery record
         localStorage.removeItem(PENDING_CHANGE_KEY);
         spent = null;
       } else if (r.status === 400 || r.status === 402) {
@@ -432,11 +596,15 @@ async function send() {
         // pending record so redeemPendingChange() can recover the change; do NOT
         // restore tokens that may already be spent.
         saveWallet(loadWallet().concat(spent));
+        await flushWallet();   // restoration durable before dropping the record
         localStorage.removeItem(PENDING_CHANGE_KEY);
         spent = null;
       }
       let d = null; try { d = await r.json(); } catch (e) {}
+      const u = d && d.usage;
+      if (u) { rec.inputTokens = u.prompt_tokens | 0; rec.outputTokens = u.completion_tokens | 0; }
       if (!r.ok) {
+        rec.error = (d && (d.detail || (d.error && (d.error.message || d.error)))) || String(r.status);
         showErr(pending, friendly(r.status, (d && (d.detail || d.error)) || r.statusText, free));
       } else {
         pending.textContent = (d && d.choices && d.choices[0] && d.choices[0].message
@@ -445,10 +613,25 @@ async function send() {
     }
   } catch (e) {
     if (spent && !requestStarted) { saveWallet(loadWallet().concat(spent)); spent = null; }
+    rec.error = e.message || 'error';
     showErr(pending, friendly(0, e.message, free));
   } finally {
     inFlight = false;
+    await flushWallet();   // ensure any wallet change this turn is durable
     renderBalance();
+    // Save the turn into the active conversation (on-device only).
+    if (activeSession) {
+      chat.appendMessage(activeSession, 'user', text);
+      chat.appendMessage(activeSession, 'assistant', pending.textContent,
+        pending.classList.contains('err'));
+      await chat.putSession(activeSession);
+      renderSessionBar();
+    }
+    if (requestStarted) {
+      rec.latencyMs = Date.now() - startedAt;
+      usage.recordRequest(rec);   // on-device only; never sent to the server
+      if (activeView === 'activity') renderActivity();
+    }
   }
 }
 
@@ -464,13 +647,7 @@ function walletNote(msg) {
   walletNoteTimer = setTimeout(() => { el.textContent = ''; }, 6000);
 }
 
-function exportWallet() {
-  const data = {
-    format: 'anon-router-wallet-v1',
-    exported_at: new Date().toISOString(),
-    account,
-    tokens: loadWallet(),
-  };
+function downloadBackup(data, note) {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -479,39 +656,236 @@ function exportWallet() {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-  walletNote('Backup downloaded. Keep the file private; it is the money.');
+  walletNote(note);
+}
+
+// Back up the wallet. Default: prompt for a passphrase and encrypt the payload
+// (the file is bearer money, so an encrypted backup is far safer to store/sync).
+// Skippable — an empty passphrase falls back to a plaintext backup after an
+// explicit warning, honoring "encryption is optional".
+async function exportWallet() {
+  const payload = { account, tokens: loadWallet() };
+  const pass = prompt(
+    'Set a passphrase to ENCRYPT this backup (recommended — the file is your '
+    + 'money).\n\nLeave blank to export UNENCRYPTED.');
+  if (pass === null) return;  // user cancelled the whole export
+  if (pass) {
+    const confirmPass = prompt('Re-enter the passphrase to confirm.');
+    if (confirmPass === null) return;
+    if (confirmPass !== pass) { walletNote('Passphrases did not match — not exported.'); return; }
+    let vault;
+    try {
+      vault = await encryptJSON(payload, pass);
+    } catch (e) {
+      walletNote('Could not encrypt the backup: ' + e.message);
+      return;
+    }
+    downloadBackup(
+      { format: 'anon-router-wallet-enc-v1', exported_at: new Date().toISOString(), vault },
+      'Encrypted backup downloaded. Keep the passphrase safe — it cannot be recovered.');
+    return;
+  }
+  if (!confirm('Export WITHOUT encryption? Anyone who gets this file can spend '
+               + 'your credits.')) return;
+  downloadBackup(
+    { format: 'anon-router-wallet-v1', exported_at: new Date().toISOString(), account, tokens: loadWallet() },
+    'Unencrypted backup downloaded. Keep the file private; it is the money.');
+}
+
+// Validate a decrypted {account, tokens} payload and merge it into this wallet.
+// Merge (deduped by secret) so importing never drops tokens already here.
+function applyImportedPayload(payload) {
+  if (!payload || !payload.account || typeof payload.account.api_key !== 'string'
+      || !Array.isArray(payload.tokens)) {
+    throw new Error('bad format');
+  }
+  for (const t of payload.tokens) {
+    if (!(Number.isInteger(t.amount) && t.amount > 0
+        && typeof t.secret === 'string' && typeof t.C === 'string')) {
+      throw new Error('bad token');
+    }
+  }
+  const bySecret = new Map(loadWallet().map((t) => [t.secret, t]));
+  for (const t of payload.tokens) {
+    bySecret.set(t.secret, { amount: t.amount, secret: t.secret, C: t.C });
+  }
+  saveWallet([...bySecret.values()]);
+  account = payload.account;
+  saveAccount(account);
+  unlockAfterKey();
+  renderBalance();
+  walletNote('Wallet imported.');
 }
 
 function importWalletFile(file) {
   const fr = new FileReader();
-  fr.onload = () => {
+  fr.onload = async () => {
+    let data;
+    try { data = JSON.parse(fr.result); } catch (e) {
+      walletNote('That file is not an anon-router wallet backup.');
+      return;
+    }
     try {
-      const data = JSON.parse(fr.result);
-      if (data.format !== 'anon-router-wallet-v1' || !data.account
-          || typeof data.account.api_key !== 'string' || !Array.isArray(data.tokens)) {
+      if (data.format === 'anon-router-wallet-enc-v1') {
+        const pass = prompt('This backup is encrypted. Enter its passphrase.');
+        if (pass === null) return;   // cancelled
+        let payload;
+        try {
+          payload = await decryptJSON(data.vault, pass);
+        } catch (e) {
+          walletNote(e.message || 'Could not decrypt the backup.');
+          return;
+        }
+        applyImportedPayload(payload);
+      } else if (data.format === 'anon-router-wallet-v1') {
+        applyImportedPayload({ account: data.account, tokens: data.tokens });
+      } else {
         throw new Error('bad format');
       }
-      for (const t of data.tokens) {
-        if (!(Number.isInteger(t.amount) && t.amount > 0
-            && typeof t.secret === 'string' && typeof t.C === 'string')) {
-          throw new Error('bad token');
-        }
-      }
-      // Merge, deduped by secret: importing must never drop tokens already here.
-      const bySecret = new Map(loadWallet().map((t) => [t.secret, t]));
-      for (const t of data.tokens) {
-        bySecret.set(t.secret, { amount: t.amount, secret: t.secret, C: t.C });
-      }
-      saveWallet([...bySecret.values()]);
-      account = data.account;
-      unlockAfterKey();
-      renderBalance();
-      walletNote('Wallet imported.');
     } catch (e) {
-      walletNote('That file is not an anon-router wallet backup.');
+      walletNote('That file is not a valid anon-router wallet backup.');
     }
   };
   fr.readAsText(file);
+}
+
+// Clear this browser's wallet and start fresh. The tokens live ONLY here, so
+// this can destroy credits — gate it behind an explicit back-up-first confirm.
+function newWallet() {
+  const bal = ecashBalance();
+  const warn = bal > 0
+    ? `This browser holds ${bal} credits ($${(bal * ((keys && keys.credit_usd) || 0.0001)).toFixed(2)}). `
+      + 'Starting a new wallet CLEARS them from this browser. Back up first if you '
+      + 'want to keep them. Continue?'
+    : 'Start a new wallet? This clears the current wallet from this browser.';
+  if (!confirm(warn)) return;
+  for (const k of [ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY, PENDING_CHANGE_KEY, VAULT_KEY]) {
+    try { localStorage.removeItem(k); } catch (e) {}
+  }
+  vaultMode = false; vaultKey = null; vaultSalt = null;
+  mem.account = null; mem.tokens = [];
+  account = null;
+  lastAcctBal = 0;
+  $('log').innerHTML = '';
+  $('key-info').classList.add('hidden');
+  $('key-start').classList.remove('hidden');
+  $('mint').disabled = false;
+  $('deposit-body').classList.add('hidden');
+  $('deposit-locked').classList.remove('hidden');
+  reflectEncState();
+  renderBalance();
+  newChat();   // fresh conversation to match the fresh wallet (old chats remain)
+}
+
+// ---- at-rest encryption UI ----
+
+// Reflect vault state on the "Encrypt this wallet" control.
+function reflectEncState() {
+  const btn = $('encrypt');
+  const state = $('enc-state');
+  if (!btn || !state) return;
+  if (vaultMode) {
+    btn.classList.add('hidden');
+    state.textContent = '🔒 Encrypted at rest';
+  } else {
+    btn.classList.remove('hidden');
+    state.textContent = '';
+  }
+}
+
+// Turn on encryption for the current wallet (prompt + confirm passphrase).
+async function encryptWallet() {
+  if (vaultMode) return;
+  if (!account && ecashBalance() === 0) {
+    walletNote('Create or import a wallet first.');
+    return;
+  }
+  const pass = prompt('Set a passphrase to encrypt this wallet on this device.\n\n'
+    + 'There is NO recovery if you forget it — back up your wallet first.');
+  if (pass === null) return;
+  if (!pass) { walletNote('Encryption cancelled (empty passphrase).'); return; }
+  const confirmPass = prompt('Re-enter the passphrase to confirm.');
+  if (confirmPass === null) return;
+  if (confirmPass !== pass) { walletNote('Passphrases did not match — not encrypted.'); return; }
+  try {
+    await enableVault(pass);
+  } catch (e) {
+    walletNote('Could not encrypt: ' + (e.message || e));
+    return;
+  }
+  reflectEncState();
+  walletNote('Wallet encrypted on this device. It will ask for the passphrase on reload.');
+}
+
+// If an encrypted vault exists, prompt to unlock it into memory. Returns true
+// once unlocked (or if there is no vault); false if the user left it locked.
+async function maybeUnlockVault() {
+  let env = null;
+  try { env = JSON.parse(localStorage.getItem(VAULT_KEY)); } catch (e) { env = null; }
+  if (!env) return true;   // plaintext mode, nothing to unlock
+  for (;;) {
+    const pass = prompt('This wallet is encrypted. Enter your passphrase to unlock.');
+    if (pass === null) return false;   // user cancelled -> stay locked
+    try {
+      const dk = await deriveVaultKey(pass, env.salt);
+      const data = await openWithKey(env, dk.key);
+      vaultKey = dk.key; vaultSalt = env.salt; vaultMode = true;
+      mem.account = (data && data.account) || null;
+      mem.tokens = (data && Array.isArray(data.tokens)) ? data.tokens : [];
+      return true;
+    } catch (e) {
+      alert('Wrong passphrase. Try again, or discard the encrypted wallet.');
+    }
+  }
+}
+
+function showLocked(locked) {
+  $('locked').classList.toggle('hidden', !locked);
+  $('main').classList.toggle('hidden', locked);
+}
+
+// ---- views / navigation + Activity ----
+let activeView = 'chat';
+const VIEWS = ['chat', 'activity', 'settings'];
+const escHtml = (s) => String(s == null ? '' : s).replace(
+  /[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function showView(name) {
+  activeView = name;
+  for (const v of VIEWS) {
+    $('view-' + v).classList.toggle('hidden', v !== name);
+    $('tab-' + v).classList.toggle('active', v === name);
+  }
+  if (name === 'activity') renderActivity();
+}
+
+async function renderActivity() {
+  const rows = await usage.allRequests();
+  const cu = (keys && keys.credit_usd) || 0.0001;
+  const t = usage.totals(rows);
+  $('act-empty').classList.toggle('hidden', rows.length > 0);
+  $('act-stats').innerHTML = [
+    ['Requests', t.requests],
+    ['Spent', '$' + (t.costCredits * cu).toFixed(4)],
+    ['Input tokens', t.inputTokens.toLocaleString()],
+    ['Output tokens', t.outputTokens.toLocaleString()],
+    ['Success', rows.length ? (t.successRate * 100).toFixed(0) + '%' : '—'],
+    ['Avg latency', t.avgLatencyMs ? t.avgLatencyMs + ' ms' : '—'],
+  ].map(([k, v]) => `<div class="s"><div class="v">${escHtml(v)}</div><div class="k">${k}</div></div>`).join('');
+
+  const bm = usage.byModel(rows);
+  $('act-by-model').innerHTML = bm.length
+    ? '<tr><th>Model</th><th class="num">Reqs</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th></tr>'
+      + bm.map((g) => `<tr><td>${escHtml(g.model)}</td><td class="num">${g.requests}</td>`
+        + `<td class="num">${g.inputTokens}</td><td class="num">${g.outputTokens}</td>`
+        + `<td class="num">$${(g.costCredits * cu).toFixed(4)}</td></tr>`).join('')
+    : '';
+  const bd = usage.byDay(rows);
+  $('act-by-day').innerHTML = bd.length
+    ? '<tr><th>Day</th><th class="num">Reqs</th><th class="num">Cost</th></tr>'
+      + bd.map((g) => `<tr><td>${g.day}</td><td class="num">${g.requests}</td>`
+        + `<td class="num">$${(g.costCredits * cu).toFixed(4)}</td></tr>`).join('')
+    : '';
 }
 
 // ---- copy affordances ----
@@ -551,6 +925,8 @@ $('prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); 
 $('model').addEventListener('change', updateSendState);
 $('amount').addEventListener('input', renderDepositPreview);
 $('export').onclick = exportWallet;
+$('new-wallet').onclick = newWallet;
+$('encrypt').onclick = encryptWallet;
 const importInput = $('import-file');
 $('import-start').onclick = () => importInput.click();
 $('import-again').onclick = () => importInput.click();
@@ -559,8 +935,102 @@ importInput.addEventListener('change', () => {
   importInput.value = '';   // allow re-importing the same file
 });
 wireCopy('copy-key', 'apikey');
-updateSendState();
-mintKeys().then(redeemPendingChange).then(renderBalance).catch(() => renderBalance());
+
+// Restore a prior session so a refresh keeps the whole wallet, not just the
+// balance. If an encrypted vault exists, unlock it FIRST (into memory) so the
+// mode-aware loaders see the decrypted wallet.
+async function restoreSession() {
+  const savedAccount = loadAccount();
+  if (savedAccount && typeof savedAccount.api_key === 'string') {
+    account = savedAccount;
+    unlockAfterKey();
+  }
+  await initSessions();
+  reflectEncState();
+  updateSendState();
+  try { await mintKeys(); await redeemPendingChange(); } catch (e) {}
+  renderBalance();
+}
+
+async function boot() {
+  const unlocked = await maybeUnlockVault();
+  if (!unlocked) { showLocked(true); return; }   // stay locked until unlocked/discarded
+  showLocked(false);
+  await restoreSession();
+}
+
+// tabs
+for (const v of VIEWS) $('tab-' + v).onclick = () => showView(v);
+
+// chat sessions
+$('new-chat').onclick = newChat;
+$('rename-chat').onclick = renameActiveSession;
+$('delete-chat').onclick = deleteActiveSession;
+$('session-select').onchange = (e) => loadSession(e.target.value);
+
+// activity actions
+$('act-export').onclick = async () => {
+  const rows = await usage.allRequests();
+  const blob = new Blob([usage.toCSV(rows)], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'anon-router-activity-' + new Date().toISOString().slice(0, 10) + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+};
+const clearActivity = async () => {
+  if (!confirm('Clear all activity on this device?')) return;
+  await usage.clearUsage(); renderActivity();
+};
+$('act-clear').onclick = clearActivity;
+$('set-clear-activity').onclick = clearActivity;
+$('set-clear-chat').onclick = async () => {
+  if (!confirm('Delete ALL conversations on this device?')) return;
+  try { localStorage.removeItem(CHAT_KEY); } catch (e) {}
+  await chat.clearAll();
+  activeSession = null;
+  await newChat();
+};
+$('set-clear-all').onclick = () => {
+  if (!confirm('Erase EVERYTHING on this device (wallet, activity, chat)? Back up your '
+    + 'wallet first — its credits are gone otherwise.')) return;
+  usage.clearUsage();
+  chat.clearAll();
+  for (const k of [ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY,
+                   PENDING_CHANGE_KEY, VAULT_KEY, RETENTION_KEY]) {
+    try { localStorage.removeItem(k); } catch (e) {}
+  }
+  location.reload();
+};
+// retention
+const RETENTION_KEY = 'anon-router-retention-days';
+$('set-retention').value = (() => { try { return localStorage.getItem(RETENTION_KEY) || '0'; } catch (e) { return '0'; } })();
+$('set-retention').onchange = async () => {
+  const d = parseInt($('set-retention').value, 10) || 0;
+  try { localStorage.setItem(RETENTION_KEY, String(d)); } catch (e) {}
+  if (d > 0) await usage.pruneOlderThan(Date.now() - d * 86400000);
+};
+
+$('unlock').onclick = async () => {
+  if (await maybeUnlockVault()) { showLocked(false); await restoreSession(); }
+};
+$('discard-vault').onclick = () => {
+  if (!confirm('Discard the encrypted wallet on this device? If you have no '
+    + 'backup + passphrase, its credits are gone for good.')) return;
+  for (const k of [VAULT_KEY, ACCOUNT_KEY, WALLET_KEY, CHAT_KEY, PENDING_CLAIM_KEY, PENDING_CHANGE_KEY]) {
+    try { localStorage.removeItem(k); } catch (e) {}
+  }
+  location.reload();
+};
+
+boot();
+
+// Apply the activity retention window on load (prune anything older).
+(() => {
+  let d = 0;
+  try { d = parseInt(localStorage.getItem(RETENTION_KEY) || '0', 10) || 0; } catch (e) {}
+  if (d > 0) usage.pruneOlderThan(Date.now() - d * 86400000);
+})();
 
 // Populate the model dropdown from the LIVE catalog so it never offers a retired
 // model. Keep a small curated shortlist (in preference order); fall back to the
